@@ -1,0 +1,7 @@
+tunnel: 75bd95fe-94e5-4632-b392-e9c6b719ef33
+credentials-file: /etc/cloudflared/credentials.json
+
+ingress:
+  - hostname: ngs-scouting.jstaff.trade
+    service: http://ngs-scouting:3000
+  - service: http_status:404

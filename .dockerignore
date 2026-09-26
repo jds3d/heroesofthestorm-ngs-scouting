@@ -1,0 +1,14 @@
+node_modules
+.next
+.git
+.gitignore
+.env*
+!.env.example
+.cache
+*.md
+.DS_Store
+Dockerfile
+docker-compose.yml
+.dockerignore
+agent-transcripts
+.cursor

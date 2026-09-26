@@ -1,0 +1,20 @@
+{
+  "season": 22,
+  "division": "A",
+  "divisionConcat": "a",
+  "homeTeam": "Little Buff Boyz",
+  "teams": [
+    "BG I Need My Caster Role",
+    "Braincellmates",
+    "Can't Connect Stuns",
+    "Gen.M Esports",
+    "gillyShark at !Bingo night",
+    "Hot(s) Dads",
+    "Little Buff Boyz",
+    "PUNishment (Withdrawn S22)",
+    "Spooky Ghosts",
+    "The Part Timers",
+    "Tricky Gooses"
+  ],
+  "notes": "Seed fallback if NGS API is unreachable. Refresh via live /api/division/get?division=a."
+}

@@ -1,0 +1,24 @@
+services:
+  ngs-scouting:
+    build: .
+    container_name: ngs-scouting
+    ports:
+      - "3000:3000"
+    env_file:
+      - .env.local
+    environment:
+      NODE_ENV: production
+    volumes:
+      - ./.cache:/app/.cache
+    restart: unless-stopped
+
+  tunnel:
+    image: cloudflare/cloudflared:latest
+    container_name: ngs-scouting-tunnel
+    command: tunnel --config /etc/cloudflared/config.yml run
+    volumes:
+      - ./cloudflared/config.yml:/etc/cloudflared/config.yml:ro
+      - ./cloudflared/credentials.json:/etc/cloudflared/credentials.json:ro
+    depends_on:
+      - ngs-scouting
+    restart: unless-stopped
