@@ -2,6 +2,7 @@ import {
   diveGreenLightSlots,
   divePlaybook,
   divePlaybookTree,
+  chooseDivePivot,
 } from "@/config/divePlaybook";
 import { heroKey, heroRole, heroSpellings, heroTags } from "@/lib/scoring/heroMeta";
 import {
@@ -468,24 +469,36 @@ export function buildDraftPlan(
     arr.indexOf(h) === i,
   );
   const antiDiveThreat = antiDiveHeroesSeen.length > 0;
+  const chosen = antiDiveThreat ? chooseDivePivot(antiDiveHeroesSeen) : null;
+  const toPivot = (p: (typeof divePlaybook.pivots)[number], why: string) => ({
+    id: p.id,
+    name: p.name,
+    objective: p.objective,
+    heroes: [...p.heroes],
+    maps: [...p.maps],
+    why,
+  });
 
   const playbook: DraftPlaybook = {
     title: divePlaybook.title,
-    intro: divePlaybook.intro,
+    intro: antiDiveThreat
+      ? `Their pool already has anti-dive. Do not force Genji / Greymane / Kerrigan. Mask with a flexible tank + enabler first, then take the pivot below.`
+      : `Open flexible tank + enabler. Hold Genji / Greymane / Kerrigan until mid-draft. If they show Tyrael, Brightwing, Falstad Gust, or Johanna — leave dive and take a pivot.`,
     antiDiveThreat,
     antiDiveHeroesSeen,
+    recommended: chosen
+      ? toPivot(chosen.pivot, chosen.why)
+      : null,
+    alternates: divePlaybook.pivots
+      .filter((p) => p.id !== chosen?.pivot.id)
+      .map((p) => toPivot(p, p.whyAgainst)),
     tree: divePlaybookTree(),
-    pivots: divePlaybook.pivots.map((p) => ({
-      name: p.name,
-      objective: p.objective,
-      heroes: [...p.heroes],
-      maps: [...p.maps],
-    })),
+    pivots: divePlaybook.pivots.map((p) => toPivot(p, p.whyAgainst)),
   };
 
   const summary = runHeavyDive
-    ? antiDiveThreat
-      ? `Primary plan is heavy dive, but their pool already shows anti-dive (${antiDiveHeroesSeen.join(", ")}). Mask tank + enabler early, then pivot to blow-up, poke, or global — do not force Genji/Greymane/Kerrigan.`
+    ? antiDiveThreat && chosen
+      ? `Primary plan was heavy dive, but their pool shows anti-dive (${antiDiveHeroesSeen.join(", ")}). Pivot to ${chosen.pivot.name}: pick ${chosen.pivot.heroes.slice(0, 3).join(" / ")}. Do not force Genji/Greymane/Kerrigan.`
       : `Primary plan is heavy dive: Anub/Tyrael/Diablo/Mei + Rehgar/BW/Hogger/Yrel first. Hold Genji/Greymane/Kerrigan until mid-draft clears anti-dive.`
     : canBait
       ? `Ban ${baitBans.map((b) => b.hero).join(" and ")} so they stay on ${[...predictedHeroes].slice(0, 3).join(", ")}. Then draft the counter as one fight, not five counters.`
@@ -493,21 +506,19 @@ export function buildDraftPlan(
         ? "Not enough of a tell to bait a comp. Default to the heavy dive playbook (tank + enabler first) unless they show anti-dive."
         : `They lean ${draft.archetype}. ${key === "dive" ? "Mirror dive is wrong — peel and punish." : "Use the heavy dive playbook unless their anti-dive forces a pivot."}`;
 
-  const diveSteps = antiDiveThreat
+  const diveSteps = antiDiveThreat && chosen
     ? [
         {
           phase: "Phase 1 — Anchor & enabler",
           action: `Still take flexible tank (${divePlaybook.phase1Slots[0].heroes.slice(0, 3).join(" / ")}) and enabler (${divePlaybook.phase1Slots[1].heroes.slice(0, 3).join(" / ")}). Do not first-pick ${divePlaybook.lateDiveAssassins.slice(0, 3).join(" / ")}.`,
         },
         {
-          phase: "Phase 2 — Pivot (anti-dive seen)",
-          action: `Their comfort already includes ${antiDiveHeroesSeen.join(", ")}. Leave pure dive. Pivot to ${divePlaybook.pivots.map((p) => p.name).join(", ")}.`,
+          phase: "Phase 2 — Pivot",
+          action: `Leave pure dive. Take ${chosen.pivot.name} because ${chosen.why}`,
         },
         {
           phase: "Phase 3 — Commit the pivot",
-          action: antiDiveThreat
-            ? `Prefer ${divePlaybook.pivots[0].heroes.slice(0, 3).join(" / ")} (blow-up) or ${divePlaybook.pivots[1].heroes.slice(0, 3).join(" / ")} (poke) based on map.`
-            : "Commit dive core.",
+          action: `Lock ${chosen.pivot.heroes.join(" / ")}. ${chosen.pivot.objective}`,
         },
       ]
     : [
@@ -518,7 +529,7 @@ export function buildDraftPlan(
         {
           phase: "Phase 2 — Pivot check",
           action:
-            "If they take Tyrael, Brightwing, Falstad Gust, or Johanna → pivot to blow-up / poke / global. Otherwise green light.",
+            "If they take Tyrael, Brightwing, Falstad Gust, or Johanna → leave dive (see pivot section). Otherwise green light.",
         },
         {
           phase: "Phase 3 — Core divers",
@@ -616,9 +627,22 @@ export function buildDraftPlan(
 
   const theyFirst = makeSide({
     label: "They pick first",
-    summary: contested
-      ? `They pick first, so ban ${contested} or they take it. Then bait the rest.`
-      : "They pick first. Ban the hero they would take immediately, then bait the rest.",
+    summary: sideSummary({
+      firstPick: "them",
+      contested,
+      wePlayContested,
+      theirLikely,
+      ourLikely: ours.picks,
+      baitBans,
+      predicted: predicted.map((p) => p.hero),
+    }),
+    counterNote: sideCounterNote({
+      theirLikely,
+      ourLikely: ours.picks,
+      ourBrief: ours.brief,
+      answerKey: key,
+      answerCounter: answer.counter,
+    }),
     theirLikely,
     ourLikely: ours.picks,
     ourCompNote: ours.note,
@@ -637,11 +661,22 @@ export function buildDraftPlan(
   });
   const weFirst = makeSide({
     label: "We pick first",
-    summary: wePlayContested
-      ? `We pick first. Take ${contested} (${wePlayContested}). If we draft something else, ban ${contested} — their next pick is that hero.`
-      : contested
-        ? `We pick first, but ${contested} is not in our pool. Ban it anyway or their first pick is ${contested}.`
-        : "We pick first. Take the best piece of our comp, and ban the hero they would answer with.",
+    summary: sideSummary({
+      firstPick: "us",
+      contested,
+      wePlayContested,
+      theirLikely: theirIfWeTake,
+      ourLikely: ourIfWeTake.picks,
+      baitBans,
+      predicted: predicted.map((p) => p.hero),
+    }),
+    counterNote: sideCounterNote({
+      theirLikely: theirIfWeTake,
+      ourLikely: ourIfWeTake.picks,
+      ourBrief: ourIfWeTake.brief,
+      answerKey: key,
+      answerCounter: answer.counter,
+    }),
     theirLikely: theirIfWeTake,
     ourLikely: ourIfWeTake.picks,
     ourCompNote: ourIfWeTake.note,
@@ -682,6 +717,135 @@ export function buildDraftPlan(
 
 function makeSide(side: DraftSide): DraftSide {
   return side;
+}
+
+function heroList(picks: DraftCompPick[]): string {
+  return picks.map((p) => p.hero).join(", ");
+}
+
+function heroListWithPlayers(picks: DraftCompPick[]): string {
+  return picks
+    .map((p) => (p.player ? `${p.hero} (${p.player})` : p.hero))
+    .join(", ");
+}
+
+/** Concrete lobby plan — names their five and what we ban/leave up. */
+function sideSummary(args: {
+  firstPick: "us" | "them";
+  contested: string | null;
+  wePlayContested: string | null;
+  theirLikely: DraftCompPick[];
+  ourLikely: DraftCompPick[];
+  baitBans: { hero: string; reason: string }[];
+  predicted: string[];
+}): string {
+  const theirHeroes = heroList(args.theirLikely);
+  const ourHeroes = heroList(args.ourLikely);
+  const leaveUp =
+    args.theirLikely.map((p) => p.hero).filter(Boolean).slice(0, 5);
+  const outs = args.baitBans.map((b) => b.hero).slice(0, 3);
+
+  if (args.firstPick === "them") {
+    const ban = args.contested
+      ? `Ban ${args.contested} before any picks — if it stays up, that is their first pick.`
+      : "Ban the hero they would open on immediately.";
+    const leave = leaveUp.length
+      ? `Leave ${leaveUp.join(", ")} up so they land on that five.`
+      : "";
+    const deny = outs.length
+      ? `Deny their outs (${outs.join(", ")}) so they cannot dodge off that read.`
+      : "";
+    const answer = ourHeroes
+      ? `We answer with ${ourHeroes}.`
+      : "";
+    return [ban, leave, deny, answer].filter(Boolean).join(" ");
+  }
+
+  if (args.contested && args.wePlayContested) {
+    return [
+      `We pick first — take ${args.contested} (${args.wePlayContested}).`,
+      leaveUp.length
+        ? `Expect them on ${theirHeroes || leaveUp.join(", ")}.`
+        : "",
+      outs.length
+        ? `Ban ${outs.join(" / ")} if those are still their way out.`
+        : args.contested
+          ? `If we do not take ${args.contested}, ban it — their next pick is that hero.`
+          : "",
+      ourHeroes ? `Finish our five as ${ourHeroes}.` : "",
+    ]
+      .filter(Boolean)
+      .join(" ");
+  }
+
+  if (args.contested) {
+    return [
+      `We pick first, but ${args.contested} is not in our pool — ban it or their first pick is ${args.contested}.`,
+      leaveUp.length ? `Then expect ${theirHeroes}.` : "",
+      ourHeroes ? `We answer with ${ourHeroes}.` : "",
+    ]
+      .filter(Boolean)
+      .join(" ");
+  }
+
+  return [
+    "We pick first — lock the best piece of our five early.",
+    leaveUp.length ? `Expect them on ${theirHeroes}.` : "",
+    ourHeroes ? `Our five: ${ourHeroes}.` : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
+}
+
+/** How our five beats *their* five — skip archetype boilerplate. */
+function sideCounterNote(args: {
+  theirLikely: DraftCompPick[];
+  ourLikely: DraftCompPick[];
+  ourBrief: OurCompBrief;
+  answerKey: string;
+  answerCounter: string;
+}): string {
+  const their = args.theirLikely;
+  const our = args.ourLikely;
+  if (their.length < 3 || our.length < 3) {
+    return args.answerKey === "default" ? args.ourBrief.whyItWorks : args.answerCounter;
+  }
+
+  const theirTank = their.find((p) => heroRole(p.hero) === "Tank")?.hero;
+  const theirHeal = their.find(
+    (p) => heroRole(p.hero) === "Healer" || heroRole(p.hero) === "Support",
+  )?.hero;
+  const theirDamage = their
+    .filter((p) => {
+      const r = heroRole(p.hero);
+      return r.includes("Assassin") || r === "Bruiser";
+    })
+    .map((p) => p.hero);
+  const ourTank = our.find((p) => heroRole(p.hero) === "Tank")?.hero;
+  const ourEngage = our
+    .filter((p) => tagsOf(p.hero).some((t) => t === "dive" || t === "engage"))
+    .map((p) => p.hero);
+
+  const parts: string[] = [];
+  parts.push(
+    `Into ${heroListWithPlayers(their)}: play ${args.ourBrief.kind.toLowerCase()} (${heroList(our)}).`,
+  );
+
+  if (theirDamage.length && ourEngage.length) {
+    parts.push(
+      `Delete ${theirDamage.slice(0, 2).join(" / ")} before ${theirHeal ?? "their healer"} stabilizes — ${ourEngage.slice(0, 2).join(" / ")} start that fight.`,
+    );
+  } else if (theirTank && ourTank) {
+    parts.push(
+      `${ourTank} dictates the engage into ${theirTank}; everyone else is drafted for that same fight.`,
+    );
+  }
+
+  if (args.ourBrief.whyItWorks) {
+    parts.push(args.ourBrief.whyItWorks);
+  }
+
+  return parts.join(" ");
 }
 
 function contestedHero(
@@ -1238,7 +1402,7 @@ function mapPlanForComp(
  * After each side has 3 and 2 picks, second-pick side bans, then first-pick side.
  * Second-pick side gets the last pick.
  */
-const DRAFT_ORDER: { side: "fp" | "sp"; kind: "ban" | "pick" }[] = [
+export const DRAFT_ORDER: { side: "fp" | "sp"; kind: "ban" | "pick" }[] = [
   { side: "fp", kind: "ban" },
   { side: "sp", kind: "ban" },
   { side: "fp", kind: "ban" },
@@ -1343,6 +1507,14 @@ function walkDraft(s: Walk): DraftTreeNode | null {
       : (ours ? s.ourPicks : s.theirPicks) + 1;
   const who = ours ? "Our" : "Their";
   const title = `${who} ${ordinal(n)} ${step.kind}: ${choice.hero}`;
+  const side = ours ? "our" : "their";
+  const baseAction = {
+    side: side as "our" | "their",
+    kind: step.kind,
+    ordinal: n,
+    hero: choice.hero,
+    player: choice.player,
+  };
 
   const pivot =
     s.deviations === 0 && !ours ? theirPivot(s, step.kind, choice) : null;
@@ -1362,18 +1534,29 @@ function walkDraft(s: Walk): DraftTreeNode | null {
     return {
       id: `${s.id}-${s.index}`,
       title: `${who} ${ordinal(n)} ${step.kind}`,
-      detail: "First line is the read. The second line is the adjustment if this step is something else.",
+      detail:
+        "Follow Expected unless they take a different hero — then use the Adjust path.",
       children: [
         {
           id: `${s.id}-${s.index}-plan`,
-          title: `Plan: ${choice.hero}`,
+          title: `Expected: ${choice.hero}`,
           detail: choice.why,
+          branch: "expected",
+          action: baseAction,
           children: plannedRest ? [plannedRest] : undefined,
         },
         {
           id: `${s.id}-${s.index}-alt`,
           title: pivot.title,
           detail: pivot.why,
+          branch: "adjust",
+          action: {
+            side: "their",
+            kind: step.kind,
+            ordinal: n,
+            hero: pivot.choice.hero,
+            player: pivot.choice.player,
+          },
           children: swungRest ? [swungRest] : undefined,
         },
       ],
@@ -1395,9 +1578,19 @@ function walkDraft(s: Walk): DraftTreeNode | null {
     const alt = alternateIfLeftUp(s);
     return {
       id: `${s.id}-${s.index}`,
-      title,
+      title: `${who} ${ordinal(n)} ${step.kind}`,
       detail: choice.why,
-      children: [left, alt].filter((n): n is DraftTreeNode => n !== null),
+      children: [
+        {
+          id: `${s.id}-${s.index}-take`,
+          title: `Expected: ${choice.hero}`,
+          detail: choice.why,
+          branch: "expected" as const,
+          action: baseAction,
+          children: left ? [left] : undefined,
+        },
+        alt,
+      ].filter((n): n is DraftTreeNode => n !== null),
     };
   }
 
@@ -1407,6 +1600,7 @@ function walkDraft(s: Walk): DraftTreeNode | null {
     id: `${s.id}-${s.index}`,
     title,
     detail: choice.why,
+    action: baseAction,
     children: next ? [next] : undefined,
   };
 }
@@ -1431,10 +1625,22 @@ function alternateIfLeftUp(s: Walk): DraftTreeNode | null {
     pendingSteal: hero,
     pendingStealPlayer: hit?.player ?? null,
   });
+  const n =
+    step.kind === "ban"
+      ? (ours ? s.ourBans : s.theirBansUsed) + 1
+      : (ours ? s.ourPicks : s.theirPicks) + 1;
   return {
     id: `${s.id}-leave`,
-    title: `${ours ? "Our" : "Their"} ${step.kind} if we leave ${hero}: ${alt.hero}`,
+    title: `If we leave ${hero}: ${alt.hero}`,
     detail: `${hero} stays up, so their next pick is ${hero}.`,
+    branch: "adjust",
+    action: {
+      side: ours ? "our" : "their",
+      kind: step.kind,
+      ordinal: n,
+      hero: alt.hero,
+      player: alt.player,
+    },
     children: rest ? [rest] : undefined,
   };
 }
@@ -1781,10 +1987,16 @@ function banWhy(
 }
 
 function removedNote(s: Walk): string {
-  const gone = [...s.gone];
-  if (!gone.length) return "";
-  const shown = gone.slice(-4).join(", ");
-  return `Already off the board: ${shown}.`;
+  const seen = new Set<string>();
+  const names: string[] = [];
+  for (const h of s.gone) {
+    const key = heroKey(h);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    names.push(h);
+  }
+  if (!names.length) return "";
+  return `Already off the board: ${names.slice(-4).join(", ")}.`;
 }
 
 function poolFrom(players: PlayerScout[]): HeroOpt[] {

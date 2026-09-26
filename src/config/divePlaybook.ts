@@ -64,6 +64,10 @@ export const divePlaybook = {
       objective:
         "Lock one target with micro-stun chains and delete them in ~1.5s.",
       heroes: ["Stitches", "Tyrande", "Jaina", "Kerrigan"],
+      /** Anti-dive heroes that push us toward this pivot. */
+      against: ["Tyrael", "Johanna", "Garrosh", "Uther"],
+      whyAgainst:
+        "They have a savior tank/peel — you cannot stick a five-man dive, so gorge or Cocoon one target and delete them instead.",
       maps: ["Tomb of the Spider Queen", "Towers of Doom"],
     },
     {
@@ -72,6 +76,9 @@ export const divePlaybook = {
       objective:
         "Whittle from range and force them off objectives without a hard engage.",
       heroes: ["Hanzo", "Chromie", "Stukov", "Johanna"],
+      against: ["Falstad", "Brightwing", "Tyrael", "Johanna", "Anduin"],
+      whyAgainst:
+        "Gust, Sanctification, or Phase Shift means dive cannot land — win from range and deny clean engages.",
       maps: ["Volskaya Foundry", "Alterac Pass"],
     },
     {
@@ -80,12 +87,53 @@ export const divePlaybook = {
       objective:
         "Avoid fair 5v5s; win XP and structures across the map.",
       heroes: ["Dehaka", "Falstad", "Brightwing", "Abathur"],
+      against: ["Anduin", "Uther", "Brightwing", "Falstad", "Johanna"],
+      whyAgainst:
+        "Their peel stack wins a fair fight — refuse the 5v5 and beat them on soak and structures.",
       maps: ["Cursed Hollow", "Sky Temple"],
     },
   ],
 } as const;
 
 export type DivePivot = (typeof divePlaybook.pivots)[number];
+
+/** Pick one pivot from the anti-dive heroes already in their pool. */
+export function chooseDivePivot(
+  antiDiveSeen: string[],
+  mapName?: string | null,
+): {
+  pivot: DivePivot;
+  matched: string[];
+  why: string;
+} {
+  const seen = new Set(antiDiveSeen);
+  const scored = divePlaybook.pivots.map((pivot) => {
+    const matched = pivot.against.filter((h) => seen.has(h));
+    const mapBonus =
+      mapName && (pivot.maps as readonly string[]).includes(mapName) ? 1.5 : 0;
+    return { pivot, matched, score: matched.length + mapBonus };
+  });
+  scored.sort((a, b) => b.score - a.score);
+  // Prefer poke when Gust/BW show up even on ties — those hard-counter stick dive.
+  const gustOrBw = seen.has("Falstad") || seen.has("Brightwing");
+  const best =
+    (gustOrBw &&
+      !mapName &&
+      scored.find((s) => s.pivot.id === "poke" && s.matched.length > 0)) ||
+    scored[0] ||
+    { pivot: divePlaybook.pivots[1], matched: [] as string[], score: 0 };
+
+  const matched = best.matched;
+  let why =
+    matched.length > 0
+      ? `${best.pivot.whyAgainst} Triggered by: ${matched.join(", ")}.`
+      : best.pivot.whyAgainst;
+  if (mapName && (best.pivot.maps as readonly string[]).includes(mapName)) {
+    why += ` ${mapName} favors this fight.`;
+  }
+
+  return { pivot: best.pivot, matched, why };
+}
 
 /** Static decision tree shown under Draft plan (our playbook, not the pick-by-pick walk). */
 export function divePlaybookTree(): DraftTreeNode {

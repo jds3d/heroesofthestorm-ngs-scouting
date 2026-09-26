@@ -1,4 +1,23 @@
-import type { PlayerScout } from "@/lib/scoring/types";
+import type { ComfortHero, PlayerScout, SourceHeroStat } from "@/lib/scoring/types";
+
+function sourceLabel(
+  short: string,
+  source: SourceHeroStat | undefined,
+): string | null {
+  if (!source || source.games <= 0) return null;
+  return `${short} ${(source.winRate * 100).toFixed(0)}% (${source.games}g)`;
+}
+
+function heroSourceLine(h: ComfortHero): string {
+  const parts = [
+    sourceLabel("NGS", h.sources.ngsCurrent),
+    sourceLabel("SL", h.sources.stormLeague),
+  ].filter(Boolean);
+  if (parts.length === 0 && h.sources.ngsPrior) {
+    parts.push(sourceLabel("NGS prior", h.sources.ngsPrior)!);
+  }
+  return parts.length > 0 ? parts.join(" · ") : "no sample";
+}
 
 export function PlayerCard({ player }: { player: PlayerScout }) {
   return (
@@ -31,23 +50,24 @@ export function PlayerCard({ player }: { player: PlayerScout }) {
           </a>
         </div>
       </div>
-      <ol className="mt-4 space-y-2">
+      <ol className="mt-4 space-y-3">
         {player.topHeroes.length === 0 && (
           <li className="text-sm text-[var(--muted)]">No hero sample yet</li>
         )}
         {player.topHeroes.map((h, i) => (
-          <li
-            key={h.hero}
-            className="flex items-baseline justify-between gap-3 text-sm"
-          >
-            <span className="text-[var(--ink)]">
-              <span className="mr-2 text-[var(--muted)]">{i + 1}.</span>
-              {h.hero}
-            </span>
-            <span className="shrink-0 text-[var(--muted)]">
-              comfort {(h.comfort * 100).toFixed(0)} ·{" "}
-              {(h.winRate * 100).toFixed(0)}% WR
-            </span>
+          <li key={h.hero} className="text-sm">
+            <div className="flex items-baseline justify-between gap-3">
+              <span className="text-[var(--ink)]">
+                <span className="mr-2 text-[var(--muted)]">{i + 1}.</span>
+                {h.hero}
+              </span>
+              <span className="shrink-0 text-[var(--muted)]">
+                comfort {(h.comfort * 100).toFixed(0)}
+              </span>
+            </div>
+            <p className="mt-0.5 pl-5 text-xs text-[var(--muted)]">
+              {heroSourceLine(h)}
+            </p>
           </li>
         ))}
       </ol>

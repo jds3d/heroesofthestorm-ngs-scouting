@@ -1,3 +1,5 @@
+import type { DraftMetaTable } from "@/lib/scoring/draftMeta";
+
 export type SourceHeroStat = {
   games: number;
   wins: number;
@@ -44,9 +46,19 @@ export type DraftDataQuality =
   | "incomplete"
   | "insufficient";
 
+export type DraftSectionGroup = {
+  title: string;
+  items?: string[];
+};
+
 export type DraftSection = {
   heading: string;
-  body: string;
+  /** Optional lead-in above bullets/groups. */
+  body?: string;
+  /** Flat list — one item per line. */
+  bullets?: string[];
+  /** Nested list (e.g. strategy group → common five). */
+  groups?: DraftSectionGroup[];
 };
 
 export type DraftInsights = {
@@ -120,16 +132,34 @@ export type OurCompBrief = {
   whyItWorks: string;
 };
 
+/** One ban or pick step for the interactive draft board. */
+export type DraftTreeAction = {
+  side: "our" | "their";
+  kind: "ban" | "pick";
+  ordinal: number;
+  hero: string;
+  player: string | null;
+};
+
 export type DraftTreeNode = {
   id: string;
   title: string;
   detail: string;
+  /**
+   * On a fork: `expected` is what we think they do (the read);
+   * `adjust` is what we do if that step is something else.
+   */
+  branch?: "expected" | "adjust";
+  /** Structured ban/pick for the HotS-style board (absent on fork parents). */
+  action?: DraftTreeAction;
   children?: DraftTreeNode[];
 };
 
 export type DraftSide = {
   label: string;
   summary: string;
+  /** Concrete counter read for their likely five — not archetype boilerplate. */
+  counterNote: string;
   theirLikely: DraftCompPick[];
   ourLikely: DraftCompPick[];
   ourCompNote: string | null;
@@ -138,10 +168,13 @@ export type DraftSide = {
 };
 
 export type DraftPlaybookPivot = {
+  id: string;
   name: string;
   objective: string;
   heroes: string[];
   maps: string[];
+  /** When this pivot is the answer to their anti-dive. */
+  why: string;
 };
 
 export type DraftPlaybook = {
@@ -150,7 +183,12 @@ export type DraftPlaybook = {
   /** Whether their predicted pool already shows anti-dive. */
   antiDiveThreat: boolean;
   antiDiveHeroesSeen: string[];
+  /** Single recommended pivot when anti-dive is already in their pool. */
+  recommended: DraftPlaybookPivot | null;
+  /** Other pivots — only if map/lobby forces a different fight. */
+  alternates: DraftPlaybookPivot[];
   tree: DraftTreeNode;
+  /** @deprecated Prefer recommended + alternates. Kept for older cached reports. */
   pivots: DraftPlaybookPivot[];
 };
 
@@ -181,6 +219,27 @@ export type AdaptPlan = {
   recommendations: AdaptRecommendation[];
   confidence: "high" | "medium" | "low";
   draftPlan: DraftPlan;
+  /** Maps we should ban vs leave up, from relative NGS records. */
+  mapPlan?: MapPlan | null;
+  /**
+   * Storm League–derived early/late timing + hard matchup counters.
+   * Built from HeroesProfile globals + matchups (not hand-written lore).
+   */
+  draftMeta?: DraftMetaTable | null;
+};
+
+export type MapPlanPick = {
+  map: string;
+  reason: string;
+  ourRecord: string | null;
+  theirRecord: string | null;
+  edge: number;
+};
+
+export type MapPlan = {
+  ban: MapPlanPick[];
+  play: MapPlanPick[];
+  note: string | null;
 };
 
 export type ScoutReport = {

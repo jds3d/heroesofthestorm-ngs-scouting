@@ -10,6 +10,7 @@ export const API_CALL_KINDS = [
   "hp-replay-bans",
   "hp-ngs-replay",
   "hp-global-heroes",
+  "hp-hero-matchups",
 ] as const;
 
 export type ApiCallKind = (typeof API_CALL_KINDS)[number];
@@ -30,6 +31,7 @@ const LABELS: Record<ApiCallKind, string> = {
   "hp-replay-bans": "HeroesProfile replay bans",
   "hp-ngs-replay": "HeroesProfile NGS replay",
   "hp-global-heroes": "HeroesProfile global hero stats",
+  "hp-hero-matchups": "HeroesProfile hero matchups",
 };
 
 type Store = { counts: Map<ApiCallKind, number> };
@@ -51,6 +53,7 @@ export function classifyHeroesProfile(endpoint: string): ApiCallKind | null {
   if (path.endsWith("/bans")) return "hp-replay-bans";
   if (path.startsWith("ngs/replay/")) return "hp-ngs-replay";
   if (path === "patches" || path.startsWith("heroes/stats")) return "hp-global-heroes";
+  if (path.startsWith("heroes/matchups")) return "hp-hero-matchups";
   return null;
 }
 

@@ -33,7 +33,7 @@ export function ScoutApp() {
   const [predictedCalls, setPredictedCalls] = useState<CallCount[] | null>(
     null,
   );
-  const [ignoreCache, setIgnoreCache] = useState(false);
+  const [refreshPlayerData, setRefreshPlayerData] = useState(false);
   const [ourRoster, setOurRoster] = useState<RosterPlayer[]>([]);
   const [theirRoster, setTheirRoster] = useState<RosterPlayer[]>([]);
   const [ourFive, setOurFive] = useState<string[]>([]);
@@ -115,7 +115,7 @@ export function ScoutApp() {
     setPredictedCalls(null);
     const teamPath = encodeURIComponent(selected.replace(/ /g, "_"));
     const params = new URLSearchParams();
-    if (ignoreCache) params.set("fresh", "1");
+    if (refreshPlayerData) params.set("fresh", "1");
     params.set("ours", ourFive.join("|"));
     params.set("theirs", (scoutingSelf ? ourFive : theirFive).join("|"));
     const fresh = `?${params.toString()}`;
@@ -200,11 +200,11 @@ export function ScoutApp() {
         <label className="flex h-12 items-center gap-2 text-sm text-[var(--ink)]">
           <input
             type="checkbox"
-            checked={ignoreCache}
+            checked={refreshPlayerData}
             disabled={loadingReport}
-            onChange={(e) => setIgnoreCache(e.target.checked)}
+            onChange={(e) => setRefreshPlayerData(e.target.checked)}
           />
-          Ignore cache and recache
+          Refresh hero &amp; player data
         </label>
       </section>
 
@@ -242,9 +242,9 @@ export function ScoutApp() {
       {loadingReport && (
         <div className="space-y-2 text-sm text-[var(--muted)]">
           <p>
-            {ignoreCache
-              ? "Ignoring saved data and pulling this team again. The new result replaces the cache."
-              : "Scouting… cached data is skipped, so a repeat is much smaller."}
+            {refreshPlayerData
+              ? "Rebuilding the report and re-pulling NGS profiles / Storm League. Past games stay cached."
+              : "Rebuilding the report from cached games and player data. Only missing pieces are fetched."}
           </p>
           {predictedCalls && predictedCalls.some((c) => c.count > 0) ? (
             <ul className="space-y-1">

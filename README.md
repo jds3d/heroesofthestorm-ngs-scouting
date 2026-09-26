@@ -53,7 +53,7 @@ docker compose down            # stop and remove containers
 2. Click **Generate scout report**.
 3. Review draft narrative, ban priorities, team threats, and per-player comfort heroes.
 
-First scout for a team can take a while (NGS + HeroesProfile calls). **Past games are forever-cached** under `.cache/` (replay/draft/ban payloads never change). Current-season player/Storm League stats refresh on a ~7 day TTL. Re-scouting reuses forever-cached games and only pulls what's missing.
+First scout for a team can take a while (NGS + HeroesProfile calls). **Past games are forever-cached** under `.cache/` (replay/draft/ban payloads never change). **Generate** always rebuilds the report from that data (plus any missing pulls). Check **Refresh hero & player data** to re-pull NGS profiles and Storm League stats when those look stale.
 
 ## Config
 

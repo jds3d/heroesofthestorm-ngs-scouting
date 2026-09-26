@@ -1,11 +1,13 @@
 import { leagueConfig } from "@/config/league";
 import type { HpMatchGame, HpNgsMatch } from "@/lib/heroesprofile/types";
 import type { NgsMatch } from "@/lib/ngs/types";
+import { labelArchetypeTag } from "@/lib/scoring/glossary";
 import { heroRole, heroTags } from "@/lib/scoring/heroMeta";
 import type {
   DraftDataQuality,
   DraftInsights,
   DraftSection,
+  DraftSectionGroup,
   PlayerScout,
 } from "@/lib/scoring/types";
 
@@ -90,7 +92,7 @@ function detectGameArchetype(heroes: string[]): string {
   if (ranked.includes("hypercarry")) return "hypercarry protect";
   if (ranked.includes("solo") && ranked.includes("engage"))
     return "bruiser frontline";
-  if (ranked[0]) return ranked[0];
+  if (ranked[0]) return labelArchetypeTag(ranked[0]);
   return "flexible / mixed";
 }
 
@@ -180,9 +182,15 @@ export function buildDraftInsights(
   >();
   const archetypeVotes = new Map<string, number>();
   const strategyPlays = new Map<string, PlaySplit>();
-  const compPlays = new Map<string, PlaySplit & { heroes: string[] }>();
+  /** Comp counts keyed by strategy archetype, then by sorted-hero key. */
+  const compsByStrategy = new Map<
+    string,
+    Map<string, PlaySplit & { heroes: string[] }>
+  >();
   let matchesAnalyzed = 0;
   let gamesWithHeroes = 0;
+  let gamesWithTheirBans = 0;
+  let gamesWithEnemyBans = 0;
   let reportedGamesExpected = 0;
   let currentMaps = 0;
   let priorMaps = 0;
@@ -229,20 +237,28 @@ export function buildDraftInsights(
         addPlay(strategyPlays, archetype, priorGame);
         if (teamHeroes.length === 5) {
           const key = compKey(teamHeroes);
-          const bucket = compPlays.get(key) ?? {
+          const byArch = compsByStrategy.get(archetype) ?? new Map();
+          const archBucket = byArch.get(key) ?? {
             heroes: teamHeroes,
             current: 0,
             prior: 0,
           };
-          if (priorGame) bucket.prior += 1;
-          else bucket.current += 1;
-          compPlays.set(key, bucket);
+          if (priorGame) archBucket.prior += 1;
+          else archBucket.current += 1;
+          byArch.set(key, archBucket);
+          compsByStrategy.set(archetype, byArch);
         }
         if (teamHeroes[0]) bump(firstPicks, teamHeroes[0], weight);
       }
 
-      for (const b of teamBans) bump(theirBans, b, weight);
-      for (const b of enemyBans) bump(bannedAgainst, b, weight);
+      if (teamBans.length > 0) {
+        gamesWithTheirBans += weight;
+        for (const b of teamBans) bump(theirBans, b, weight);
+      }
+      if (enemyBans.length > 0) {
+        gamesWithEnemyBans += weight;
+        for (const b of enemyBans) bump(bannedAgainst, b, weight);
+      }
 
       const mapName = game.map;
       if (mapName && teamHeroes.length > 0) {
@@ -330,13 +346,23 @@ export function buildDraftInsights(
     )[0];
 
   const fp = firstPickHeroes[0];
-  const ban1 = theirBanList[0]?.hero;
-  const ban2 = theirBanList[1]?.hero;
   const mapNote = mapTendencies[0];
   const weakRole = findWeakRole(players);
   const sections: DraftSection[] = [];
-  const add = (heading: string, body: string | null | undefined) => {
-    if (body?.trim()) sections.push({ heading, body: body.trim() });
+  const add = (
+    heading: string,
+    body: string | null | undefined,
+    extras?: { bullets?: string[]; groups?: DraftSectionGroup[] },
+  ) => {
+    if (!body?.trim() && !extras?.bullets?.length && !extras?.groups?.length) {
+      return;
+    }
+    sections.push({
+      heading,
+      body: body?.trim() || undefined,
+      bullets: extras?.bullets,
+      groups: extras?.groups,
+    });
   };
 
   if (trustNgsDrafts) {
@@ -387,34 +413,24 @@ export function buildDraftInsights(
     );
   }
 
-  add("Strategy groups", strategyGroupSentence());
-  add("Most common 5-man", mostCommonFiveSentence());
+  add("Strategy groups", null, { groups: strategyGroupBlocks() });
 
   if (trustNgsDrafts && fp) {
     add("First-pick lean", `${fp.hero} (~${fp.pct}% of analyzed games)`);
   }
-  if (ban1) {
-    add(
-      "Their hero bans",
-      ban2 ? `${ban1} and ${ban2}` : ban1,
-    );
+
+  const heroBanBullets = heroBanLines();
+  if (heroBanBullets.length) {
+    add("Hero bans", null, { bullets: heroBanBullets });
   }
-  if (bannedAgainstList[0]) {
-    add(
-      "Banned into them",
-      bannedAgainstList
-        .slice(0, 3)
-        .map((b) => b.hero)
-        .join(", "),
-    );
-  }
+
   if (mapBans[0]) {
     add(
-      "Their map bans",
-      mapBans
-        .slice(0, 3)
-        .map((m) => m.map)
-        .join(", "),
+      "Maps they ban",
+      null,
+      {
+        bullets: mapBans.slice(0, 3).map((m) => m.map),
+      },
     );
   }
   if (trustNgsDrafts && mapNote) {
@@ -427,7 +443,10 @@ export function buildDraftInsights(
     );
   }
   if (weakRole) {
-    add("Soft spot", `Limited flex off ${weakRole}`);
+    add(
+      "Soft spot",
+      `Nobody on the roster lists ${weakRole} as their preferred role. If you strip their usual Tank / Healer / Ranged comfort, they do not have a clear ${weakRole} player to fall back on — that flex seat gets filled by someone playing off-role.`,
+    );
   }
 
   const notes: string[] = [];
@@ -447,7 +466,7 @@ export function buildDraftInsights(
     }
   }
 
-  function strategyGroupSentence(): string | null {
+  function strategyGroupBlocks(): DraftSectionGroup[] {
     const groups = [...strategyPlays.entries()]
       .map(([label, plays]) => ({
         label,
@@ -461,38 +480,92 @@ export function buildDraftInsights(
           b.current - a.current ||
           a.label.localeCompare(b.label),
       );
-    if (groups.length === 0) return null;
-    return groups
-      .map((g) => `${g.label} (${countLabel(g.current, g.prior)})`)
-      .join("; ");
+    return groups.map((g) => {
+      const comps = [...(compsByStrategy.get(g.label)?.values() ?? [])]
+        .map((c) => ({ ...c, total: c.current + c.prior }))
+        .filter((c) => c.total > 0)
+        .sort(
+          (a, b) =>
+            b.total - a.total ||
+            b.current - a.current ||
+            formatFive(a.heroes).localeCompare(formatFive(b.heroes)),
+        );
+      const items: string[] = [];
+      if (comps.length === 0) {
+        items.push("No full five recorded for this shape.");
+      } else {
+        const top = comps[0];
+        const tied = comps.filter(
+          (r) => r.total === top.total && r.current === top.current,
+        );
+        const label = countLabel(top.current, top.prior);
+        if (tied.length === 1) {
+          items.push(`Most common five (${label}): ${formatFive(top.heroes)}`);
+        } else {
+          const shown = tied.slice(0, 3);
+          for (const row of shown) {
+            items.push(`Tied most common (${label}): ${formatFive(row.heroes)}`);
+          }
+          if (tied.length > 3) {
+            items.push(`+${tied.length - 3} more tied fives`);
+          }
+        }
+      }
+      return {
+        title: `${g.label} (${countLabel(g.current, g.prior)})`,
+        items,
+      };
+    });
   }
 
-  function mostCommonFiveSentence(): string | null {
-    const rows = [...compPlays.values()]
-      .map((c) => ({ ...c, total: c.current + c.prior }))
-      .filter((c) => c.total > 0)
-      .sort(
-        (a, b) =>
-          b.total - a.total ||
-          b.current - a.current ||
-          formatFive(a.heroes).localeCompare(formatFive(b.heroes)),
-      );
-    if (rows.length === 0) return null;
-    const top = rows[0];
-    const tied = rows.filter(
-      (r) => r.total === top.total && r.current === top.current,
+  function heroBanLines(): string[] {
+    const theirPct = (count: number) =>
+      gamesWithTheirBans > 0
+        ? Math.round((count / gamesWithTheirBans) * 1000) / 10
+        : 0;
+    const intoPct = (count: number) =>
+      gamesWithEnemyBans > 0
+        ? Math.round((count / gamesWithEnemyBans) * 1000) / 10
+        : 0;
+
+    const theirMap = new Map(theirBanList.map((b) => [b.hero, b.count]));
+    const intoMap = new Map(bannedAgainstList.map((b) => [b.hero, b.count]));
+    const heroes = [
+      ...new Set([...theirMap.keys(), ...intoMap.keys()]),
+    ].sort(
+      (a, b) =>
+        (intoMap.get(b) ?? 0) +
+          (theirMap.get(b) ?? 0) -
+          ((intoMap.get(a) ?? 0) + (theirMap.get(a) ?? 0)) ||
+        a.localeCompare(b),
     );
-    const label = countLabel(top.current, top.prior);
-    if (tied.length === 1) {
-      return `${formatFive(top.heroes)} (${label})`;
+
+    const lines: string[] = [];
+    for (const hero of heroes.slice(0, 8)) {
+      const theyBan = theirPct(theirMap.get(hero) ?? 0);
+      const intoThem = intoPct(intoMap.get(hero) ?? 0);
+      if (theyBan <= 0 && intoThem <= 0) continue;
+      lines.push(
+        `${hero} — they ban ${theyBan}%; banned into them ${intoThem}%`,
+      );
     }
-    const shown = tied.slice(0, 3).map((r) => formatFive(r.heroes));
-    const extra = tied.length > 3 ? `; +${tied.length - 3} more` : "";
-    return `Tied at ${label}: ${shown.join("; ")}${extra}`;
+    return lines;
   }
 
   return {
-    narrative: sections.map((s) => `${s.heading}: ${s.body}`).join(" "),
+    narrative: sections
+      .map((s) => {
+        const bits = [
+          s.body,
+          ...(s.bullets ?? []),
+          ...(s.groups ?? []).flatMap((g) => [
+            g.title,
+            ...(g.items ?? []).map((i) => `  ${i}`),
+          ]),
+        ].filter(Boolean);
+        return `${s.heading}: ${bits.join(" / ")}`;
+      })
+      .join(" "),
     sections,
     archetype,
     gamesAnalyzedLabel: gamesAnalyzedLabel(

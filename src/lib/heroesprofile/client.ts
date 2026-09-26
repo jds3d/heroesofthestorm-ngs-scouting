@@ -3,6 +3,10 @@ import { leagueConfig } from "@/config/league";
 import { FOREVER, cachedFetch, getCached } from "@/lib/cache";
 import type { GlobalHeroStat } from "@/lib/scoring/metaPressure";
 import type {
+  HeroMapStat,
+  MatchupEnemyRow,
+} from "@/lib/scoring/draftMeta";
+import type {
   HpDraftEntry,
   HpMatchGame,
   HpNgsMatch,
@@ -580,7 +584,8 @@ export async function getNgsMatch(
 
 export const globalHeroStatsKey = "hp-v1-global-heroes-sl-minor";
 
-const GLOBAL_HERO_TTL_MS = 24 * 60 * 60 * 1000;
+/** Storm League globals / matchups / map stats — refresh at most weekly. */
+const GLOBAL_HERO_TTL_MS = leagueConfig.cacheTtlMs;
 
 type PatchList = {
   patches?: { game_version?: string; valid_globals?: boolean }[];
@@ -598,18 +603,32 @@ type HeroStatsResponse = {
   }[];
 };
 
+const PATCH_TTL_MS = leagueConfig.cacheTtlMs;
+const patchCacheKey = "hp-v1-current-global-patch";
+
+async function currentGlobalPatch(): Promise<string | null> {
+  return cachedFetch(
+    patchCacheKey,
+    async () => {
+      const patches = await hpGet<PatchList>("patches");
+      const patch =
+        patches.patches?.find((p) => p.valid_globals && p.game_version) ??
+        patches.patches?.find((p) => p.game_version);
+      return patch?.game_version ?? null;
+    },
+    PATCH_TTL_MS,
+  );
+}
+
 /** Current minor patch, Storm League. One cached pull for the whole meta table. */
 export async function getGlobalHeroStats(): Promise<GlobalHeroStat[]> {
   return cachedFetch(globalHeroStatsKey, async () => {
-    const patches = await hpGet<PatchList>("patches");
-    const patch =
-      patches.patches?.find((p) => p.valid_globals && p.game_version) ??
-      patches.patches?.find((p) => p.game_version);
-    if (!patch?.game_version) return [];
+    const gameVersion = await currentGlobalPatch();
+    if (!gameVersion) return [];
     const stats = await hpGet<HeroStatsResponse>("heroes/stats", {
       game_type: "Storm League",
       timeframe_type: "minor",
-      timeframe: patch.game_version,
+      timeframe: gameVersion,
     });
     return (stats.data ?? [])
       .filter((row) => row.name)
@@ -623,6 +642,153 @@ export async function getGlobalHeroStats(): Promise<GlobalHeroStat[]> {
         games: Number(row.games_played) || 0,
       }));
   }, GLOBAL_HERO_TTL_MS);
+}
+
+export const globalHeroMapStatsKey = "hp-v1-global-heroes-sl-minor-by-map";
+
+type HeroStatsByMapResponse = {
+  data?: {
+    name?: string;
+    map?: string | { name?: string };
+    game_map?: string | { name?: string };
+    win_rate?: number;
+    games_played?: number;
+  }[];
+};
+
+function mapNameFromRow(row: {
+  map?: string | { name?: string };
+  game_map?: string | { name?: string };
+}): string | null {
+  const raw = row.map ?? row.game_map;
+  if (!raw) return null;
+  if (typeof raw === "string") return raw;
+  return raw.name ?? null;
+}
+
+/** Per-hero-per-map Storm League WR for the current minor patch. */
+export async function getGlobalHeroStatsByMap(): Promise<HeroMapStat[]> {
+  return cachedFetch(
+    globalHeroMapStatsKey,
+    async () => {
+      const gameVersion = await currentGlobalPatch();
+      if (!gameVersion) return [];
+      const stats = await hpGet<HeroStatsByMapResponse>("heroes/stats", {
+        game_type: "Storm League",
+        timeframe_type: "minor",
+        timeframe: gameVersion,
+        group_by_map: "true",
+      });
+      return (stats.data ?? [])
+        .map((row) => {
+          const map = mapNameFromRow(row);
+          if (!row.name || !map) return null;
+          return {
+            hero: row.name,
+            map,
+            winRate: Number(row.win_rate) || 0,
+            games: Number(row.games_played) || 0,
+          } satisfies HeroMapStat;
+        })
+        .filter((r): r is HeroMapStat => r != null);
+    },
+    GLOBAL_HERO_TTL_MS,
+  );
+}
+
+type MatchupApiRow = {
+  hero?: { name?: string };
+  wins?: number;
+  losses?: number;
+  games_played?: number;
+  win_rate?: number;
+};
+
+type MatchupApiResponse = {
+  enemy?: MatchupApiRow[];
+};
+
+function matchupsCacheKey(patch: string, hero: string): string {
+  return `hp-v1-matchups-sl-minor-${patch}-${hero.replace(/[^a-zA-Z0-9._-]+/g, "_")}`;
+}
+
+/** Enemy matchup rows for one hero (Storm League, current minor patch). */
+export async function getHeroMatchups(hero: string): Promise<{
+  patch: string;
+  enemies: MatchupEnemyRow[];
+}> {
+  const gameVersion = await currentGlobalPatch();
+  if (!gameVersion) return { patch: "", enemies: [] };
+  return cachedFetch(
+    matchupsCacheKey(gameVersion, hero),
+    async () => {
+      const raw = await hpGet<MatchupApiResponse>("heroes/matchups", {
+        game_type: "Storm League",
+        timeframe_type: "minor",
+        timeframe: gameVersion,
+        hero,
+      });
+      const enemies: MatchupEnemyRow[] = (raw.enemy ?? [])
+        .map((row) => {
+          const name = row.hero?.name;
+          if (!name) return null;
+          const wins = Number(row.wins) || 0;
+          const losses = Number(row.losses) || 0;
+          const games = Number(row.games_played) || wins + losses;
+          return {
+            hero: name,
+            wins,
+            losses,
+            games,
+            // HP enemy.win_rate is opponent win% into you.
+            enemyWinRate: Number(row.win_rate) || 0,
+          } satisfies MatchupEnemyRow;
+        })
+        .filter((r): r is MatchupEnemyRow => r != null);
+      return { patch: gameVersion, enemies };
+    },
+    GLOBAL_HERO_TTL_MS,
+  );
+}
+
+/**
+ * Fetch matchups for many heroes. Cached heroes are free; uncached calls
+ * run with low concurrency to avoid HeroesProfile rate limits.
+ */
+export async function getHeroMatchupsMany(
+  heroes: string[],
+): Promise<{ patch: string; byHero: Record<string, MatchupEnemyRow[]> }> {
+  const unique = [...new Set(heroes.filter(Boolean))];
+  const byHero: Record<string, MatchupEnemyRow[]> = {};
+  let patch = "";
+  const queue = [...unique];
+  const workers = 2;
+  async function worker() {
+    while (queue.length) {
+      const hero = queue.shift();
+      if (!hero) break;
+      try {
+        const { patch: p, enemies } = await getHeroMatchups(hero);
+        if (p) patch = p;
+        byHero[hero] = enemies;
+      } catch (err) {
+        if (
+          err instanceof HeroesProfileError &&
+          (err.status === 429 || err.code === "rate_limited")
+        ) {
+          await sleep(8000);
+          queue.unshift(hero);
+          continue;
+        }
+        // Skip failed hero — draft meta degrades to globals-only for them.
+      }
+      await sleep(350);
+    }
+  }
+  await Promise.all(
+    Array.from({ length: Math.min(workers, unique.length) }, () => worker()),
+  );
+  return { patch, byHero };
 }
 
 export async function checkHeroesProfileAuth(): Promise<{

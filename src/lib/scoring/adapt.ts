@@ -1,4 +1,5 @@
 import { buildDraftPlan } from "@/lib/scoring/draftPlan";
+import { buildMapPlan } from "@/lib/scoring/mapPlan";
 import {
   banPressure,
   heroComfort,
@@ -19,6 +20,7 @@ export function buildAdaptPlan(
   threats: TeamThreat[],
   draft: DraftInsights,
   meta: GlobalHeroStat[] = [],
+  ourMaps: DraftInsights["mapTendencies"] | null = null,
 ): AdaptPlan {
   const recommendations: AdaptRecommendation[] = [];
   const banPriority: { hero: string; reason: string }[] = [];
@@ -34,6 +36,8 @@ export function buildAdaptPlan(
       : totalNgsGames >= 8
         ? "medium"
         : "low";
+
+  const mapPlan = buildMapPlan(draft.mapTendencies, ourMaps);
 
   // One-tricks / signature comfort
   for (const p of players) {
@@ -127,27 +131,29 @@ export function buildAdaptPlan(
     });
   }
 
-  // Map bans
-  if (draft.mapBans.length) {
+  // Map plan — what we ban / what we want to play
+  if (mapPlan.ban.length || mapPlan.play.length) {
+    const banBit = mapPlan.ban.length
+      ? `Ban ${mapPlan.ban.map((m) => m.map).join(" and ")}`
+      : null;
+    const playBit = mapPlan.play.length
+      ? `leave up ${mapPlan.play.map((m) => m.map).join(", ")}`
+      : null;
     recommendations.push({
-      priority: 3,
-      title: "Map ban path",
-      detail: `Expect them to ban ${draft.mapBans
-        .slice(0, 2)
-        .map((m) => m.map)
-        .join(" and ")}. Prepare three map plans for what remains.`,
+      priority: 2,
+      title: "Map plan",
+      detail: [banBit, playBit].filter(Boolean).join("; ") + ".",
     });
   }
 
-  // What they fear (their bans) — bait / bring
+  // What they fear (their bans) — concrete pick / ban / strategy if they spend it
   if (draft.theirBans[0]) {
+    const feared = draft.theirBans.slice(0, 3);
+    const lines = feared.map((b) => fearBanAdvice(b.hero));
     recommendations.push({
-      priority: 3,
-      title: "They fear these",
-      detail: `Their common bans (${draft.theirBans
-        .slice(0, 3)
-        .map((b) => b.hero)
-        .join(", ")}) reveal priority threats — bring flex versions or bait the ban.`,
+      priority: 2,
+      title: "If they ban what they fear",
+      detail: lines.join(" "),
     });
   }
 
@@ -228,6 +234,7 @@ export function buildAdaptPlan(
     recommendations: uniqRecs,
     confidence,
     draftPlan: buildDraftPlan(players, draft, null, meta),
+    mapPlan,
   };
 }
 
@@ -260,6 +267,38 @@ function findBestInRole(players: PlayerScout[], role: string): string | null {
     }
   }
   return best?.hero ?? null;
+}
+
+/**
+ * Concrete response when opponents spend a ban on a hero they commonly fear.
+ * Tell us what to pick, what to ban next, or which fight shape to divert to.
+ */
+function fearBanAdvice(hero: string): string {
+  const role = heroRole(hero);
+  const tags = heroTags(hero);
+
+  if (role === "Bruiser" || tags.includes("solo")) {
+    return `${hero}: they are denying offlane sustain — lock a flexible tank/healer first, then take offlane after they declare the lane. If you open Leoric / Sonya / Dehaka early, it is as flex bait only: play them in the 4-man if they counter-pick the lane, and take the real offlaner later. Never first-pick your committed offlaner into open answers — offlane is ~half the game.`;
+  }
+  if (
+    (role === "Melee Assassin" || role === "Ranged Assassin") &&
+    (tags.includes("dive") || tags.includes("assassin") || tags.includes("pick"))
+  ) {
+    return `${hero}: they are scared of dive/pick — either first-pick ${hero} when they leave it, or drop pure dive and pivot to poke (Hanzo / Jaina / Chromie) or blow-up (Stitches / Kerrigan). Next, ban their best peel (Tyrael, Brightwing, or Johanna) so they cannot punish the divert.`;
+  }
+  if (role === "Tank" || tags.includes("frontline") || tags.includes("peel")) {
+    return `${hero}: they are denying a tank shell — if the ban lands, lock Diablo, Anub'arak, or Johanna next and keep our healer flexible (Rehgar / Brightwing). If they leave ${hero} up, first-pick them and force them onto a worse tank.`;
+  }
+  if (role === "Healer" || tags.includes("heal")) {
+    return `${hero}: they are denying our heal — first-pick Rehgar, Anduin, or Brightwing immediately, or leave ${hero} up and take them. Ban their best engage tank next so they cannot run at a backup healer.`;
+  }
+  if (tags.includes("poke") || tags.includes("siege") || tags.includes("hypercarry")) {
+    return `${hero}: they are denying ranged threat — if banned, divert to dive (Genji / Greymane / Kerrigan behind Anub/Tyrael) or global macro (Dehaka / Falstad). If left up, first-pick ${hero} and ban their best gap-closer.`;
+  }
+  if (tags.includes("global") || tags.includes("split")) {
+    return `${hero}: they are denying map pressure — if banned, take Dehaka, Falstad, or Brightwing as the global instead, and play for soak + objective timers rather than a fair 5v5.`;
+  }
+  return `${hero}: treat the ban as a free tell — either first-pick ${hero} when available, or fill that same role with a flex (same role: ${role === "Unknown" ? "whatever they just denied" : role}) and ban the hero that answers our divert.`;
 }
 
 function dedupeHeroes(

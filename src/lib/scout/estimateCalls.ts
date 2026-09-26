@@ -1,12 +1,14 @@
 import { leagueConfig } from "@/config/league";
 import {
-  API_CALL_KINDS,
   type ApiCallCount,
   type ApiCallKind,
   countsFromMap,
 } from "@/lib/apiUsage";
 import { FOREVER, cacheHas, getCached } from "@/lib/cache";
-import { globalHeroStatsKey } from "@/lib/heroesprofile/client";
+import {
+  globalHeroMapStatsKey,
+  globalHeroStatsKey,
+} from "@/lib/heroesprofile/client";
 import type { NgsTeam } from "@/lib/ngs/types";
 import type { NgsPlayerProfile } from "@/lib/heroesprofile/types";
 import type { HpReplayData } from "@/lib/heroesprofile/types";
@@ -17,16 +19,6 @@ import {
   teamMatchesCacheKey,
 } from "@/lib/ngs/client";
 import type { NgsMatch } from "@/lib/ngs/types";
-import { readCacheEntry } from "@/lib/cache";
-
-const reportKey = (teamName: string) => `scout-report-${teamName}`;
-
-function sameIds(a: string[], b: string[]): boolean {
-  if (a.length !== b.length) return false;
-  const left = [...a].sort();
-  const right = [...b].sort();
-  return left.every((id, i) => id === right[i]);
-}
 
 async function replayNeedsFetch(id: number): Promise<"cached" | "bans" | "full"> {
   const replay = await getCached<HpReplayData>(`hp-v1-ngs-replay-${id}`, FOREVER);
@@ -51,18 +43,24 @@ async function roundIsCached(
   );
 }
 
-/** What the next scout will call, based on cache. Does not include this check's own schedule fetch. */
+/**
+ * What the next scout will call. Generate always rebuilds the report; only
+ * missing source data (or a player-data refresh) produces API calls.
+ */
 export async function predictScoutCalls(
   teamName: string,
-  opts?: { ignoreCache?: boolean; starters?: string[] },
+  opts?: { refreshPlayerData?: boolean; starters?: string[] },
 ): Promise<ApiCallCount[]> {
-  const ignoreCache = Boolean(opts?.ignoreCache);
+  const refreshPlayerData = Boolean(opts?.refreshPlayerData);
   const starterSet = new Set((opts?.starters ?? []).map((s) => s.toLowerCase()));
   const counts = new Map<ApiCallKind, number>();
   const add = (kind: ApiCallKind, n = 1) =>
     counts.set(kind, (counts.get(kind) ?? 0) + n);
 
   if (!(await cacheHas(globalHeroStatsKey))) add("hp-global-heroes", 2);
+  if (!(await cacheHas(globalHeroMapStatsKey))) add("hp-global-heroes", 1);
+  // Matchups for plan heroes are usually cached after the first scout of a patch.
+  add("hp-hero-matchups", 8);
 
   const matches = await getTeamMatches(teamName, leagueConfig.season, {
     fresh: true,
@@ -70,45 +68,40 @@ export async function predictScoutCalls(
   add("ngs-schedule", 1);
 
   const reported = matches.filter((m) => m.reported);
-  const reportedIds = reported.map((m) => m.matchId);
-  const replayIds = reported.flatMap((m) => extractHpReplayIds(m));
-  const entry = await readCacheEntry<{ reportedMatchIds?: string[] }>(
-    reportKey(teamName),
-  );
-  const cached = entry?.fresh ? entry.data : null;
-  const covered =
-    cached != null && sameIds(cached.reportedMatchIds ?? [], reportedIds);
-  let needsReplay = false;
-  for (const id of replayIds) {
-    if (!(await cacheHas(`hp-v1-ngs-replay-${id}`))) {
-      needsReplay = true;
-      break;
-    }
-  }
 
-  if (!ignoreCache && cached && covered && !needsReplay) {
-    return countsFromMap(counts);
-  }
-
-  const weekly = ignoreCache || !cached;
   let team = await getCached<NgsTeam>(`ngs-team-${teamName}`);
   if (!team) team = await getTeam(teamName).catch(() => null);
-  if (weekly) add("ngs-team");
+  if (refreshPlayerData || !team) add("ngs-team");
+
   const tags = (team?.teamMembers ?? [])
     .map((m) => m.displayName)
     .filter((tag) => starterSet.size === 0 || starterSet.has(tag.toLowerCase()));
 
   const priorKey = teamMatchesCacheKey(teamName, leagueConfig.priorSeason);
   const priorCached = await getCached<NgsMatch[]>(priorKey, FOREVER);
-  if (ignoreCache || !priorCached) add("ngs-schedule");
+  if (refreshPlayerData || !priorCached) add("ngs-schedule");
 
   for (const tag of tags) {
     const slKey = `hp-v1-hero-all-${tag}-Storm League-${leagueConfig.stormLeagueStartDate}`;
-    if (weekly || !(await cacheHas(slKey))) add("hp-storm-league");
-    add("hp-ngs-player", 2);
+    if (refreshPlayerData || !(await cacheHas(slKey))) add("hp-storm-league");
+    // Current + prior season profiles (pipeline always asks for both).
+    if (refreshPlayerData) {
+      add("hp-ngs-player", 2);
+    } else {
+      const cur = `hp-v1-ngs-profile-${tag}-s${leagueConfig.season}-${leagueConfig.division}`;
+      const prior = `hp-v1-ngs-profile-${tag}-s${leagueConfig.priorSeason}-${leagueConfig.division}`;
+      if (!(await cacheHas(cur))) add("hp-ngs-player");
+      if (!(await cacheHas(prior))) add("hp-ngs-player");
+    }
   }
 
-  await addRoundCalls(counts, teamName, leagueConfig.season, reported, ignoreCache);
+  await addRoundCalls(
+    counts,
+    teamName,
+    leagueConfig.season,
+    reported,
+    refreshPlayerData,
+  );
 
   const priorReturning = await countCachedReturning(tags);
   if (priorReturning >= 3 && priorCached) {
@@ -118,14 +111,11 @@ export async function predictScoutCalls(
       teamName,
       leagueConfig.priorSeason,
       priorReported,
-      ignoreCache,
+      false,
     );
   }
 
-  return API_CALL_KINDS.map((kind) => {
-    const row = countsFromMap(counts).find((r) => r.kind === kind)!;
-    return row;
-  });
+  return countsFromMap(counts);
 }
 
 async function countCachedReturning(tags: string[]): Promise<number> {
@@ -144,16 +134,19 @@ async function addRoundCalls(
   teamName: string,
   season: number,
   reported: NgsMatch[],
-  ignoreCache = false,
+  forceListRefresh = false,
 ): Promise<void> {
   const add = (kind: ApiCallKind, n = 1) =>
     counts.set(kind, (counts.get(kind) ?? 0) + n);
   let needList = false;
   for (const match of reported) {
-    if (!ignoreCache && (await roundIsCached(teamName, season, match.round))) continue;
+    if (!forceListRefresh && (await roundIsCached(teamName, season, match.round))) {
+      continue;
+    }
     needList = true;
     for (const id of extractHpReplayIds(match)) {
-      const state = ignoreCache ? "full" : await replayNeedsFetch(id);
+      // Never force re-download of forever-cached replays.
+      const state = await replayNeedsFetch(id);
       if (state === "full") {
         add("hp-replay-draft");
         add("hp-replay-bans", 2);
@@ -165,7 +158,7 @@ async function addRoundCalls(
   if (needList) {
     const listKey = `hp-v1-ngs-team-matches-s${season}-${leagueConfig.division}-${teamName}`;
     const listCached =
-      ignoreCache || season === leagueConfig.season
+      forceListRefresh || season === leagueConfig.season
         ? false
         : await cacheHas(listKey);
     if (!listCached) add("hp-team-matches");
