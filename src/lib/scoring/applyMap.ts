@@ -1,6 +1,12 @@
 import { divePlaybook, chooseDivePivot } from "@/config/divePlaybook";
 import { ngsMapByName, type NgsMap } from "@/config/ngsMaps";
-import type { DraftPlan, DraftPlaybookPivot } from "@/lib/scoring/types";
+import { mapBriefForSelectedMap } from "@/lib/scoring/draftPlan";
+import type {
+  DraftInsights,
+  DraftPlan,
+  DraftPlaybookPivot,
+  OurCompBrief,
+} from "@/lib/scoring/types";
 
 function toPivot(
   p: (typeof divePlaybook.pivots)[number],
@@ -65,10 +71,26 @@ function pivotForMap(
   };
 }
 
+function patchBrief(
+  brief: OurCompBrief,
+  picks: DraftPlan["theirLikely"],
+  mapName: string,
+  draft: DraftInsights,
+): OurCompBrief {
+  const next = mapBriefForSelectedMap(picks, mapName, draft);
+  return {
+    ...brief,
+    kind: next.kind,
+    mapStrategy: next.mapStrategy,
+    whyItWorks: next.whyItWorks,
+  };
+}
+
 /** Rewrite plan text / playbook for the selected NGS map. */
 export function applyMapToDraftPlan(
   plan: DraftPlan,
   mapName: string | null,
+  draft?: DraftInsights | null,
 ): DraftPlan {
   if (!mapName) return plan;
   const map = ngsMapByName(mapName);
@@ -85,7 +107,7 @@ export function applyMapToDraftPlan(
         const next = pivotForMap(plan.playbook.antiDiveHeroesSeen, map);
         return {
           ...plan.playbook,
-          intro: `Map locked: ${map.name}. Their pool has anti-dive — leave Genji / Greymane / Kerrigan and take the pivot below.`,
+          intro: `Map locked: ${map.name}. Their pool has anti-dive — leave Genji / Greymane / Kerrigan, keep Qhira if open, and take the pivot below.`,
           recommended: next.recommended,
           alternates: next.alternates,
           pivots: [next.recommended, ...next.alternates],
@@ -99,17 +121,17 @@ export function applyMapToDraftPlan(
       ? `${mapLead} Large map: draft one global or high-mobility hero (Dehaka, Falstad, Brightwing) and a wave-clear offlane.`
       : `${mapLead} Point-control map: you can spend the flex slot on fight synergy instead of a pure global.`;
 
+  const draftStub: DraftInsights =
+    draft ??
+    ({
+      mapTendencies: [{ map: map.name, games: 0, wins: 0, winRate: 0 }],
+    } as DraftInsights);
+
   const patchSide = (side: DraftPlan["sides"]["theyFirst"]) => ({
     ...side,
-    summary: `${mapLead} ${side.summary}`,
-    ourBrief: {
-      ...side.ourBrief,
-      mapStrategy: `${mapLead}${
-        side.ourBrief.mapStrategy
-          ? ` ${side.ourBrief.mapStrategy.replace(/^On [^,]+,?\s*/i, "")}`
-          : ""
-      }`,
-    },
+    // Keep the lobby plan; do not prepend the map one-liner on top of it.
+    summary: side.summary,
+    ourBrief: patchBrief(side.ourBrief, side.ourLikely, map.name, draftStub),
   });
 
   const rec = playbook?.recommended;
@@ -126,9 +148,6 @@ export function applyMapToDraftPlan(
       theyFirst: patchSide(plan.sides.theyFirst),
       weFirst: patchSide(plan.sides.weFirst),
     },
-    ourBrief: {
-      ...plan.ourBrief,
-      mapStrategy: mapLead,
-    },
+    ourBrief: patchBrief(plan.ourBrief, plan.ourLikely, map.name, draftStub),
   };
 }

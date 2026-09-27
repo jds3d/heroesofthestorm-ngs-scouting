@@ -292,13 +292,27 @@ export function buildDraftInsights(
 
   let archetype: string;
   let identitySource: DraftInsights["identitySource"];
+  let archetypeBreakdown: DraftInsights["archetypeBreakdown"] = [];
   if (trustNgsDrafts) {
-    archetype = topEntries(archetypeVotes, 1)[0]?.key ?? "flexible / mixed";
+    const ranked = topEntries(archetypeVotes, 12);
+    const voteTotal = ranked.reduce((s, e) => s + e.count, 0);
+    archetype = ranked[0]?.key ?? "flexible / mixed";
     identitySource = "ngs_drafts";
+    archetypeBreakdown = ranked.map((e) => ({
+      archetype: e.key,
+      count: Math.round(e.count * 10) / 10,
+      pct:
+        voteTotal > 0
+          ? Math.round((e.count / voteTotal) * 1000) / 10
+          : 0,
+    }));
   } else {
     const fb = detectStormLeagueArchetype(players);
     archetype = fb.archetype;
     identitySource = fb.source;
+    archetypeBreakdown = [
+      { archetype: fb.archetype, count: 0, pct: 100 },
+    ];
   }
 
   const firstPickHeroes = trustNgsDrafts
@@ -419,9 +433,9 @@ export function buildDraftInsights(
     add("First-pick lean", `${fp.hero} (~${fp.pct}% of analyzed games)`);
   }
 
-  const heroBanBullets = heroBanLines();
-  if (heroBanBullets.length) {
-    add("Hero bans", null, { bullets: heroBanBullets });
+  const banGroups = heroBanGroups();
+  if (banGroups.length) {
+    add("Hero bans", null, { groups: banGroups });
   }
 
   if (mapBans[0]) {
@@ -443,10 +457,7 @@ export function buildDraftInsights(
     );
   }
   if (weakRole) {
-    add(
-      "Soft spot",
-      `Nobody on the roster lists ${weakRole} as their preferred role. If you strip their usual Tank / Healer / Ranged comfort, they do not have a clear ${weakRole} player to fall back on — that flex seat gets filled by someone playing off-role.`,
-    );
+    add("Soft spot", softSpotAdvice(weakRole));
   }
 
   const notes: string[] = [];
@@ -518,7 +529,7 @@ export function buildDraftInsights(
     });
   }
 
-  function heroBanLines(): string[] {
+  function heroBanGroups(): { title: string; items: string[] }[] {
     const theirPct = (count: number) =>
       gamesWithTheirBans > 0
         ? Math.round((count / gamesWithTheirBans) * 1000) / 10
@@ -528,28 +539,25 @@ export function buildDraftInsights(
         ? Math.round((count / gamesWithEnemyBans) * 1000) / 10
         : 0;
 
-    const theirMap = new Map(theirBanList.map((b) => [b.hero, b.count]));
-    const intoMap = new Map(bannedAgainstList.map((b) => [b.hero, b.count]));
-    const heroes = [
-      ...new Set([...theirMap.keys(), ...intoMap.keys()]),
-    ].sort(
-      (a, b) =>
-        (intoMap.get(b) ?? 0) +
-          (theirMap.get(b) ?? 0) -
-          ((intoMap.get(a) ?? 0) + (theirMap.get(a) ?? 0)) ||
-        a.localeCompare(b),
-    );
+    const theyBan = theirBanList
+      .map((b) => ({ hero: b.hero, pct: theirPct(b.count) }))
+      .filter((b) => b.pct > 0)
+      .sort((a, b) => b.pct - a.pct || a.hero.localeCompare(b.hero))
+      .slice(0, 8)
+      .map((b) => `${b.hero} — ${b.pct}%`);
 
-    const lines: string[] = [];
-    for (const hero of heroes.slice(0, 8)) {
-      const theyBan = theirPct(theirMap.get(hero) ?? 0);
-      const intoThem = intoPct(intoMap.get(hero) ?? 0);
-      if (theyBan <= 0 && intoThem <= 0) continue;
-      lines.push(
-        `${hero} — they ban ${theyBan}%; banned into them ${intoThem}%`,
-      );
-    }
-    return lines;
+    const intoThem = bannedAgainstList
+      .map((b) => ({ hero: b.hero, pct: intoPct(b.count) }))
+      .filter((b) => b.pct > 0)
+      .sort((a, b) => b.pct - a.pct || a.hero.localeCompare(b.hero))
+      .slice(0, 8)
+      .map((b) => `${b.hero} — ${b.pct}%`);
+
+    const groups: { title: string; items: string[] }[] = [];
+    if (theyBan.length) groups.push({ title: "They ban", items: theyBan });
+    if (intoThem.length)
+      groups.push({ title: "Banned into them", items: intoThem });
+    return groups;
   }
 
   return {
@@ -568,6 +576,7 @@ export function buildDraftInsights(
       .join(" "),
     sections,
     archetype,
+    archetypeBreakdown,
     gamesAnalyzedLabel: gamesAnalyzedLabel(
       dataQuality,
       gamesWithHeroes,
@@ -610,4 +619,51 @@ function findWeakRole(players: PlayerScout[]): string | null {
   }
   const weakest = [...coverage.entries()].sort((a, b) => a[1] - b[1])[0];
   return weakest && weakest[1] === 0 ? weakest[0] : null;
+}
+
+/** Diagnosis + how we actually play the soft spot — not just "they are thin here". */
+function softSpotAdvice(weakRole: string): string {
+  const base =
+    `Nobody on the roster lists ${weakRole} as their preferred role. ` +
+    `If you strip their usual Tank / Healer / Ranged comfort, that seat is filled off-role.`;
+
+  if (weakRole === "Melee Assassin") {
+    return (
+      `${base} Exploit: poke / siege and spaced frontlines are safer against this roster — ` +
+      `they do not have a dedicated Genji / Qhira / Kerrigan / Greymane player to punish slow setups. ` +
+      `Ban or first-pick deny their best Ranged Assassin comfort so the fifth seat cannot hide as a mage; ` +
+      `if they still draft a melee assassin, treat it as off-role and take the fight they are worse at. ` +
+      `Do not over-draft peel for a dive tip-in they cannot comfortably run.`
+    );
+  }
+  if (weakRole === "Ranged Assassin") {
+    return (
+      `${base} Exploit: dive and blow-up are freer — they lack a dedicated backline carry to punish engages. ` +
+      `Contest their best Bruiser / Melee comfort so the damage seat stays awkward, and play for a short fight.`
+    );
+  }
+  if (weakRole === "Bruiser") {
+    return (
+      `${base} Exploit: force a real offlane and punish soak — they will park a tank or assassin in the solo lane. ` +
+      `Take wave-clear offlane yourself and leave camps/shrines that punish a thin solo.`
+    );
+  }
+  if (weakRole === "Tank") {
+    return (
+      `${base} Exploit: pick comps that need a real frontline answer (dive, gorge, or hard engage) — ` +
+      `their "tank" will be a bruiser or off-role. Ban their best Bruiser so they cannot fake the seat.`
+    );
+  }
+  if (weakRole === "Healer") {
+    return (
+      `${base} Exploit: deny their best heal pocket early and force a flex support — ` +
+      `then draft damage that wins before a backup healer stabilizes.`
+    );
+  }
+  return base;
+}
+
+/** Exported so adapt / plan can bias bans and fight shape off the same soft spot. */
+export function rosterWeakRole(players: PlayerScout[]): string | null {
+  return findWeakRole(players);
 }

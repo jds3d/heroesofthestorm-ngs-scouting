@@ -10,9 +10,11 @@ import {
 export function MapPicker({
   value,
   onChange,
+  hint,
 }: {
   value: string | null;
   onChange: (mapName: string | null) => void;
+  hint?: string;
 }) {
   const [filter, setFilter] = useState("");
   const maps = useMemo(() => {
@@ -29,7 +31,8 @@ export function MapPicker({
             Map
           </h4>
           <p className="mt-1 text-sm text-[var(--muted)]">
-            Current NGS pool only. Draft plan updates for the map you pick.
+            {hint ??
+              "Current NGS pool only. Draft plan updates for the map you pick."}
           </p>
         </div>
         {value && (

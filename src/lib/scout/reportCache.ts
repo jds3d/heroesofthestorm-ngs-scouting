@@ -96,14 +96,11 @@ async function buildScoutReport(
       await refreshHeroPlayerData(teamName);
     }
 
-    const matches = await getTeamMatches(teamName, leagueConfig.season, {
-      fresh: true,
-    });
-    await setCached(
-      teamMatchesCacheKey(teamName, leagueConfig.season),
-      matches,
-      leagueConfig.cacheTtlMs,
-    );
+    // Force a live NGS schedule pull only when "Refresh hero & player data"
+    // is checked. Otherwise the 24h cache is enough.
+    if (refreshPlayerData) {
+      await getTeamMatches(teamName, leagueConfig.season, { fresh: true });
+    }
 
     const report = await generateScoutReport(teamName, starters);
     await setCached(reportKey(teamName, starters), report, leagueConfig.cacheTtlMs);

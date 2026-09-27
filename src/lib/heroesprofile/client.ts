@@ -1,9 +1,10 @@
 import { classifyHeroesProfile, noteApiCall } from "@/lib/apiUsage";
 import { leagueConfig } from "@/config/league";
-import { FOREVER, cachedFetch, getCached } from "@/lib/cache";
+import { FOREVER, cacheHas, cachedFetch, getCached } from "@/lib/cache";
 import type { GlobalHeroStat } from "@/lib/scoring/metaPressure";
 import type {
   HeroMapStat,
+  MatchupAllyRow,
   MatchupEnemyRow,
 } from "@/lib/scoring/draftMeta";
 import type {
@@ -697,58 +698,286 @@ export async function getGlobalHeroStatsByMap(): Promise<HeroMapStat[]> {
 }
 
 type MatchupApiRow = {
-  hero?: { name?: string };
+  hero?: { name?: string } | string;
+  name?: string;
   wins?: number;
   losses?: number;
   games_played?: number;
   win_rate?: number;
+  wins_with?: number;
+  losses_with?: number;
+  win_rate_as_ally?: number;
+  wins_against?: number;
+  losses_against?: number;
+  win_rate_against?: number;
 };
 
 type MatchupApiResponse = {
   enemy?: MatchupApiRow[];
+  ally?: MatchupApiRow[];
+  /** Classic nested shape: { [hero]: { [other]: { ally, enemy } } } */
+  [hero: string]: unknown;
 };
 
-function matchupsCacheKey(patch: string, hero: string): string {
-  return `hp-v1-matchups-sl-minor-${patch}-${hero.replace(/[^a-zA-Z0-9._-]+/g, "_")}`;
+/** Below this, a matchup edge is too thin on the minor patch — use major. */
+const SPARSE_MATCHUP_GAMES = 250;
+/** Enemy WR at/above this with sparse games triggers a major-patch refill. */
+const SPARSE_COUNTER_ENEMY_WR = 52;
+
+export type HeroMatchupBundle = {
+  enemies: MatchupEnemyRow[];
+  allies: MatchupAllyRow[];
+};
+
+function majorPatchFromMinor(minor: string): string {
+  const parts = minor.split(".");
+  if (parts.length >= 2) return `${parts[0]}.${parts[1]}`;
+  return minor.slice(0, 4);
 }
 
-/** Enemy matchup rows for one hero (Storm League, current minor patch). */
-export async function getHeroMatchups(hero: string): Promise<{
-  patch: string;
-  enemies: MatchupEnemyRow[];
-}> {
+function rowHeroName(row: MatchupApiRow): string | null {
+  if (typeof row.hero === "string") return row.hero;
+  if (row.hero && typeof row.hero === "object" && row.hero.name) {
+    return row.hero.name;
+  }
+  return row.name ?? null;
+}
+
+function parseEnemyRow(row: MatchupApiRow): MatchupEnemyRow | null {
+  const name = rowHeroName(row);
+  if (!name) return null;
+  const wins = Number(row.wins ?? row.wins_against) || 0;
+  const losses = Number(row.losses ?? row.losses_against) || 0;
+  const games = Number(row.games_played) || wins + losses;
+  return {
+    hero: name,
+    wins,
+    losses,
+    games,
+    // Opponent win% into you (HP enemy.win_rate / win_rate_against).
+    enemyWinRate: Number(row.win_rate ?? row.win_rate_against) || 0,
+  };
+}
+
+function parseAllyRow(row: MatchupApiRow): MatchupAllyRow | null {
+  const name = rowHeroName(row);
+  if (!name) return null;
+  const wins = Number(row.wins ?? row.wins_with) || 0;
+  const losses = Number(row.losses ?? row.losses_with) || 0;
+  const games = Number(row.games_played) || wins + losses;
+  return {
+    hero: name,
+    wins,
+    losses,
+    games,
+    allyWinRate: Number(row.win_rate ?? row.win_rate_as_ally) || 0,
+  };
+}
+
+function parseMatchupBundle(
+  raw: MatchupApiResponse,
+  forHero: string,
+): HeroMatchupBundle {
+  const enemies: MatchupEnemyRow[] = [];
+  const allies: MatchupAllyRow[] = [];
+
+  if (Array.isArray(raw.enemy)) {
+    for (const row of raw.enemy) {
+      const e = parseEnemyRow(row);
+      if (e) enemies.push(e);
+    }
+  }
+  if (Array.isArray(raw.ally)) {
+    for (const row of raw.ally) {
+      const a = parseAllyRow(row);
+      if (a) allies.push(a);
+    }
+  }
+
+  // Classic nested: { Abathur: { Alarak: { ally, enemy }, ... } }
+  if (!enemies.length && !allies.length) {
+    const root =
+      (raw[forHero] as Record<string, unknown> | undefined) ??
+      (Object.values(raw).find(
+        (v) => v && typeof v === "object" && !Array.isArray(v),
+      ) as Record<string, unknown> | undefined);
+    if (root) {
+      for (const [other, cell] of Object.entries(root)) {
+        if (!cell || typeof cell !== "object") continue;
+        const c = cell as {
+          ally?: MatchupApiRow;
+          enemy?: MatchupApiRow;
+        };
+        if (c.enemy) {
+          const e = parseEnemyRow({ ...c.enemy, name: other });
+          if (e) enemies.push(e);
+        }
+        if (c.ally) {
+          const a = parseAllyRow({ ...c.ally, name: other });
+          if (a) allies.push(a);
+        }
+      }
+    }
+  }
+
+  return { enemies, allies };
+}
+
+function matchupsNeedMajor(bundle: HeroMatchupBundle): boolean {
+  const sparseEnemy = bundle.enemies.some(
+    (e) =>
+      e.games > 0 &&
+      e.games < SPARSE_MATCHUP_GAMES &&
+      e.enemyWinRate >= SPARSE_COUNTER_ENEMY_WR,
+  );
+  const sparseAlly = bundle.allies.some(
+    (a) => a.games > 0 && a.games < SPARSE_MATCHUP_GAMES,
+  );
+  return sparseEnemy || sparseAlly;
+}
+
+function mergeEnemySparse(
+  minor: MatchupEnemyRow[],
+  major: MatchupEnemyRow[],
+): MatchupEnemyRow[] {
+  const byKey = new Map<string, MatchupEnemyRow>();
+  for (const row of minor) byKey.set(row.hero.toLowerCase(), row);
+  for (const row of major) {
+    const k = row.hero.toLowerCase();
+    const existing = byKey.get(k);
+    if (!existing || existing.games < SPARSE_MATCHUP_GAMES) byKey.set(k, row);
+  }
+  return [...byKey.values()];
+}
+
+function mergeAllySparse(
+  minor: MatchupAllyRow[],
+  major: MatchupAllyRow[],
+): MatchupAllyRow[] {
+  const byKey = new Map<string, MatchupAllyRow>();
+  for (const row of minor) byKey.set(row.hero.toLowerCase(), row);
+  for (const row of major) {
+    const k = row.hero.toLowerCase();
+    const existing = byKey.get(k);
+    if (!existing || existing.games < SPARSE_MATCHUP_GAMES) byKey.set(k, row);
+  }
+  return [...byKey.values()];
+}
+
+function mergeMatchupBundles(
+  minor: HeroMatchupBundle,
+  major: HeroMatchupBundle,
+): HeroMatchupBundle {
+  return {
+    enemies: mergeEnemySparse(minor.enemies, major.enemies),
+    allies: mergeAllySparse(minor.allies, major.allies),
+  };
+}
+
+function matchupsCacheKey(
+  timeframeType: "minor" | "major",
+  timeframe: string,
+  hero: string,
+): string {
+  return `hp-v3-matchups-sl-${timeframeType}-${timeframe}-${hero.replace(/[^a-zA-Z0-9._-]+/g, "_")}`;
+}
+
+/**
+ * How many HeroesProfile matchup HTTP calls a scout would still need.
+ * Only counts calls that would miss the weekly TTL cache — and does not
+ * pre-count a major-patch refill until the minor is known to be sparse.
+ */
+export async function countPendingMatchupCalls(
+  heroes: string[],
+): Promise<number> {
   const gameVersion = await currentGlobalPatch();
-  if (!gameVersion) return { patch: "", enemies: [] };
+  if (!gameVersion) return 0;
+  const major = majorPatchFromMinor(gameVersion);
+  const unique = [...new Set(heroes.filter(Boolean))];
+  let n = 0;
+  for (const hero of unique) {
+    const minorKey = matchupsCacheKey("minor", gameVersion, hero);
+    const minorFresh =
+      (await getCached<HeroMatchupBundle>(minorKey, GLOBAL_HERO_TTL_MS)) !==
+      null;
+    if (!minorFresh) {
+      // One call for minor. Major is only fetched after we see sparse edges.
+      n += 1;
+      continue;
+    }
+    try {
+      const minorBundle = await getCached<HeroMatchupBundle>(
+        minorKey,
+        GLOBAL_HERO_TTL_MS,
+      );
+      if (!minorBundle) {
+        n += 1;
+        continue;
+      }
+      if (
+        matchupsNeedMajor(minorBundle) &&
+        (await getCached(
+          matchupsCacheKey("major", major, hero),
+          GLOBAL_HERO_TTL_MS,
+        )) === null
+      ) {
+        n += 1;
+      }
+    } catch {
+      // Ignore estimate failures.
+    }
+  }
+  return n;
+}
+
+async function fetchMatchupsForTimeframe(
+  hero: string,
+  timeframeType: "minor" | "major",
+  timeframe: string,
+): Promise<HeroMatchupBundle> {
   return cachedFetch(
-    matchupsCacheKey(gameVersion, hero),
+    matchupsCacheKey(timeframeType, timeframe, hero),
     async () => {
       const raw = await hpGet<MatchupApiResponse>("heroes/matchups", {
         game_type: "Storm League",
-        timeframe_type: "minor",
-        timeframe: gameVersion,
+        timeframe_type: timeframeType,
+        timeframe,
         hero,
       });
-      const enemies: MatchupEnemyRow[] = (raw.enemy ?? [])
-        .map((row) => {
-          const name = row.hero?.name;
-          if (!name) return null;
-          const wins = Number(row.wins) || 0;
-          const losses = Number(row.losses) || 0;
-          const games = Number(row.games_played) || wins + losses;
-          return {
-            hero: name,
-            wins,
-            losses,
-            games,
-            // HP enemy.win_rate is opponent win% into you.
-            enemyWinRate: Number(row.win_rate) || 0,
-          } satisfies MatchupEnemyRow;
-        })
-        .filter((r): r is MatchupEnemyRow => r != null);
-      return { patch: gameVersion, enemies };
+      return parseMatchupBundle(raw, hero);
     },
     GLOBAL_HERO_TTL_MS,
   );
+}
+
+/**
+ * Enemy + ally matchup rows for one hero (Storm League).
+ * Prefers the current minor patch; sparse edges (&lt;250g) fill from major.
+ */
+export async function getHeroMatchups(hero: string): Promise<{
+  patch: string;
+  enemies: MatchupEnemyRow[];
+  allies: MatchupAllyRow[];
+}> {
+  const gameVersion = await currentGlobalPatch();
+  if (!gameVersion) return { patch: "", enemies: [], allies: [] };
+
+  const minor = await fetchMatchupsForTimeframe(hero, "minor", gameVersion);
+
+  if (!matchupsNeedMajor(minor)) {
+    return { patch: gameVersion, ...minor };
+  }
+
+  const major = majorPatchFromMinor(gameVersion);
+  try {
+    const majorBundle = await fetchMatchupsForTimeframe(hero, "major", major);
+    return {
+      patch: `${major} (major+minor)`,
+      ...mergeMatchupBundles(minor, majorBundle),
+    };
+  } catch {
+    return { patch: gameVersion, ...minor };
+  }
 }
 
 /**
@@ -757,9 +986,12 @@ export async function getHeroMatchups(hero: string): Promise<{
  */
 export async function getHeroMatchupsMany(
   heroes: string[],
-): Promise<{ patch: string; byHero: Record<string, MatchupEnemyRow[]> }> {
+): Promise<{
+  patch: string;
+  byHero: Record<string, HeroMatchupBundle>;
+}> {
   const unique = [...new Set(heroes.filter(Boolean))];
-  const byHero: Record<string, MatchupEnemyRow[]> = {};
+  const byHero: Record<string, HeroMatchupBundle> = {};
   let patch = "";
   const queue = [...unique];
   const workers = 2;
@@ -768,9 +1000,9 @@ export async function getHeroMatchupsMany(
       const hero = queue.shift();
       if (!hero) break;
       try {
-        const { patch: p, enemies } = await getHeroMatchups(hero);
+        const { patch: p, enemies, allies } = await getHeroMatchups(hero);
         if (p) patch = p;
-        byHero[hero] = enemies;
+        byHero[hero] = { enemies, allies };
       } catch (err) {
         if (
           err instanceof HeroesProfileError &&

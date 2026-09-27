@@ -93,7 +93,10 @@ export async function getTeamMatches(
   opts?: { fresh?: boolean },
 ): Promise<NgsMatch[]> {
   const key = teamMatchesCacheKey(teamName, season);
-  const ttl = season === leagueConfig.season ? leagueConfig.cacheTtlMs : null;
+  // NGS site schedule (not HeroesProfile). Prior seasons never change.
+  // Current season: 24h TTL; force-refresh when the coach recaches.
+  const ttl =
+    season === leagueConfig.season ? 24 * 60 * 60 * 1000 : null;
   const fetcher = () =>
     ngsPost<NgsMatch[]>("/api/schedule/fetch/matches/team", {
       season,

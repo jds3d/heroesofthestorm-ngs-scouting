@@ -1,5 +1,6 @@
 import { buildDraftPlan } from "@/lib/scoring/draftPlan";
 import { buildMapPlan } from "@/lib/scoring/mapPlan";
+import { rosterWeakRole } from "@/lib/scoring/draft";
 import {
   banPressure,
   heroComfort,
@@ -92,6 +93,58 @@ export function buildAdaptPlan(
         detail: `Tank pool looks deeper than heals. Ban/contest ${bestHealer}; leave tanks and punish the draft.`,
       });
     }
+  }
+
+  // Roster soft spot — turn diagnosis into a fight-shape / ban bias
+  const weakRole = rosterWeakRole(players);
+  if (weakRole === "Melee Assassin") {
+    const bestRanged = findBestInRole(players, "Ranged Assassin");
+    recommendations.push({
+      priority: 2,
+      title: "Exploit thin melee assassin",
+      detail:
+        "No preferred Melee Assassin on their roster — poke / siege and spaced setups are safer; they lack a dedicated dive tip-in to punish. " +
+        (bestRanged
+          ? `Ban or deny ${bestRanged} so the fifth seat cannot hide as a mage, and do not over-peel for a dive they cannot comfortably run.`
+          : "Do not over-draft peel for a dive tip-in they cannot comfortably run."),
+    });
+    if (bestRanged && !banPriority.some((b) => b.hero === bestRanged)) {
+      banPriority.push({
+        hero: bestRanged,
+        reason:
+          "No melee-assassin main — deny ranged so the flex fifth stays awkward",
+      });
+    }
+  } else if (weakRole === "Ranged Assassin") {
+    recommendations.push({
+      priority: 2,
+      title: "Exploit thin ranged",
+      detail:
+        "No preferred Ranged Assassin — dive and blow-up are freer. Contest their bruiser/melee comfort and play for a short fight.",
+    });
+  } else if (weakRole === "Bruiser") {
+    recommendations.push({
+      priority: 2,
+      title: "Exploit thin offlane",
+      detail:
+        "No preferred Bruiser — force a real solo lane and punish soak. Take waveclear offlane yourself; their solo will be a tank or assassin parked off-role.",
+    });
+  } else if (weakRole === "Tank") {
+    recommendations.push({
+      priority: 2,
+      title: "Exploit thin tank",
+      detail:
+        "No preferred Tank — engage and pick tanks punish a fake frontline. Ban their best Bruiser so they cannot paper over the seat.",
+    });
+  } else if (weakRole === "Healer") {
+    const bestHeal = findBestInRole(players, "Healer");
+    recommendations.push({
+      priority: 2,
+      title: "Exploit thin healer",
+      detail: bestHeal
+        ? `No preferred Healer main — deny ${bestHeal} early and draft damage that wins before a flex support stabilizes.`
+        : "No preferred Healer main — deny their best heal pocket and end fights early.",
+    });
   }
 
   // Archetype adapts

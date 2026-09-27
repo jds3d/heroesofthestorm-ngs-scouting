@@ -16,15 +16,103 @@ export const ARCHETYPE_HINTS: Record<string, string> = {
     "Roster comfort skews Assassin. Draft identity is inferred from players, not a thick NGS draft sample.",
   "tank-heavy roster":
     "Roster comfort skews Tank. Draft identity is inferred from players, not a thick NGS draft sample.",
+  "peel / protect":
+    "Frontline and utility built to keep a backline alive rather than start the fight.",
+  "sustain / attrition":
+    "Long-fight healing and armor. They win by outlasting burst, not by a single engage.",
+  "global / macro":
+    "Globals and map pressure. They win by soaking and hitting objectives first, not by a fair 5v5.",
+  "safe / disengage":
+    "Kiting and disengage tools. They decline bad fights and reset rather than force.",
   "flexible / mixed":
     "No single draft identity stood out across the sample.",
   unclear: "Not enough signal to name a draft identity yet.",
   unknown: "No hero data for this draft.",
 };
 
+/** Canonical fight shapes to always show in the archetype tooltip. */
+export const ARCHETYPE_CATALOG: string[] = [
+  "dive",
+  "poke/siege",
+  "hypercarry protect",
+  "double support / sustain",
+  "bruiser frontline",
+  "assassin-focused",
+  "peel / protect",
+  "sustain / attrition",
+  "global / macro",
+  "safe / disengage",
+  "flexible / mixed",
+];
+
+export type ArchetypeTooltipRow = {
+  name: string;
+  description: string;
+  preferred: boolean;
+  pct: number | null;
+};
+
+/**
+ * Rows for the archetype hover: sample frequency first (high → low), then
+ * unused catalog shapes. Preferred (their lean) is marked for bold rendering.
+ */
+export function archetypeTooltipRows(
+  preferred: string,
+  breakdown: { archetype: string; count: number; pct: number }[] = [],
+): ArchetypeTooltipRow[] {
+  const preferredKey = preferred.trim();
+  const preferredLower = preferredKey.toLowerCase();
+  const byName = new Map(
+    breakdown.map((b) => [b.archetype.toLowerCase(), b] as const),
+  );
+  const seen = new Set<string>();
+  const rows: ArchetypeTooltipRow[] = [];
+
+  const isPreferred = (name: string) => {
+    const n = name.toLowerCase();
+    return n === preferredLower || preferredLower.startsWith(n);
+  };
+
+  const push = (name: string, pct: number | null) => {
+    const key = name.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    rows.push({
+      name,
+      description:
+        archetypeHint(name) ??
+        ARCHETYPE_HINTS[name] ??
+        "No description yet.",
+      preferred: isPreferred(name),
+      pct,
+    });
+  };
+
+  for (const b of [...breakdown].sort(
+    (a, b) =>
+      b.pct - a.pct ||
+      b.count - a.count ||
+      a.archetype.localeCompare(b.archetype),
+  )) {
+    push(b.archetype, b.pct);
+  }
+
+  if (preferredKey) {
+    const hit = byName.get(preferredLower);
+    push(preferredKey, hit?.pct ?? null);
+  }
+
+  for (const name of ARCHETYPE_CATALOG) {
+    const hit = byName.get(name.toLowerCase());
+    push(name, hit?.pct ?? 0);
+  }
+
+  return rows;
+}
+
 export const DRAFT_TERM_HINTS: Record<string, string> = {
   Archetype:
-    "The fight shape they draft most often — dive, poke, hypercarry, double support, and so on.",
+    "Hover for every fight shape, ordered by how often they draft it. Their lean is bold.",
   "Games analyzed":
     "How many NGS maps with usable hero drafts fed this read.",
   "First-pick leans":
@@ -40,9 +128,9 @@ export const DRAFT_TERM_HINTS: Record<string, string> = {
   "First-pick lean":
     "The single hero they open on most when they have first pick.",
   "Hero bans":
-    "How often they ban a hero, and how often opponents ban that hero into them.",
+    "Two lists: heroes they spend bans on, and heroes opponents ban into them.",
   "Soft spot":
-    "A role nobody on their roster claims as preferred — force them there and the draft gets awkward.",
+    "A role nobody on their roster claims as preferred — and the fight shape we should play because of it (e.g. no melee assassin → poke is safer).",
   "Map plan":
     "Maps we should ban vs leave up, from our NGS record against theirs.",
   "Maps they ban":

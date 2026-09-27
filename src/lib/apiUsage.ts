@@ -79,6 +79,18 @@ export function countsFromMap(map: Map<ApiCallKind, number>): ApiCallCount[] {
   }));
 }
 
+/** Add two usage tallies (e.g. scout body + post-plan matchups). */
+export function mergeApiCounts(
+  a: ApiCallCount[],
+  b: ApiCallCount[],
+): ApiCallCount[] {
+  const map = new Map<ApiCallKind, number>();
+  for (const row of [...a, ...b]) {
+    map.set(row.kind, (map.get(row.kind) ?? 0) + row.count);
+  }
+  return countsFromMap(map);
+}
+
 export async function runWithApiUsage<T>(
   fn: () => Promise<T>,
 ): Promise<{ result: T; actual: ApiCallCount[] }> {

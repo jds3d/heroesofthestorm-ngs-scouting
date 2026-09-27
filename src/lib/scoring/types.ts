@@ -67,6 +67,11 @@ export type DraftInsights = {
   /** Headings + short answers for the Draft strategy block. */
   sections: DraftSection[];
   archetype: string;
+  /**
+   * Fight shapes seen in the sample, highest frequency first.
+   * Empty when identity is roster / Storm League fallback.
+   */
+  archetypeBreakdown: { archetype: string; count: number; pct: number }[];
   /** What the "Games analyzed" UI should show. */
   gamesAnalyzedLabel: string;
   dataQuality: DraftDataQuality;
@@ -130,6 +135,11 @@ export type OurCompBrief = {
   /** How this five plays the map they see most. */
   mapStrategy: string;
   whyItWorks: string;
+  /**
+   * Structural holes (no ranged, no clear, etc.) — call these out so we do
+   * not walk into Infernal Shrines / Punisher with an all-melee five.
+   */
+  holes: string | null;
 };
 
 /** One ban or pick step for the interactive draft board. */
@@ -261,7 +271,7 @@ export type ScoutReport = {
   reportedMatchIds: string[];
   warnings: string[];
   apiUsage?: {
-    predicted: { kind: string; label: string; count: number }[];
-    actual: { kind: string; label: string; count: number }[];
+    predicted: import("@/lib/apiUsage").ApiCallCount[];
+    actual: import("@/lib/apiUsage").ApiCallCount[];
   };
 };

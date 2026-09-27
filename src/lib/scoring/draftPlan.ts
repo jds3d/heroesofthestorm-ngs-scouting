@@ -3,6 +3,7 @@ import {
   divePlaybook,
   divePlaybookTree,
   chooseDivePivot,
+  pivotPlanSlots,
 } from "@/config/divePlaybook";
 import { heroKey, heroRole, heroSpellings, heroTags } from "@/lib/scoring/heroMeta";
 import {
@@ -71,7 +72,7 @@ const MAP_MACRO: Record<string, { size: "large" | "point"; line: string }> = {
   },
   "Infernal Shrines": {
     size: "point",
-    line: "clear the shrine as five, then fight on the punisher you just earned",
+    line: "push the lane that feeds the shrine before it pops, then fight on the Punisher while that wave arrives",
   },
   "Braxis Holdout": {
     size: "point",
@@ -265,12 +266,12 @@ const ANSWERS: Record<string, Answer> = {
       },
       {
         role: "Ranged",
-        heroes: ["Valla", "Greymane", "Jaina"],
+        heroes: ["Valla", "Greymane", "Jaina", "Qhira"],
         why: "One main damage hero the tank is drafted to enable.",
       },
       {
         role: "Flex",
-        heroes: ["Imperius", "Maiev", "Tychus"],
+        heroes: ["Imperius", "Maiev", "Qhira", "Tychus"],
         why: "The piece that completes the wombo or answers their frontline.",
       },
     ],
@@ -470,6 +471,12 @@ export function buildDraftPlan(
   );
   const antiDiveThreat = antiDiveHeroesSeen.length > 0;
   const chosen = antiDiveThreat ? chooseDivePivot(antiDiveHeroesSeen) : null;
+  // When anti-dive is already in their pool, the *plan five* must follow the
+  // pivot — not keep drafting Anub/Rehgar dive while the playbook says leave.
+  const leaveDive = Boolean(antiDiveThreat && chosen);
+  const planSlots = leaveDive && chosen ? pivotPlanSlots(chosen.pivot) : answer.slots;
+  const planKey =
+    leaveDive && chosen ? (`pivot:${chosen.pivot.id}` as string) : key;
   const toPivot = (p: (typeof divePlaybook.pivots)[number], why: string) => ({
     id: p.id,
     name: p.name,
@@ -482,8 +489,8 @@ export function buildDraftPlan(
   const playbook: DraftPlaybook = {
     title: divePlaybook.title,
     intro: antiDiveThreat
-      ? `Their pool already has anti-dive. Do not force Genji / Greymane / Kerrigan. Mask with a flexible tank + enabler first, then take the pivot below.`
-      : `Open flexible tank + enabler. Hold Genji / Greymane / Kerrigan until mid-draft. If they show Tyrael, Brightwing, Falstad Gust, or Johanna — leave dive and take a pivot.`,
+      ? `Their pool already has anti-dive. Leave Genji / Greymane / Kerrigan — keep Qhira if open and rebuild into the pivot below (not a pure dive shell).`
+      : `Open flexible tank + enabler. Hold Genji / Greymane / Kerrigan until mid-draft. Take Qhira immediately if open. If they show Tyrael, Brightwing, Falstad Gust, or Johanna — leave dive and take a pivot (still keep Qhira).`,
     antiDiveThreat,
     antiDiveHeroesSeen,
     recommended: chosen
@@ -498,8 +505,8 @@ export function buildDraftPlan(
 
   const summary = runHeavyDive
     ? antiDiveThreat && chosen
-      ? `Primary plan was heavy dive, but their pool shows anti-dive (${antiDiveHeroesSeen.join(", ")}). Pivot to ${chosen.pivot.name}: pick ${chosen.pivot.heroes.slice(0, 3).join(" / ")}. Do not force Genji/Greymane/Kerrigan.`
-      : `Primary plan is heavy dive: Anub/Tyrael/Diablo/Mei + Rehgar/BW/Hogger/Yrel first. Hold Genji/Greymane/Kerrigan until mid-draft clears anti-dive.`
+      ? `Primary plan was heavy dive, but their pool shows anti-dive (${antiDiveHeroesSeen.join(", ")}). Pivot to ${chosen.pivot.name}: ${chosen.pivot.heroes.join(" / ")}. Keep Qhira if she is open — change the shell, not the pocket.`
+      : `Primary plan is heavy dive: Anub/Tyrael/Diablo/Mei + Rehgar/BW/Hogger/Yrel first. Hold Genji/Greymane/Kerrigan until mid-draft clears anti-dive. Take Qhira immediately if open.`
     : canBait
       ? `Ban ${baitBans.map((b) => b.hero).join(" and ")} so they stay on ${[...predictedHeroes].slice(0, 3).join(", ")}. Then draft the counter as one fight, not five counters.`
       : certainty === "low"
@@ -509,27 +516,27 @@ export function buildDraftPlan(
   const diveSteps = antiDiveThreat && chosen
     ? [
         {
-          phase: "Phase 1 — Anchor & enabler",
-          action: `Still take flexible tank (${divePlaybook.phase1Slots[0].heroes.slice(0, 3).join(" / ")}) and enabler (${divePlaybook.phase1Slots[1].heroes.slice(0, 3).join(" / ")}). Do not first-pick ${divePlaybook.lateDiveAssassins.slice(0, 3).join(" / ")}.`,
+          phase: "Phase 1 — Keep the pocket",
+          action: `If Qhira is open, take her. Do not first-pick ${divePlaybook.lateDiveAssassins.slice(0, 3).join(" / ")}.`,
         },
         {
-          phase: "Phase 2 — Pivot",
+          phase: "Phase 2 — Pivot the shell",
           action: `Leave pure dive. Take ${chosen.pivot.name} because ${chosen.why}`,
         },
         {
           phase: "Phase 3 — Commit the pivot",
-          action: `Lock ${chosen.pivot.heroes.join(" / ")}. ${chosen.pivot.objective}`,
+          action: `Build ${chosen.pivot.heroes.join(" / ")} around Qhira (or the flex threat). ${chosen.pivot.objective}`,
         },
       ]
     : [
         {
           phase: "Phase 1 — Anchor & enabler",
-          action: `Flexible tank: ${divePlaybook.phase1Slots[0].heroes.join(" / ")}. Enabler: ${divePlaybook.phase1Slots[1].heroes.join(" / ")}. Mask dive assassins.`,
+          action: `Flexible tank: ${divePlaybook.phase1Slots[0].heroes.join(" / ")}. Enabler: ${divePlaybook.phase1Slots[1].heroes.join(" / ")}. Mask dive assassins — except take Qhira immediately if open.`,
         },
         {
           phase: "Phase 2 — Pivot check",
           action:
-            "If they take Tyrael, Brightwing, Falstad Gust, or Johanna → leave dive (see pivot section). Otherwise green light.",
+            "If they take Tyrael, Brightwing, Falstad Gust, or Johanna → leave dive (see pivot section). Keep Qhira; change the tank/heal/range around her.",
         },
         {
           phase: "Phase 3 — Core divers",
@@ -590,38 +597,44 @@ export function buildDraftPlan(
     undefined,
     allowDoubleHealer,
   );
-  const base = ourLikelyComp(home, answer.slots);
+  const base = ourLikelyComp(home, planSlots, planKey, leaveDive);
   const ourVsTheirHeroes = dropClaimedHeroes(
     base.picks,
     claimKeys(theirLikely.map((p) => p.hero)),
-    answer.slots,
+    planSlots,
     home,
   );
   const ours = finishOurComp(
     ourVsTheirHeroes,
-    answer.slots,
+    planSlots,
     home,
     draft,
     base.note,
   );
   const ourIfWeTakePicks = wePlayContested
-    ? forceFirstPick(base.picks, contested, wePlayContested, home, answer.slots)
+    ? forceFirstPick(base.picks, contested, wePlayContested, home, planSlots)
     : base.picks;
   const ourClaim = claimKeys(ourIfWeTakePicks.map((p) => p.hero));
   const ourIfWeTake = finishOurComp(
     ourIfWeTakePicks,
-    answer.slots,
+    planSlots,
     home,
     draft,
     base.note,
   );
+  // If contested is not in our pool we tell the coach to ban it — their
+  // "likely five" should be the post-ban read (full five), not Johanna + 3.
+  const banContestedAway = Boolean(contested && !wePlayContested);
+  const theirWeFirstGone = new Set(ourClaim);
+  if (banContestedAway && contested) {
+    theirWeFirstGone.add(heroKey(contested));
+  }
   const theirIfWeTake = fillLikelyComp(
     players,
-    [
-      ...(contested && !wePlayContested ? [contested] : []),
-      ...predicted.map((p) => p.hero),
-    ].filter((h) => !ourClaim.has(heroKey(h))),
-    ourClaim,
+    predicted
+      .map((p) => p.hero)
+      .filter((h) => !theirWeFirstGone.has(heroKey(h))),
+    theirWeFirstGone,
     allowDoubleHealer,
   );
 
@@ -739,10 +752,17 @@ function sideSummary(args: {
   baitBans: { hero: string; reason: string }[];
   predicted: string[];
 }): string {
-  const theirHeroes = heroList(args.theirLikely);
+  // Heroes we remove from the board (ban or take ourselves) are not "expected".
+  const goneFromThem = new Set<string>();
+  if (args.contested) goneFromThem.add(heroKey(args.contested));
+  for (const b of args.baitBans) goneFromThem.add(heroKey(b.hero));
+
+  const theirAfterPlan = args.theirLikely.filter(
+    (p) => !goneFromThem.has(heroKey(p.hero)),
+  );
+  const theirHeroes = heroList(theirAfterPlan);
   const ourHeroes = heroList(args.ourLikely);
-  const leaveUp =
-    args.theirLikely.map((p) => p.hero).filter(Boolean).slice(0, 5);
+  const leaveUp = theirAfterPlan.map((p) => p.hero).filter(Boolean).slice(0, 5);
   const outs = args.baitBans.map((b) => b.hero).slice(0, 3);
 
   if (args.firstPick === "them") {
@@ -769,9 +789,7 @@ function sideSummary(args: {
         : "",
       outs.length
         ? `Ban ${outs.join(" / ")} if those are still their way out.`
-        : args.contested
-          ? `If we do not take ${args.contested}, ban it — their next pick is that hero.`
-          : "",
+        : "",
       ourHeroes ? `Finish our five as ${ourHeroes}.` : "",
     ]
       .filter(Boolean)
@@ -781,7 +799,9 @@ function sideSummary(args: {
   if (args.contested) {
     return [
       `We pick first, but ${args.contested} is not in our pool — ban it or their first pick is ${args.contested}.`,
-      leaveUp.length ? `Then expect ${theirHeroes}.` : "",
+      leaveUp.length
+        ? `If it is banned, expect ${theirHeroes}.`
+        : "",
       ourHeroes ? `We answer with ${ourHeroes}.` : "",
     ]
       .filter(Boolean)
@@ -797,7 +817,7 @@ function sideSummary(args: {
     .join(" ");
 }
 
-/** How our five beats *their* five — skip archetype boilerplate. */
+/** How our five beats *their* five — reference the faces above; no roster rerun. */
 function sideCounterNote(args: {
   theirLikely: DraftCompPick[];
   ourLikely: DraftCompPick[];
@@ -808,44 +828,150 @@ function sideCounterNote(args: {
   const their = args.theirLikely;
   const our = args.ourLikely;
   if (their.length < 3 || our.length < 3) {
-    return args.answerKey === "default" ? args.ourBrief.whyItWorks : args.answerCounter;
+    return args.answerKey === "default"
+      ? args.ourBrief.whyItWorks
+      : args.answerCounter;
   }
 
-  const theirTank = their.find((p) => heroRole(p.hero) === "Tank")?.hero;
+  const parts: string[] = ["Against the likely five above:"];
+  const fight = howOurFiveFights(our, their);
+  if (fight) parts.push(fight);
+
+  if (args.answerKey !== "default" && args.answerCounter) {
+    // One short archetype line, no hero laundry list.
+    const short = args.answerCounter.replace(/\s+/g, " ").trim();
+    if (short.length < 160) parts.push(short);
+  }
+
+  return parts.filter(Boolean).join(" ");
+}
+
+/**
+ * Kit-level how this five starts the fight / plays the map — keyed off the
+ * *current* tank/dive/heal, so alts (E.T.C. over Stitches) rewrite the copy.
+ * Returns ordered beats (engage, heal, lane, rotate) for callers that want
+ * only the lead sentence.
+ */
+export function howOurFiveFightParts(
+  our: DraftCompPick[],
+  their: DraftCompPick[] = [],
+): string[] {
+  if (our.length < 3) return [];
+
   const theirHeal = their.find(
     (p) => heroRole(p.hero) === "Healer" || heroRole(p.hero) === "Support",
-  )?.hero;
-  const theirDamage = their
-    .filter((p) => {
-      const r = heroRole(p.hero);
-      return r.includes("Assassin") || r === "Bruiser";
-    })
-    .map((p) => p.hero);
-  const ourTank = our.find((p) => heroRole(p.hero) === "Tank")?.hero;
-  const ourEngage = our
-    .filter((p) => tagsOf(p.hero).some((t) => t === "dive" || t === "engage"))
-    .map((p) => p.hero);
-
-  const parts: string[] = [];
-  parts.push(
-    `Into ${heroListWithPlayers(their)}: play ${args.ourBrief.kind.toLowerCase()} (${heroList(our)}).`,
+  );
+  const theirCarry = their.find((p) => heroRole(p.hero).includes("Assassin"));
+  const theirOff = their.find((p) => heroIsOfflaner(p.hero));
+  const ourTank = our.find((p) => heroRole(p.hero) === "Tank");
+  const ourHeal = our.find(
+    (p) => heroRole(p.hero) === "Healer" || heroRole(p.hero) === "Support",
+  );
+  const ourDive = our.find(
+    (p) =>
+      tagsOf(p.hero).includes("dive") && heroRole(p.hero).includes("Assassin"),
+  );
+  const ourOff = our.find((p) => heroIsOfflaner(p.hero));
+  const ourGlobal = our.find((p) =>
+    tagsOf(p.hero).some((t) => t === "global" || t === "mobile"),
   );
 
-  if (theirDamage.length && ourEngage.length) {
+  const parts: string[] = [];
+  const tankKey = ourTank ? heroKey(ourTank.hero) : null;
+
+  if (ourTank && tankKey === heroKey("Stitches")) {
+    const follow = ourDive?.hero ?? ourHeal?.hero ?? "the follow-up";
     parts.push(
-      `Delete ${theirDamage.slice(0, 2).join(" / ")} before ${theirHeal ?? "their healer"} stabilizes — ${ourEngage.slice(0, 2).join(" / ")} start that fight.`,
+      `Stitches starts it with Hook / Gorge on ${theirCarry?.hero ?? theirOff?.hero ?? "their damage"} — ${follow} is drafted to hit the same target the moment they land, not to take a fair front-to-back.`,
     );
-  } else if (theirTank && ourTank) {
+  } else if (ourTank && tankKey === heroKey("Garrosh")) {
     parts.push(
-      `${ourTank} dictates the engage into ${theirTank}; everyone else is drafted for that same fight.`,
+      `Garrosh throws ${theirCarry?.hero ?? "a carry"} into your pack; everyone else is there for the throw, not a long peel fight.`,
+    );
+  } else if (
+    ourTank &&
+    ["Anub'arak", "Anubarak", "Diablo", "ETC", "E.T.C."].some(
+      (h) => heroKey(h) === tankKey,
+    )
+  ) {
+    const kit =
+      tankKey === heroKey("E.T.C.") || tankKey === heroKey("ETC")
+        ? "Mosh / Face Melt"
+        : tankKey === heroKey("Diablo")
+          ? "Charge / Apocalypse"
+          : "Cocoon / Impale";
+    parts.push(
+      `${ourTank.hero} engages first (${kit}) so ${ourDive?.hero ?? "the follow-up"} gets a free window — do not send the assassin in alone.`,
+    );
+  } else if (ourTank && ourDive) {
+    parts.push(
+      `${ourTank.hero} creates the engage; ${ourDive.hero} deletes ${theirCarry?.hero ?? "their carry"} before ${theirHeal?.hero ?? "their heal"} stabilizes.`,
+    );
+  } else if (ourTank) {
+    parts.push(
+      `${ourTank.hero} decides when the fight starts; the rest of the five follows that engage.`,
     );
   }
 
-  if (args.ourBrief.whyItWorks) {
-    parts.push(args.ourBrief.whyItWorks);
+  if (ourHeal && heroKey(ourHeal.hero) === heroKey("Rehgar")) {
+    parts.push(
+      `Rehgar is not "starting" the engage — Wolf / Ancestral keeps the ${ourTank?.hero ?? "frontline"} alive through the commit, and Lightning Bloodlust only if the engage already landed.`,
+    );
   }
 
-  return parts.join(" ");
+  if (ourOff && theirOff) {
+    parts.push(
+      `Lane: ${ourOff.hero} soaks against ${theirOff.hero}; do not leave that matchup empty when the objective spawns or you lose a wave and the rotate.`,
+    );
+  } else if (ourOff) {
+    parts.push(
+      `Lane: ${ourOff.hero} clears and soaks so the four-man can move first.`,
+    );
+  }
+
+  if (ourGlobal) {
+    parts.push(
+      `Rotate: ${ourGlobal.hero} covers the cross-map path so you do not walk five people mid every time.`,
+    );
+  }
+
+  return parts;
+}
+
+export function howOurFiveFights(
+  our: DraftCompPick[],
+  their: DraftCompPick[] = [],
+): string | null {
+  const parts = howOurFiveFightParts(our, their);
+  return parts.length ? parts.join(" ") : null;
+}
+
+/**
+ * Live board copy for the interactive draft — shape + how it fights, built
+ * from the *current* five (alts included), not the pre-draft Stitches brief.
+ */
+export function liveCompMatchupLine(args: {
+  picks: DraftCompPick[];
+  theirLikely?: DraftCompPick[];
+  theirArchetype?: string | null;
+  /** Fallback when we cannot name a kit-level fight plan. */
+  fallbackCounter?: string | null;
+}): string | null {
+  if (!args.picks.length) return null;
+  const kind = describeCompKind(args.picks);
+  const theirRaw = args.theirArchetype?.trim() ?? "";
+  const theirOk =
+    theirRaw &&
+    theirRaw !== "unclear" &&
+    theirRaw !== "unknown" &&
+    theirRaw !== "flexible / mixed";
+  const their = theirOk ? `their ${theirRaw}` : "their likely shape";
+  const head = `${kind} into ${their}`;
+  const parts = howOurFiveFightParts(args.picks, args.theirLikely ?? []);
+  // Lead with the engage beat only — lane/rotate stay in the full counter note.
+  if (parts[0]) return `${head} — ${parts[0]}`;
+  if (args.fallbackCounter) return `${head} — ${args.fallbackCounter}`;
+  return `${head}.`;
 }
 
 function contestedHero(
@@ -964,7 +1090,12 @@ function backfillSlot(
     for (const h of p.topHeroes) {
       if (heroBlocked(h.hero)) continue;
       if (!slotFits(role, heroRole(h.hero), h.hero, named)) continue;
-      const score = h.comfort + (named.includes(h.hero) ? 1 : 0);
+      const score = comfortSlotScore(
+        h.hero,
+        h.comfort,
+        { role, heroes: named, why: "" },
+        [],
+      );
       if (!best || score > best.score) {
         best = { hero: h.hero, player: name, score };
       }
@@ -1114,6 +1245,56 @@ function fillLikelyComp(
     if (picks.length >= 5) break;
     take(next.hero, next.role, next.player, next.name, null);
   }
+
+  // Always prefer a full five: if role caps stranded a free player, flex them in.
+  if (picks.length < 5) {
+    const leftovers = pool
+      .filter(
+        (x) =>
+          !heroTaken(x.hero) &&
+          !playerTaken(x.player) &&
+          !playerTaken(x.name),
+      )
+      .sort((a, b) => b.comfort - a.comfort);
+    for (const next of leftovers) {
+      if (picks.length >= 5) break;
+      // Bypass roleOpen — last seat is flex so we do not publish a 4-hero "five".
+      picks.push({
+        role: next.role,
+        hero: next.hero,
+        player: next.name,
+        note: "flex seat",
+      });
+      usedH.add(heroKey(next.hero));
+      markPlayer(usedP, next.player);
+      markPlayer(usedP, next.name);
+    }
+  }
+
+  // Still short: free player's top pool was entirely claimed — seat them on a
+  // remaining lock / predicted hero so the board always shows five faces.
+  if (picks.length < 5) {
+    const freePlayers = players.filter(
+      (p) =>
+        !playerTaken(p.battletag) && !playerTaken(playerName(p.battletag)),
+    );
+    for (const hero of locks) {
+      if (picks.length >= 5) break;
+      if (heroTaken(hero)) continue;
+      const owner = freePlayers.shift() ?? null;
+      picks.push({
+        role: heroRole(hero),
+        hero,
+        player: owner ? playerName(owner.battletag) : null,
+        note: owner ? "flex seat" : "likely fifth",
+      });
+      usedH.add(heroKey(hero));
+      if (owner) {
+        markPlayer(usedP, owner.battletag);
+        markPlayer(usedP, playerName(owner.battletag));
+      }
+    }
+  }
   return picks;
 }
 
@@ -1123,18 +1304,87 @@ function slotFits(slotRole: string, role: string, hero: string, named: string[])
   const h = role.toLowerCase();
   if (s.includes("heal")) return h === "healer";
   if (s.includes("tank")) return h === "tank";
-  if (s.includes("off") || s.includes("solo")) return h === "bruiser";
-  if (s.includes("follow")) return h.includes("melee") || h === "bruiser";
-  if (s.includes("range") || s.includes("siege") || s.includes("percent") || s.includes("flex")) {
+  if (s.includes("off") || s.includes("solo") || s.includes("clear"))
+    return h === "bruiser" || h === "tank";
+  if (s.includes("follow") || s.includes("threat") || s.includes("burst"))
+    return h.includes("melee") || h === "bruiser" || h.includes("ranged");
+  if (
+    s.includes("range") ||
+    s.includes("siege") ||
+    s.includes("percent") ||
+    s.includes("poke") ||
+    s.includes("flex") ||
+    s.includes("mage") ||
+    s.includes("split") ||
+    s.includes("global")
+  ) {
     return h.includes("ranged") || h.includes("melee") || h === "bruiser";
   }
   return false;
 }
 
+/** Comfort is ~0–1; a +1 named bonus always crushed pockets like Qhira. */
+const NAMED_PLAN_BONUS = 0.08;
+
+function preferredTagsForAnswer(answerKey: string): string[] {
+  if (answerKey === "pivot:poke") return ["poke", "siege", "safe"];
+  if (answerKey === "pivot:blowup") return ["engage", "assassin"];
+  if (answerKey === "pivot:global") return ["global", "mobile", "waveclear"];
+  if (answerKey === "poke/siege" || answerKey === "hypercarry") {
+    return ["dive", "engage", "assassin"];
+  }
+  if (answerKey === "double support") {
+    return ["tankbuster", "siege", "percent"];
+  }
+  if (answerKey === "dive") {
+    return ["peel", "frontline"];
+  }
+  // default / assassin-focused: we often answer with dive follow-up
+  return ["dive", "assassin", "engage"];
+}
+
+function comfortSlotScore(
+  hero: string,
+  comfort: number,
+  slot: DraftPlanSlot,
+  preferredTags: string[],
+): number {
+  const named = slot.heroes.some((n) => heroKey(n) === heroKey(hero))
+    ? NAMED_PLAN_BONUS
+    : 0;
+  const tags = tagsOf(hero);
+  const tagHit = preferredTags.some((t) => tags.includes(t)) ? 0.12 : 0;
+  // Priority dive cores (Qhira): always win the damage seat over template fillers.
+  const coreHit = divePlaybook.priorityDiveCores.some(
+    (h) => heroKey(h) === heroKey(hero),
+  )
+    ? 0.55
+    : 0;
+  let roleFit = 0;
+  const s = slot.role.toLowerCase();
+  const actual = heroRole(hero);
+  // Ranged seat must prefer real ranged — bruisers filling it produced all-melee fives.
+  if (s.includes("range") || s.includes("siege") || s.includes("percent")) {
+    if (actual.includes("Ranged")) roleFit += 0.4;
+    if (actual === "Bruiser" || actual.includes("Melee")) roleFit -= 0.35;
+  }
+  return comfort + named + tagHit + coreHit + roleFit;
+}
+
+/**
+ * Seat OP / priority pockets first (Qhira), then fill the rest around them.
+ * When anti-dive forced a pivot, she stays — the shell changes, not the pocket.
+ */
 function ourLikelyComp(
   home: PlayerScout[] | null,
   slots: DraftPlanSlot[],
+  answerKey = "default",
+  leaveDive = false,
 ): { picks: DraftCompPick[]; note: string | null } {
+  const preferredTags = preferredTagsForAnswer(answerKey);
+  const coreNote = leaveDive
+    ? "priority pocket — keep her, rebuild into the pivot shell"
+    : "priority dive — rebuild around this";
   if (!home?.length) {
     const used = new Set<string>();
     return {
@@ -1151,47 +1401,390 @@ function ourLikelyComp(
       }),
     };
   }
+
   const usedH = new Set<string>();
   const usedP = new Set<string>();
-  const picks: DraftCompPick[] = [];
-  for (const slot of slots) {
-    let best: { hero: string; player: string; name: string; score: number } | null = null;
+  const picks: (DraftCompPick | null)[] = slots.map(() => null);
+
+  const tryPlace = (
+    slotIndex: number,
+    hero: string,
+    player: string,
+    name: string,
+    note: string,
+  ): boolean => {
+    if (picks[slotIndex]) return false;
+    if (usedH.has(heroKey(hero))) return false;
+    if (setHasPlayer(usedP, player) || setHasPlayer(usedP, name)) return false;
+    usedH.add(heroKey(hero));
+    markPlayer(usedP, player);
+    markPlayer(usedP, name);
+    picks[slotIndex] = {
+      role: slots[slotIndex].role,
+      hero,
+      player: name,
+      note,
+    };
+    return true;
+  };
+
+  // 1) Lock priority dive cores (Qhira) onto the best-fitting damage seat.
+  type CoreHit = {
+    hero: string;
+    player: string;
+    name: string;
+    comfort: number;
+    slotIndex: number;
+    score: number;
+  };
+  const cores: CoreHit[] = [];
+  for (const p of home) {
+    const name = playerName(p.battletag);
+    for (const h of p.topHeroes) {
+      if (
+        !divePlaybook.priorityDiveCores.some(
+          (c) => heroKey(c) === heroKey(h.hero),
+        )
+      ) {
+        continue;
+      }
+      slots.forEach((slot, slotIndex) => {
+        if (
+          !slotFits(slot.role, heroRole(h.hero), h.hero, slot.heroes)
+        ) {
+          return;
+        }
+        // Prefer ranged / flex / follow / burst seats over tank/heal/offlane.
+        const r = slot.role.toLowerCase();
+        if (r.includes("tank") || r.includes("heal") || r.includes("off")) {
+          return;
+        }
+        cores.push({
+          hero: h.hero,
+          player: p.battletag,
+          name,
+          comfort: h.comfort,
+          slotIndex,
+          score:
+            comfortSlotScore(h.hero, h.comfort, slot, preferredTags) +
+            (r.includes("flex") ||
+            r.includes("follow") ||
+            r.includes("threat") ||
+            r.includes("burst")
+              ? 0.05
+              : 0),
+        });
+      });
+    }
+  }
+  cores.sort((a, b) => b.score - a.score || b.comfort - a.comfort);
+  for (const c of cores) {
+    if (tryPlace(c.slotIndex, c.hero, c.player, c.name, coreNote)) {
+      break;
+    }
+  }
+
+  // 2) Fill remaining seats by comfort vs the answer shape.
+  slots.forEach((slot, slotIndex) => {
+    if (picks[slotIndex]) return;
+    let best: { hero: string; player: string; name: string; score: number } | null =
+      null;
     for (const p of home) {
       const name = playerName(p.battletag);
       if (setHasPlayer(usedP, p.battletag) || setHasPlayer(usedP, name)) continue;
       for (const h of p.topHeroes) {
         if (usedH.has(heroKey(h.hero))) continue;
         if (!slotFits(slot.role, heroRole(h.hero), h.hero, slot.heroes)) continue;
-        const score = h.comfort + (slot.heroes.some((n) => heroKey(n) === heroKey(h.hero)) ? 1 : 0);
+        const score = comfortSlotScore(h.hero, h.comfort, slot, preferredTags);
         if (!best || score > best.score) {
           best = { hero: h.hero, player: p.battletag, name, score };
         }
       }
     }
     if (best) {
-      usedH.add(heroKey(best.hero));
-      markPlayer(usedP, best.player);
-      markPlayer(usedP, best.name);
-      picks.push({
-        role: slot.role,
-        hero: best.hero,
-        player: best.name,
-        note: slot.heroes.some((n) => heroKey(n) === heroKey(best.hero))
+      tryPlace(
+        slotIndex,
+        best.hero,
+        best.player,
+        best.name,
+        slot.heroes.some((n) => heroKey(n) === heroKey(best.hero))
           ? "matches the plan"
           : "closest comfort we have",
-      });
+      );
     } else {
       const hero = slot.heroes.find((h) => !usedH.has(heroKey(h)));
       if (hero) usedH.add(heroKey(hero));
-      picks.push({
+      picks[slotIndex] = {
         role: slot.role,
         hero: hero ?? "Open",
         player: null,
         note: "not in our saved pool",
-      });
+      };
+    }
+  });
+
+  return {
+    picks: picks.map(
+      (p, i) =>
+        p ?? {
+          role: slots[i].role,
+          hero: "Open",
+          player: null,
+          note: "not in our saved pool",
+        },
+    ),
+    note: leaveDive
+      ? "Anti-dive on their side — shell is the pivot; Qhira stays if she was open."
+      : null,
+  };
+}
+
+/** Bruisers that want the solo lane (clear / sustain / soak). */
+const OFFLANE_BRUISERS = new Set(
+  [
+    "Malthael",
+    "Leoric",
+    "Sonya",
+    "Dehaka",
+    "Blaze",
+    "Xul",
+    "Hogger",
+    "Ragnaros",
+    "Gazlowe",
+    "Rexxar",
+  ].map(heroKey),
+);
+
+/** Bruisers that want the 4-man (fight follow-up, not the soak seat). */
+const FOUR_MAN_BRUISERS = new Set(
+  [
+    "Thrall",
+    "Imperius",
+    "Yrel",
+    "Artanis",
+    "Chen",
+    "Dva",
+    "D.Va",
+    "Varian",
+  ].map(heroKey),
+);
+
+function offlaneFitness(hero: string): number {
+  const key = heroKey(hero);
+  let score = 0;
+  if (OFFLANE_BRUISERS.has(key)) score += 4;
+  if (tagsOf(hero).includes("waveclear")) score += 3;
+  if (tagsOf(hero).includes("solo")) score += 1;
+  if (FOUR_MAN_BRUISERS.has(key)) score -= 2;
+  if (heroRole(hero) !== "Bruiser") score -= 5;
+  return score;
+}
+
+function fourManBruiserFitness(hero: string): number {
+  const key = heroKey(hero);
+  let score = 0;
+  if (FOUR_MAN_BRUISERS.has(key)) score += 4;
+  if (tagsOf(hero).some((t) => t === "dive" || t === "engage")) score += 2;
+  if (OFFLANE_BRUISERS.has(key)) score -= 2;
+  if (tagsOf(hero).includes("waveclear") && !FOUR_MAN_BRUISERS.has(key)) {
+    score -= 1;
+  }
+  if (heroRole(hero) !== "Bruiser") score -= 5;
+  return score;
+}
+
+/**
+ * Human-readable seat for the plan UI — never call a Bruiser "Ranged"
+ * just because they filled a damage template slot.
+ * Never call Kael'thas / Valla "Offlane" just because they sat in that seat.
+ * Dehaka / Sonya / etc. show as Offlane even when the raw role is Bruiser.
+ */
+export function planSeatJob(p: DraftCompPick): string {
+  const slot = p.role.toLowerCase();
+  const actual = heroRole(p.hero);
+  if (slot.includes("tank") || actual === "Tank") {
+    if (actual === "Tank") return "Tank";
+  }
+  if (slot.includes("heal") || actual === "Healer" || actual === "Support") {
+    return actual === "Support" ? "Support" : "Healer";
+  }
+  // Real offlaners first — Dehaka is Offlane, not "4-man".
+  if (heroIsOfflaner(p.hero)) return "Offlane";
+  if (slot.includes("off") || slot.includes("solo") || slot.includes("clear")) {
+    if (heroIsOfflaner(p.hero)) return "Offlane";
+  }
+  if (actual === "Bruiser" || actual.includes("Melee")) return "4-man";
+  if (actual.includes("Ranged")) return "Ranged";
+  if (slot.includes("flex")) return "Flex";
+  if (actual === "Tank") return "Tank";
+  return actual;
+}
+
+/** True offlane / soak heroes — not mages parked on the offlane seat. */
+export function heroIsOfflaner(hero: string): boolean {
+  const role = heroRole(hero);
+  if (role.includes("Ranged")) return false;
+  if (role === "Healer" || role === "Support") return false;
+  // Blaze is stored as Tank but is a real offlaner.
+  if (role === "Tank" && !OFFLANE_BRUISERS.has(heroKey(hero))) return false;
+  return offlaneFitness(hero) >= 2;
+}
+
+/** Do we already have a committed offlaner in the five? */
+export function planHasOfflane(picks: DraftCompPick[]): boolean {
+  return picks.some((p) => heroIsOfflaner(p.hero));
+}
+
+/** Any hero in the five carries a waveclear tag (lane / shrine clear). */
+export function planHasWaveclear(picks: DraftCompPick[]): boolean {
+  return picks.some((p) => tagsOf(p.hero).includes("waveclear"));
+}
+
+export function heroHasWaveclear(hero: string): boolean {
+  return tagsOf(hero).includes("waveclear");
+}
+
+/** Ranged damage (not healers) — at least one belongs in almost every five. */
+export function heroIsRangedDamage(hero: string): boolean {
+  const r = heroRole(hero);
+  if (r === "Healer" || r === "Support" || r === "Tank") return false;
+  return r.includes("Ranged");
+}
+
+export function planHasRangedDamage(picks: DraftCompPick[]): boolean {
+  return picks.some((p) => heroIsRangedDamage(p.hero));
+}
+
+function laneSplitNote(offlane: string, fourMan: string): string {
+  return (
+    `${offlane} offlanes (waveclear / soak — offlane is ~half the game); ` +
+    `${fourMan} plays the 4-man (teamfight follow-up, not the lane).`
+  );
+}
+
+/** Drop prior lane-split annotations so re-runs do not stack the same sentence. */
+function stripLaneSplitNote(note: string | null | undefined): string | null {
+  if (!note) return null;
+  const cleaned = note
+    .split(/;\s*/)
+    .map((p) => p.trim())
+    .filter(
+      (p) =>
+        p.length > 0 &&
+        !/offlanes\s*\(waveclear/i.test(p) &&
+        !/plays the 4-man/i.test(p),
+    )
+    .join("; ");
+  return cleaned || null;
+}
+
+function withLaneSplitNote(
+  note: string | null | undefined,
+  why: string,
+): string {
+  const base = stripLaneSplitNote(note);
+  return base ? `${base}; ${why}` : why;
+}
+
+/**
+ * When we have two bruisers, put the clear specialist offlane and the fight
+ * bruiser in the 4-man. Fixes Thrall-offlane / Malthael-"Ranged" mistakes.
+ */
+export function normalizeBruiserLanes(picks: DraftCompPick[]): DraftCompPick[] {
+  const next = picks.map((p) => ({ ...p }));
+  const offIdx = next.findIndex((p) => {
+    const r = p.role.toLowerCase();
+    return r.includes("off") || r.includes("solo") || r.includes("clear");
+  });
+  if (offIdx < 0) return next;
+
+  const bruiserIdxs = next
+    .map((p, i) => (heroRole(p.hero) === "Bruiser" ? i : -1))
+    .filter((i) => i >= 0);
+  if (bruiserIdxs.length < 2) {
+    // Single bruiser in a non-offlane slot → move label to offlane job if empty slot nonsense
+    const only = bruiserIdxs[0];
+    if (
+      only != null &&
+      only !== offIdx &&
+      offlaneFitness(next[only].hero) >= 3 &&
+      heroRole(next[offIdx].hero) !== "Bruiser" &&
+      heroRole(next[offIdx].hero) !== "Tank"
+    ) {
+      // Don't steal tank/heal — only swap if offlane seat is a misplaced damage hero
+      const offHero = next[offIdx].hero;
+      if (
+        heroRole(offHero).includes("Assassin") ||
+        next[offIdx].role.toLowerCase().includes("range") ||
+        next[offIdx].role.toLowerCase().includes("flex")
+      ) {
+        // leave alone — single bruiser already elsewhere is a different problem
+      }
+    }
+    return next;
+  }
+
+  // Best offlaner among bruisers vs whoever currently holds offlane if bruiser.
+  let bestOff = bruiserIdxs[0];
+  for (const i of bruiserIdxs) {
+    if (offlaneFitness(next[i].hero) > offlaneFitness(next[bestOff].hero)) {
+      bestOff = i;
     }
   }
-  return { picks, note: null };
+
+  const currentOffIsBruiser = heroRole(next[offIdx].hero) === "Bruiser";
+  if (bestOff === offIdx) {
+    // Already correct seat — still annotate if another bruiser is in 4-man.
+    const other = bruiserIdxs.find((i) => i !== offIdx);
+    if (other != null) {
+      const why = laneSplitNote(next[offIdx].hero, next[other].hero);
+      next[offIdx] = {
+        ...next[offIdx],
+        role: "Offlane",
+        note: withLaneSplitNote(next[offIdx].note, why),
+      };
+      next[other] = {
+        ...next[other],
+        role: "4-man",
+        note: withLaneSplitNote(next[other].note, why),
+      };
+    }
+    return next;
+  }
+
+  // Swap best offlane bruiser into offlane seat.
+  if (currentOffIsBruiser || fourManBruiserFitness(next[offIdx].hero) >= 0) {
+    const a = next[offIdx];
+    const b = next[bestOff];
+    const why = laneSplitNote(b.hero, a.hero);
+    next[offIdx] = {
+      ...b,
+      role: "Offlane",
+      note: withLaneSplitNote(b.note, why),
+    };
+    next[bestOff] = {
+      ...a,
+      role: "4-man",
+      note: withLaneSplitNote(a.note, why),
+    };
+  }
+
+  return next;
+}
+
+/** Export for UI — one clean lane-split sentence from plan notes. */
+export function extractLaneSplitNote(
+  picks: { note?: string | null }[],
+): string | null {
+  for (const p of picks) {
+    if (!p.note) continue;
+    const parts = p.note.split(/;\s*/).map((s) => s.trim());
+    const off = parts.find((s) => /offlanes\s*\(waveclear/i.test(s));
+    const four = parts.find((s) => /plays the 4-man/i.test(s));
+    if (off && four) return `${off}; ${four}`;
+    if (off) return off;
+  }
+  return null;
 }
 
 function finishOurComp(
@@ -1201,12 +1794,17 @@ function finishOurComp(
   draft: DraftInsights,
   note: string | null,
 ): { picks: DraftCompPick[]; note: string | null; brief: OurCompBrief } {
-  const withAlts = picks.map((p, i) => ({
+  const laneds = fillPlanHoles(
+    normalizeBruiserLanes(picks),
+    home ?? [],
+    new Set(),
+  );
+  const withAlts = laneds.map((p, i) => ({
     ...p,
     alternatives: alternativesFor(
       home,
       slots[i] ?? { role: p.role, heroes: [], why: "" },
-      picks,
+      laneds,
       i,
     ),
   }));
@@ -1219,8 +1817,275 @@ function finishOurComp(
       noTankReason: explainNoTank(withAlts, slots),
       mapStrategy: plan.strategy,
       whyItWorks: plan.why,
+      holes: explainCompHoles(withAlts),
     },
   };
+}
+
+export function explainCompHoles(picks: DraftCompPick[]): string | null {
+  const counted = picks.some((p) => p.player)
+    ? picks.filter((p) => p.player)
+    : picks;
+  if (counted.length < 3) return null;
+
+  const heroes = counted.map((p) => p.hero);
+  const roles = heroes.map((h) => heroRole(h));
+  const ranged = heroes.filter((h) => heroRole(h).includes("Ranged"));
+  const clear = heroes.filter((h) => tagsOf(h).includes("waveclear"));
+  const parts: string[] = [];
+
+  if (ranged.length === 0) {
+    const clearNote =
+      clear.length > 0
+        ? `${clear.join(" / ")} can clear shrine waves up close`
+        : "nobody has real waveclear";
+    parts.push(
+      `No ranged damage — all melee. On Infernal Shrines that means ${clearNote}, but Punisher DPS is a melee stack (easy to wombo, slow chip). ` +
+        `Take a ranged seat (Valla / Greymane / Jaina / Kael'thas / Tychus) before stacking another bruiser.`,
+    );
+  }
+  if (clear.length === 0) {
+    parts.push(
+      ranged.length === 0
+        ? `Also no waveclear — a ranged mage/AA with clear (Jaina / Kael'thas / Greymane) patches both holes at once.`
+        : `No waveclear tag in the five — shrine waves and Punisher races get ugly. Keep an offlane clear (Malthael / Leoric / Sonya) or a mage with wave clear.`,
+    );
+  }
+
+  const tanks = roles.filter((r) => r === "Tank").length;
+  const healers = roles.filter((r) => r === "Healer" || r === "Support").length;
+  if (tanks === 0) {
+    parts.push("No main tank — engages and Punisher bodyblocks fall apart.");
+  }
+  if (healers === 0) {
+    parts.push("No healer — you cannot contest a Punisher fight.");
+  }
+
+  return parts.length ? parts.join(" ") : null;
+}
+
+const DEFAULT_RANGED_FILLS = [
+  "Valla",
+  "Greymane",
+  "Falstad",
+  "Raynor",
+  "Jaina",
+  "Kael'thas",
+  "Hanzo",
+  "Sylvanas",
+];
+
+function isLockedSeatNote(note: string | null | undefined): boolean {
+  return Boolean(note && /\blocked\b/i.test(note));
+}
+
+function comfortOn(
+  home: PlayerScout[],
+  player: string | null,
+  hero: string,
+): number {
+  if (!player || !home.length) return 0;
+  const id = player.split("#")[0]?.trim().toLowerCase() ?? "";
+  const row = home.find(
+    (p) =>
+      p.battletag.split("#")[0]?.trim().toLowerCase() === id ||
+      p.battletag.toLowerCase() === player.toLowerCase(),
+  );
+  if (!row) return 0;
+  return (
+    row.topHeroes.find((h) => heroKey(h.hero) === heroKey(hero))?.comfort ?? 0
+  );
+}
+
+/**
+ * After locks / lane splits, rewrite open seats so the planned five does not
+ * carry a known hole (no ranged with Qhira+Thrall, no clear, etc.).
+ * Also: if someone locked a mage onto the offlane seat, relabel them and
+ * open a real offlane NEED seat.
+ */
+export function fillPlanHoles(
+  picks: DraftCompPick[],
+  home: PlayerScout[],
+  gone: Set<string>,
+): DraftCompPick[] {
+  if (picks.length < 3) return picks;
+  let next = picks.map((p) => ({ ...p }));
+  const heroesOf = () => next.map((p) => p.hero);
+  const free = (h: string) =>
+    !gone.has(heroKey(h)) &&
+    !heroesOf().some((x) => heroKey(x) === heroKey(h));
+
+  // Mage/assassin locked on "Offlane" → that is not offlane. Relabel + reopen lane.
+  for (let i = 0; i < next.length; i++) {
+    const p = next[i];
+    const slot = p.role.toLowerCase();
+    const looksOff =
+      slot.includes("off") || slot.includes("solo") || slot.includes("clear");
+    if (!looksOff || heroIsOfflaner(p.hero)) continue;
+    const actual = heroRole(p.hero);
+    next[i] = {
+      ...p,
+      role: actual.includes("Ranged")
+        ? "Ranged"
+        : actual === "Bruiser" || actual.includes("Melee")
+          ? "4-man"
+          : actual,
+      note: isLockedSeatNote(p.note)
+        ? "locked — not offlane"
+        : p.note?.includes("not offlane")
+          ? p.note
+          : "not an offlaner",
+    };
+  }
+
+  // No real offlaner in the five → put one on an open seat (prefer empty offlane label).
+  if (!planHasOfflane(next)) {
+    let offIdx = next.findIndex((p) => {
+      if (isLockedSeatNote(p.note)) return false;
+      const r = p.role.toLowerCase();
+      return r.includes("off") || r.includes("solo") || r.includes("clear");
+    });
+    if (offIdx < 0) {
+      // Steal an unlocked non-tank/heal seat that isn't our only ranged if we have two damage.
+      offIdx = next.findIndex((p) => {
+        if (isLockedSeatNote(p.note)) return false;
+        const r = p.role.toLowerCase();
+        if (r.includes("tank") || r.includes("heal")) return false;
+        // Prefer 4-man / flex over our only ranged.
+        if (r.includes("4-man") || r.includes("flex")) return true;
+        return r.includes("range");
+      });
+    }
+    if (offIdx >= 0) {
+      const seat = next[offIdx];
+      const options = [
+        ...(seat.alternatives?.map((a) => a.hero) ?? []),
+        "Malthael",
+        "Leoric",
+        "Sonya",
+        "Blaze",
+        "Xul",
+        "Dehaka",
+        "Hogger",
+      ].filter((h) => free(h) && heroIsOfflaner(h));
+      let best: string | null = null;
+      let bestScore = -1;
+      for (const h of options) {
+        const score =
+          offlaneFitness(h) + comfortOn(home, seat.player, h) * 20;
+        if (score > bestScore) {
+          bestScore = score;
+          best = h;
+        }
+      }
+      if (best) {
+        next[offIdx] = {
+          ...seat,
+          hero: best,
+          role: "Offlane",
+          note: "need real offlane",
+        };
+      }
+    }
+  }
+
+  // Prefer a waveclear offlaner when the five has none.
+  if (!heroesOf().some((h) => tagsOf(h).includes("waveclear"))) {
+    const offIdx = next.findIndex((p) => {
+      const r = p.role.toLowerCase();
+      return r.includes("off") || r.includes("solo") || r.includes("clear");
+    });
+    if (offIdx >= 0 && !isLockedSeatNote(next[offIdx].note)) {
+      const seat = next[offIdx];
+      const options = [
+        ...(seat.alternatives?.map((a) => a.hero) ?? []),
+        "Malthael",
+        "Leoric",
+        "Sonya",
+        "Blaze",
+        "Xul",
+      ].filter(free);
+      let best: string | null = null;
+      let bestScore = -1;
+      for (const h of options) {
+        if (!tagsOf(h).includes("waveclear")) continue;
+        const score =
+          offlaneFitness(h) + comfortOn(home, seat.player, h) * 20;
+        if (score > bestScore) {
+          bestScore = score;
+          best = h;
+        }
+      }
+      if (best) {
+        next[offIdx] = {
+          ...seat,
+          hero: best,
+          role: "Offlane",
+          note: seat.note?.includes("fills clear")
+            ? seat.note
+            : "fills waveclear hole",
+        };
+      }
+    }
+  }
+
+  // Prefer a real ranged seat when the five is all melee (Qhira + Thrall case).
+  if (!heroesOf().some((h) => heroRole(h).includes("Ranged"))) {
+    const seatIdx = next.findIndex((p) => {
+      if (isLockedSeatNote(p.note)) return false;
+      const r = p.role.toLowerCase();
+      if (r.includes("off") || r.includes("tank") || r.includes("heal")) {
+        return false;
+      }
+      const role = heroRole(p.hero);
+      return (
+        role === "Bruiser" ||
+        role.includes("Melee") ||
+        r.includes("4-man") ||
+        r.includes("flex")
+      );
+    });
+    if (seatIdx >= 0) {
+      const seat = next[seatIdx];
+      const takenPlayers = new Set(
+        next
+          .map((x) => x.player?.split("#")[0]?.trim().toLowerCase())
+          .filter((x): x is string => Boolean(x)),
+      );
+      type Opt = { hero: string; player: string | null; score: number };
+      const best: { current: Opt | null } = { current: null };
+      const consider = (hero: string, player: string | null, base: number) => {
+        if (!free(hero) || !heroRole(hero).includes("Ranged")) return;
+        const score = base + comfortOn(home, player, hero) * 30;
+        if (!best.current || score > best.current.score) {
+          best.current = { hero, player, score };
+        }
+      };
+      for (const a of seat.alternatives ?? []) {
+        consider(a.hero, a.player ?? seat.player, 2);
+      }
+      for (const h of DEFAULT_RANGED_FILLS) {
+        consider(h, seat.player, 1);
+        for (const p of home) {
+          const name = p.battletag.split("#")[0]?.trim() ?? p.battletag;
+          if (takenPlayers.has(name.toLowerCase())) continue;
+          // Don't steal the seat's current player assignment unless comfort is real.
+          consider(h, p.battletag, comfortOn(home, name, h) > 0.03 ? 3 : 0);
+        }
+      }
+      if (best.current && best.current.score > 0) {
+        next[seatIdx] = {
+          ...seat,
+          hero: best.current.hero,
+          player: best.current.player ?? seat.player,
+          role: "Ranged",
+          note: "fills ranged hole — not a second melee with dive",
+        };
+      }
+    }
+  }
+
+  return next;
 }
 
 function describeCompKind(picks: DraftCompPick[]): string {
@@ -1232,18 +2097,45 @@ function describeCompKind(picks: DraftCompPick[]): string {
   const tanks = roles.filter((r) => r === "Tank").length;
   const healers = roles.filter((r) => r === "Healer" || r === "Support").length;
   const bruisers = roles.filter((r) => r === "Bruiser").length;
-  const divers = heroes.filter((h) => tagsOf(h).includes("dive")).length;
+  const tankHero = heroes.find((h) => heroRole(h) === "Tank");
+  const diveAssassin = heroes.find(
+    (h) =>
+      tagsOf(h).includes("dive") &&
+      (heroRole(h).includes("Assassin") || heroRole(h) === "Bruiser"),
+  );
   const poke = heroes.filter((h) =>
     tagsOf(h).some((t) => t === "poke" || t === "siege"),
   ).length;
   const hyper = heroes.filter((h) => tagsOf(h).includes("hypercarry")).length;
+  const hookTank =
+    tankHero &&
+    ["Stitches", "Garrosh"].some((h) => heroKey(h) === heroKey(tankHero));
+  const hardDiveTank =
+    tankHero &&
+    ["Anub'arak", "Anubarak", "Diablo", "ETC", "E.T.C.", "Tyrael", "Mei"].some(
+      (h) => heroKey(h) === heroKey(tankHero!),
+    );
 
   if (healers >= 2) return "Double support";
-  if (tanks === 0 && divers >= 1) return "Dive comp with no main tank";
-  if (tanks === 0 && bruisers >= 2) return "Double bruiser comp with no main tank";
-  if (tanks === 0) return "Skirmish comp with no main tank";
-  if (divers >= 1) return "Dive comp";
-  if (poke >= 2) return "Poke / siege comp";
+  if (tanks === 0 && diveAssassin)
+    return `Dive without a main tank (${diveAssassin} looks for picks)`;
+  if (tanks === 0 && bruisers >= 2) return "Double bruiser, no main tank";
+  if (tanks === 0) return "Skirmish comp, no main tank";
+
+  // Stitches / Garrosh + follow-up is hook/pick, not "dive".
+  if (hookTank && diveAssassin) {
+    return `${tankHero} hook/pick into ${diveAssassin}`;
+  }
+  if (hookTank) {
+    return `${tankHero} pick/engage — not a classic dive shell`;
+  }
+  if (hardDiveTank && diveAssassin) {
+    return `Dive — ${tankHero} + ${diveAssassin}`;
+  }
+  if (diveAssassin && tankHero) {
+    return `${tankHero} frontline with ${diveAssassin} follow-up`;
+  }
+  if (poke >= 2) return "Poke / siege";
   if (hyper >= 1) return "Hypercarry protect";
   if (tanks >= 1 && healers >= 1) return "Standard five";
   return "Mixed comp";
@@ -1300,6 +2192,30 @@ function alternativesFor(
   const alts: CompAlternative[] = [];
   const seen = new Set<string>([heroKey(chosen.hero)]);
 
+  // Same player's other comforts for this seat first (MrHustler → Qhira under Valla).
+  if (home?.length && chosen.player) {
+    const owner = home.find(
+      (p) =>
+        playerId(p.battletag) === playerId(chosen.player!) ||
+        playerId(playerName(p.battletag)) === playerId(chosen.player!),
+    );
+    if (owner) {
+      const owned = [...owner.topHeroes]
+        .filter(
+          (h) =>
+            !seen.has(heroKey(h.hero)) &&
+            !usedElsewhere.has(heroKey(h.hero)) &&
+            slotFits(slot.role, heroRole(h.hero), h.hero, slot.heroes),
+        )
+        .sort((a, b) => b.comfort - a.comfort);
+      for (const h of owned) {
+        seen.add(heroKey(h.hero));
+        alts.push({ hero: h.hero, player: playerName(owner.battletag) });
+        if (alts.length >= 2) return alts;
+      }
+    }
+  }
+
   if (home?.length) {
     const cands: { hero: string; player: string; score: number }[] = [];
     for (const p of home) {
@@ -1313,7 +2229,7 @@ function alternativesFor(
         cands.push({
           hero: h.hero,
           player: name,
-          score: h.comfort + (slot.heroes.some((n) => heroKey(n) === heroKey(h.hero)) ? 1 : 0),
+          score: comfortSlotScore(h.hero, h.comfort, slot, []),
         });
       }
     }
@@ -1338,69 +2254,109 @@ function alternativesFor(
 function mapPlanForComp(
   picks: DraftCompPick[],
   draft: DraftInsights,
+  mapOverride?: string | null,
 ): { strategy: string; why: string } {
-  const top = draft.mapTendencies[0];
+  const top = mapOverride
+    ? { map: mapOverride }
+    : draft.mapTendencies[0];
   const heroes = picks.filter((p) => p.player).map((p) => p.hero);
   const globalHero = heroes.find((h) =>
     tagsOf(h).some((t) => t === "global" || t === "mobile"),
   );
-  const clearHero = heroes.find((h) => tagsOf(h).includes("waveclear"));
+  const clearHero = heroes.find((h) => heroIsOfflaner(h));
   const tankHero = heroes.find((h) => heroRole(h) === "Tank");
-  const diveHero = heroes.find(
-    (h) => tagsOf(h).includes("dive") && heroRole(h) !== "Tank",
+  const healHero = heroes.find(
+    (h) => heroRole(h) === "Healer" || heroRole(h) === "Support",
   );
+  const diveHero = heroes.find(
+    (h) =>
+      tagsOf(h).includes("dive") && heroRole(h).includes("Assassin"),
+  );
+  const rangedHero = heroes.find((h) => heroRole(h).includes("Ranged"));
   const info = top ? MAP_MACRO[top.map] : undefined;
   const size =
     info?.size ?? (top && LARGE_MAPS.has(top.map) ? "large" : "point");
-  const macroLine =
-    info?.line ??
-    (size === "large"
-      ? "soak the side lanes and only group for the objective you can reach first"
-      : "group for the objective and win that one fight");
   const where = top
     ? `On ${top.map}`
     : size === "large"
       ? "On a large map"
       : "On a point-control map";
 
-  const jobs: string[] = [];
-  if (globalHero) jobs.push(`${globalHero} covers the rotation`);
-  if (clearHero && clearHero !== globalHero)
-    jobs.push(`${clearHero} clears the wave before you leave the lane`);
-  if (tankHero) jobs.push(`${tankHero} starts the fight once the lane is pushed`);
-  else if (diveHero)
-    jobs.push(`${diveHero} looks for a pick instead of a front-to-back`);
+  const lanes: string[] = [];
+  if (clearHero && tankHero) {
+    lanes.push(
+      `Lanes: ${clearHero} offlanes; ${tankHero}${healHero ? ` + ${healHero}` : ""}${rangedHero ? ` + ${rangedHero}` : ""} hold the 4-man / soak the short lane`,
+    );
+  } else if (clearHero) {
+    lanes.push(`Lanes: ${clearHero} offlanes and clears before the rotate`);
+  }
+  if (globalHero) {
+    lanes.push(
+      `Rotate: ${globalHero} covers the long path so the offlaner can stay in lane until the last second`,
+    );
+  } else if (size === "large") {
+    lanes.push(
+      `Rotate: no global — leave the offlane earlier and accept a weaker wave to make the objective`,
+    );
+  }
+  if (tankHero && heroKey(tankHero) === heroKey("Stitches") && diveHero) {
+    lanes.push(
+      `Fight: set up Hook sight on ${diveHero}'s target before the camp/punisher starts — do not walk in as five and hope`,
+    );
+  } else if (tankHero && diveHero) {
+    lanes.push(
+      `Fight: ${tankHero} engages first; ${diveHero} only follows the engage`,
+    );
+  } else if (info?.line) {
+    lanes.push(`Objective: ${info.line}`);
+  }
 
-  const jobLine = jobs.length ? ` ${jobs.join(". ")}.` : "";
-  const strategy = `${where}, ${macroLine}.${jobLine}`;
+  const strategy =
+    lanes.length > 0
+      ? `${where}. ${lanes.join(". ")}.`
+      : `${where}. ${info?.line ?? "Play the objective timing."}`;
 
   let why: string;
-  if (!tankHero && diveHero && globalHero) {
+  if (tankHero && heroKey(tankHero) === heroKey("Stitches") && diveHero) {
+    why = `${tankHero} is the pick tool, ${diveHero} is the punish — this is not a classic Anub/Diablo dive shell.`;
+  } else if (!tankHero && diveHero && globalHero) {
     why = `${globalHero} gets you to the objective without five people soaking, and ${diveHero} wins a short fight. A long front-to-back against a real tank gives it back.`;
   } else if (!tankHero && diveHero) {
     why = `${diveHero} has to find a pick before their frontline locks the fight. Without a main tank this comp loses the longer the fight goes.`;
-  } else if (!tankHero) {
-    why = `You get value from waves and a collapse, and you give it back if you stand in a choke against a real frontline.`;
   } else if (size === "large" && globalHero && clearHero) {
-    why = `${clearHero} keeps a lane from falling over and ${globalHero} still makes the objective, so ${tankHero} fights on your timing.`;
-  } else if (size === "large" && clearHero) {
-    why = `${clearHero} buys the rotate. Without a global you have to leave the lane earlier, so the wave has to be pushed first.`;
+    why = `${clearHero} keeps a lane from falling over and ${globalHero} still makes the objective, so ${tankHero ?? "the frontline"} fights on your timing.`;
   } else if (tankHero && diveHero) {
     why = `${tankHero} and ${diveHero} want the same short fight this objective forces.`;
   } else if (tankHero) {
-    why = `${tankHero} decides when the objective fight starts, and the rest of the five is there to follow that engage.`;
+    why = `${tankHero} decides when the objective fight starts; the rest of the five is there to follow that engage.`;
   } else {
-    why = `Play the objective timing above and don't take a fair 5v5 on their terms.`;
+    why = `Play the objective timing and do not take a fair 5v5 on their terms.`;
   }
 
   return { strategy, why };
 }
 
+/** Rebuild lane/rotate copy when the coach locks an NGS map. */
+export function mapBriefForSelectedMap(
+  picks: DraftCompPick[],
+  mapName: string,
+  draft: DraftInsights,
+): { mapStrategy: string; whyItWorks: string; kind: string } {
+  const plan = mapPlanForComp(picks, draft, mapName);
+  return {
+    mapStrategy: plan.strategy,
+    whyItWorks: plan.why,
+    kind: describeCompKind(picks),
+  };
+}
+
 /**
- * Storm League / NGS custom "Mid Ban".
- * First-pick side bans first. Two bans each, alternating, before any picks.
- * After each side has 3 and 2 picks, second-pick side bans, then first-pick side.
- * Second-pick side gets the last pick.
+ * Storm League / NGS "Mid Ban" draft (snake picks).
+ *
+ * Pre-bans: FP, SP, FP, SP
+ * Picks: FP 1 → SP 2+3 → FP 4+5
+ * Mid-bans: SP, FP
+ * Picks: SP 6+7 (their 3rd+4th heroes) → FP 8+9 → SP 10 (last)
  */
 export const DRAFT_ORDER: { side: "fp" | "sp"; kind: "ban" | "pick" }[] = [
   { side: "fp", kind: "ban" },
@@ -1412,9 +2368,9 @@ export const DRAFT_ORDER: { side: "fp" | "sp"; kind: "ban" | "pick" }[] = [
   { side: "sp", kind: "pick" },
   { side: "fp", kind: "pick" },
   { side: "fp", kind: "pick" },
-  { side: "sp", kind: "pick" },
   { side: "sp", kind: "ban" },
   { side: "fp", kind: "ban" },
+  { side: "sp", kind: "pick" },
   { side: "sp", kind: "pick" },
   { side: "fp", kind: "pick" },
   { side: "fp", kind: "pick" },
@@ -1761,7 +2717,7 @@ function theirPivot(s: Walk, kind: "ban" | "pick", expected: Choice): Pivot | nu
     );
     const swap = alt
       ? `${alt.hero} takes ${threat.role} instead.`
-      : `Listed backups for ${threat.role} are already off the board, so that slot is filled from whoever is left.`;
+      : `Listed backups for ${threat.role} are gone, so that slot is filled from whoever is left.`;
     return {
       title: `If they ban ${threat.hero} instead`,
       why: `${threat.hero} is our ${threat.role}${threat.player ? ` (${threat.player})` : ""}. ${swap}`,
@@ -1904,7 +2860,7 @@ function nextTheirPick(s: Walk): Choice {
     return {
       hero,
       player: who,
-      why: `${hero} is the comfort you left up. ${removedNote(s)}`,
+      why: `${hero} is the comfort you left up.`,
     };
   }
   const best = bestFree(s.theirPool, s.theirPlayers, s.gone, s.passed);
@@ -1912,7 +2868,7 @@ function nextTheirPick(s: Walk): Choice {
     hero: best?.hero ?? "Flex",
     player: best?.player ?? null,
     why: best
-      ? `${best.hero} is the highest comfort still available for an open player. ${removedNote(s)}`
+      ? `${best.hero} is the highest comfort still available for an open player.`
       : "Pool is exhausted.",
   };
 }
@@ -1951,8 +2907,8 @@ function nextOurPick(s: Walk): Choice {
         hero,
         player: who,
         why: swapped
-          ? `${pick.hero} is off the board, so ${hero} takes ${pick.role}. ${removedNote(s)}`
-          : `${hero} fills ${pick.role} from our plan. ${removedNote(s)}`,
+          ? `${pick.hero} was taken, so ${hero} takes ${pick.role}.`
+          : `${hero} fills ${pick.role} from our plan.`,
       };
     }
   }
@@ -1984,19 +2940,6 @@ function banWhy(
     return `${who}Mid ban, after three pick rounds. ${hero} is the threat still on the board.`;
   }
   return `${who}Opening ban, before any picks.`;
-}
-
-function removedNote(s: Walk): string {
-  const seen = new Set<string>();
-  const names: string[] = [];
-  for (const h of s.gone) {
-    const key = heroKey(h);
-    if (seen.has(key)) continue;
-    seen.add(key);
-    names.push(h);
-  }
-  if (!names.length) return "";
-  return `Already off the board: ${names.slice(-4).join(", ")}.`;
 }
 
 function poolFrom(players: PlayerScout[]): HeroOpt[] {

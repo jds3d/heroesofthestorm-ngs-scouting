@@ -1,4 +1,6 @@
-import { heroKey } from "@/lib/scoring/heroMeta";
+import { divePlaybook } from "@/config/divePlaybook";
+import { heroIsOfflaner } from "@/lib/scoring/draftPlan";
+import { heroKey, heroRole } from "@/lib/scoring/heroMeta";
 import {
   metaStrength,
   type GlobalHeroStat,
@@ -27,6 +29,15 @@ export type MatchupEnemyRow = {
   enemyWinRate: number;
 };
 
+export type MatchupAllyRow = {
+  hero: string;
+  wins: number;
+  losses: number;
+  games: number;
+  /** Combined WR when you and this hero are teammates. */
+  allyWinRate: number;
+};
+
 export type HeroMapStat = {
   hero: string;
   map: string;
@@ -43,6 +54,15 @@ export type MatchupEdge = {
   deltaPp: number;
 };
 
+export type SynergyEdge = {
+  hero: string;
+  /** Combined WR when you and this hero are teammates (0–100). */
+  allyWinRate: number;
+  games: number;
+  /** pp vs your solo baseline (positive = real synergy). */
+  deltaPp: number;
+};
+
 export type ComputedHeroMeta = {
   hero: string;
   winRate: number;
@@ -54,6 +74,8 @@ export type ComputedHeroMeta = {
   timing: "early" | "flex" | "late";
   /** Heroes that beat you by the numbers (hard counters). */
   counteredBy: MatchupEdge[];
+  /** Teammates that raise/lower your WR by the numbers. */
+  synergiesWith: SynergyEdge[];
   /** Maps where your WR is meaningfully above baseline. */
   mapStrong: { map: string; winRate: number; games: number; deltaPp: number }[];
   note: string;
@@ -102,6 +124,33 @@ function hardCounters(
     });
   }
   return out.sort((a, b) => b.theirWinRate - a.theirWinRate || b.games - a.games);
+}
+
+/** Min games before an ally pair counts as synergy. */
+const MIN_ALLY_GAMES = 60;
+/** |delta| below this is noise vs solo baseline. */
+const MIN_SYNERGY_DELTA_PP = 2;
+
+function buildSynergies(
+  baselineWr: number,
+  allies: MatchupAllyRow[] | undefined,
+): SynergyEdge[] {
+  if (!allies?.length) return [];
+  const out: SynergyEdge[] = [];
+  for (const row of allies) {
+    if (row.games < MIN_ALLY_GAMES) continue;
+    const deltaPp = row.allyWinRate - baselineWr;
+    if (Math.abs(deltaPp) < MIN_SYNERGY_DELTA_PP) continue;
+    out.push({
+      hero: row.hero,
+      allyWinRate: Math.round(row.allyWinRate * 10) / 10,
+      games: row.games,
+      deltaPp: Math.round(deltaPp * 10) / 10,
+    });
+  }
+  return out.sort(
+    (a, b) => b.deltaPp - a.deltaPp || b.games - a.games,
+  );
 }
 
 function mapEdges(
@@ -166,6 +215,8 @@ export function buildDraftMetaTable(args: {
   global: GlobalHeroStat[];
   /** enemy rows keyed by the hero being evaluated */
   matchups: Record<string, MatchupEnemyRow[]>;
+  /** ally rows keyed by the hero being evaluated */
+  allies?: Record<string, MatchupAllyRow[]>;
   mapStats?: HeroMapStat[];
 }): DraftMetaTable {
   const globalByKey = new Map<string, GlobalHeroStat>();
@@ -174,21 +225,28 @@ export function buildDraftMetaTable(args: {
   }
   const mapStats = args.mapStats ?? [];
   const byHero: Record<string, ComputedHeroMeta> = {};
+  const alliesByKey = args.allies ?? {};
 
   const keys = new Set<string>([
     ...globalByKey.keys(),
     ...Object.keys(args.matchups).map(heroKey),
+    ...Object.keys(alliesByKey).map(heroKey),
   ]);
+
+  const lookup = <T,>(
+    table: Record<string, T>,
+    key: string,
+  ): T | undefined =>
+    table[key] ??
+    table[Object.keys(table).find((k) => heroKey(k) === key) ?? ""];
 
   for (const key of keys) {
     const g = globalByKey.get(key);
     const wr = g?.winRate ?? 50;
-    const enemies =
-      args.matchups[key] ??
-      args.matchups[
-        Object.keys(args.matchups).find((k) => heroKey(k) === key) ?? ""
-      ];
+    const enemies = lookup(args.matchups, key);
+    const allies = lookup(alliesByKey, key);
     const counteredBy = hardCounters(key, wr, enemies, globalByKey);
+    const synergiesWith = buildSynergies(wr, allies);
     const influence = g?.influence ?? 0;
     const popularity = g?.popularity ?? 0;
     const partial = {
@@ -201,6 +259,7 @@ export function buildDraftMetaTable(args: {
       games: g?.games ?? 0,
       timing: classifyTiming(wr, influence, popularity, counteredBy),
       counteredBy,
+      synergiesWith,
       mapStrong: mapEdges(key, wr, mapStats),
     };
     byHero[key] = { ...partial, note: buildNote(partial) };
@@ -230,9 +289,28 @@ export function heroDraftMeta(
     games: 0,
     timing: "flex",
     counteredBy: [],
+    synergiesWith: [],
     mapStrong: [],
     note: "No Storm League sample for this hero yet.",
   };
+}
+
+/** Ally synergy edges for heroes already locked on our side. */
+export function liveAllySynergies(
+  table: DraftMetaTable | null | undefined,
+  hero: string,
+  lockedAllies: string[],
+): SynergyEdge[] {
+  if (!lockedAllies.length) return [];
+  const syn = heroDraftMeta(table, hero).synergiesWith;
+  const want = new Set(lockedAllies.map((h) => heroKey(h)));
+  return syn.filter((s) => want.has(heroKey(s.hero)));
+}
+
+/** Cho + Gall are one roster lock — never count them as two answers. */
+export function isChoGall(hero: string): boolean {
+  const k = heroKey(hero).toLowerCase().replace(/['’]/g, "");
+  return k === "cho" || k === "gall" || k === "chogall";
 }
 
 /** Hard counters still available on the live board. */
@@ -241,9 +319,126 @@ export function liveCountersUp(
   hero: string,
   gone: Set<string>,
 ): MatchupEdge[] {
-  return heroDraftMeta(table, hero).counteredBy.filter(
-    (c) => !goneHas(gone, c.hero),
+  const choGallGone = [...gone].some((h) => isChoGall(h));
+  return heroDraftMeta(table, hero).counteredBy.filter((c) => {
+    if (isChoGall(c.hero) && choGallGone) return false;
+    return !goneHas(gone, c.hero);
+  });
+}
+
+/**
+ * Collapse linked dual-hero counters (Cho'Gall) into a single edge so we
+ * don't double-penalize open-answers risk or trip "≥2 counters" mistake copy.
+ */
+export function collapseCounterEdges(threats: MatchupEdge[]): MatchupEdge[] {
+  const linked = threats.filter((t) => isChoGall(t.hero));
+  const rest = threats.filter((t) => !isChoGall(t.hero));
+  if (!linked.length) return threats;
+  const best = [...linked].sort(
+    (a, b) =>
+      b.games - a.games ||
+      b.theirWinRate - a.theirWinRate ||
+      a.hero.localeCompare(b.hero),
+  )[0];
+  return [{ ...best, hero: "Cho'Gall" }, ...rest];
+}
+
+/** Whether the answering team's known pool includes this counter. */
+export function poolPlaysCounter(
+  pool: Iterable<string>,
+  counterHero: string,
+): boolean {
+  const keys = new Set(
+    [...pool].map((h) => heroKey(h).toLowerCase().replace(/['’]/g, "")),
   );
+  if (isChoGall(counterHero)) {
+    return keys.has("cho") || keys.has("gall") || keys.has("chogall");
+  }
+  const want = heroKey(counterHero).toLowerCase().replace(/['’]/g, "");
+  return keys.has(want);
+}
+
+/**
+ * Drop counters that would fill a seat the answering team already has
+ * (e.g. Tyrael when they locked Varian). Double-tank / double-offlane is
+ * a weak stack — we shouldn't fear it, we should punish it.
+ *
+ * When `answeringTeamPool` is provided, only fear counters that team
+ * actually plays (SL matchup ≠ their comfort pool).
+ */
+export function credibleOpenCounters(
+  threats: MatchupEdge[],
+  answeringTeamLocked: string[] = [],
+  answeringTeamPool?: string[] | null,
+): MatchupEdge[] {
+  let out = collapseCounterEdges(threats);
+
+  if (answeringTeamPool != null) {
+    out = out.filter((t) => poolPlaysCounter(answeringTeamPool, t.hero));
+  }
+
+  if (!answeringTeamLocked.length) return out;
+  const roles = answeringTeamLocked.map((h) => heroRole(h));
+  const hasTank = roles.some((r) => r === "Tank");
+  const hasHeal = roles.some((r) => r === "Healer" || r === "Support");
+  const hasOfflane = answeringTeamLocked.some((h) => heroIsOfflaner(h));
+  return out.filter((t) => {
+    // Cho'Gall needs the tank seat (Cho). Treat as Tank for role-fill.
+    const r = isChoGall(t.hero) ? "Tank" : heroRole(t.hero);
+    if (hasTank && r === "Tank") return false;
+    if (hasHeal && (r === "Healer" || r === "Support")) return false;
+    if (hasOfflane && !isChoGall(t.hero) && heroIsOfflaner(t.hero))
+      return false;
+    return true;
+  });
+}
+
+/** Roles already filled that make a listed counter non-credible. */
+export function counterRoleFillNote(
+  threats: MatchupEdge[],
+  answeringTeamLocked: string[] = [],
+  answeringTeamPool?: string[] | null,
+): string | null {
+  if (!answeringTeamLocked.length || !threats.length) return null;
+  const collapsed = collapseCounterEdges(threats);
+  const live = new Set(
+    credibleOpenCounters(
+      threats,
+      answeringTeamLocked,
+      answeringTeamPool,
+    ).map((t) => heroKey(t.hero)),
+  );
+  const dropped = collapsed.filter((t) => {
+    if (answeringTeamPool != null && !poolPlaysCounter(answeringTeamPool, t.hero)) {
+      return false; // pool-drop is a different note
+    }
+    return !live.has(heroKey(t.hero));
+  });
+  if (!dropped.length) return null;
+  const bits = dropped.slice(0, 3).map((t) => {
+    const r = isChoGall(t.hero) ? "Tank" : heroRole(t.hero);
+    if (r === "Tank") return `${t.hero} (they already tanked)`;
+    if (r === "Healer" || r === "Support")
+      return `${t.hero} (they already healed)`;
+    if (heroIsOfflaner(t.hero)) return `${t.hero} (they already offlaned)`;
+    return t.hero;
+  });
+  return `Not fearing ${bits.join(", ")} — that seat is filled; double-stack is free.`;
+}
+
+/** SL counters that aren't in their pool — don't invent answers they won't take. */
+export function counterPoolNote(
+  threats: MatchupEdge[],
+  answeringTeamPool?: string[] | null,
+): string | null {
+  if (answeringTeamPool == null || !threats.length) return null;
+  const collapsed = collapseCounterEdges(threats);
+  const notInPool = collapsed.filter(
+    (t) => !poolPlaysCounter(answeringTeamPool, t.hero),
+  );
+  if (!notInPool.length) return null;
+  const bits = notInPool.slice(0, 3).map((t) => t.hero);
+  return `Not fearing ${bits.join(", ")} — not in their played pool.`;
 }
 
 export function isMapSpecialist(
@@ -278,9 +473,44 @@ export function isFlexibleAnchorRole(role: string | null | undefined): boolean {
 }
 
 /**
+ * Patch-defining dive we always snag when open (Qhira). Take it and rebuild —
+ * do not hold for "mask dive" timing.
+ */
+export function isPriorityDiveCore(hero: string): boolean {
+  return divePlaybook.priorityDiveCores.some(
+    (h) => heroKey(h) === heroKey(hero),
+  );
+}
+
+/**
+ * Storm League says this hero is a must-take when available.
+ * Tuned around Qhira-shaped influence/popularity.
+ */
+export function isMetaOp(
+  table: DraftMetaTable | null | undefined,
+  hero: string,
+): boolean {
+  if (isPriorityDiveCore(hero)) return true;
+  const m = heroDraftMeta(table, hero);
+  if (m.games < 80) return false;
+  if (metaStrength(m) >= 0.72) return true;
+  if (m.influence >= 220 && m.popularity >= 55) return true;
+  if (m.winRate >= 52 && m.influence >= 150 && m.popularity >= 45) return true;
+  return false;
+}
+
+/** Take this now and rebuild the plan — OP pocket or priority dive core. */
+export function shouldTakeAndRebuild(
+  table: DraftMetaTable | null | undefined,
+  hero: string,
+): boolean {
+  return isPriorityDiveCore(hero) || isMetaOp(table, hero);
+}
+
+/**
  * Higher = better to lock on this step.
- * Pick 1 prioritizes flexible anchors; naked offlane is heavily punished
- * (offlane is ~half the game — do not gift them the counter).
+ * OP / priority dive cores beat everything — take them and rebuild.
+ * Otherwise pick 1 prefers flexible anchors; naked offlane is punished.
  */
 export function earlyPickScore(
   table: DraftMetaTable | null | undefined,
@@ -292,13 +522,26 @@ export function earlyPickScore(
     inPlan: boolean;
     /** Role from our planned five, if this hero is in it. */
     planRole?: string | null;
+    /** Heroes the answering side already locked — role-fill counters don't count. */
+    answeringTeamLocked?: string[];
+    /**
+     * Heroes the answering side actually plays. When set, SL counters outside
+     * this pool do not count as open answers.
+     */
+    answeringTeamPool?: string[] | null;
+    /** Last pick of the draft — nobody answers after this. */
+    lastPick?: boolean;
   },
 ): number {
   const meta = heroDraftMeta(table, hero);
-  let score = args.inPlan ? 20 : 0;
+  // Soft prior only — board state should dominate once picks start landing.
+  const planDecay = Math.max(0.15, 1 - args.ourPickCount * 0.28);
+  let score = (args.inPlan ? 12 : 0) * planDecay;
+
   const opening = args.ourPickCount === 0;
   const offlane = isOfflanePlanRole(args.planRole);
   const anchor = isFlexibleAnchorRole(args.planRole);
+  const takeNow = shouldTakeAndRebuild(table, hero);
 
   // Power from current patch numbers
   score += metaStrength(meta) * 18;
@@ -308,9 +551,15 @@ export function earlyPickScore(
 
   if (meta.timing === "early") score += 8;
   if (meta.timing === "late") score -= 10;
-  if (opening && meta.timing === "late") score -= 10;
+  if (opening && meta.timing === "late" && !takeNow) score -= 10;
 
-  const threats = liveCountersUp(table, hero, args.gone);
+  const threats = args.lastPick
+    ? []
+    : credibleOpenCounters(
+        liveCountersUp(table, hero, args.gone),
+        args.answeringTeamLocked ?? [],
+        args.answeringTeamPool,
+      );
   for (const t of threats) {
     // Popular counters that crush you are worse to leave up.
     const pop =
@@ -319,14 +568,20 @@ export function earlyPickScore(
     const hit =
       5 + Math.min(8, (t.theirWinRate - 50) / 3) + pop / 40;
     // Offlane counters are existential; tank counters are awkward but rotatable.
-    score -= offlane && opening ? hit * 1.75 : hit;
+    // OP cores: still respect hard answers, but do not refuse the pick.
+    score -= offlane && opening ? hit * 1.75 : takeNow ? hit * 0.45 : hit;
   }
 
-  if (opening && anchor) score += 14;
-  if (opening && offlane) {
-    // Never casually open your real offlaner — they counter it and the map is over.
-    score -= 22;
-    if (threats.length > 0) score -= 10;
+  // When an OP dive is open, take it — anchors wait.
+  if (takeNow) {
+    score += opening ? 42 : 28;
+  } else {
+    if (opening && anchor) score += 14;
+    if (opening && offlane) {
+      // Never casually open your real offlaner — they counter it and the map is over.
+      score -= 22;
+      if (threats.length > 0) score -= 10;
+    }
   }
 
   const mapHit = isMapSpecialist(table, hero, args.map);

@@ -7,37 +7,73 @@ import type {
   ScoutReport,
 } from "@/lib/scoring/types";
 import {
-  archetypeHint,
+  archetypeTooltipRows,
   DRAFT_TERM_HINTS,
 } from "@/lib/scoring/glossary";
+import { extractLaneSplitNote } from "@/lib/scoring/draftPlan";
 import type { MapPlan } from "@/lib/scoring/types";
 import { applyMapToDraftPlan } from "@/lib/scoring/applyMap";
+import {
+  explainCompHoles,
+  normalizeBruiserLanes,
+  planSeatJob,
+} from "@/lib/scoring/draftPlan";
 import { PlayerCard } from "@/components/PlayerCard";
 import { HeroFace } from "@/components/HeroFace";
 import { InteractiveDraft } from "@/components/InteractiveDraft";
 import { MapPicker } from "@/components/MapPicker";
 
 export function ScoutReportView({ report }: { report: ScoutReport }) {
-  const [pickSide, setPickSide] = useState<"theyFirst" | "weFirst">("theyFirst");
+  const [pickSide, setPickSide] = useState<"theyFirst" | "weFirst" | null>(null);
   const [selectedMap, setSelectedMap] = useState<string | null>(null);
   const shown = report;
   const plan = useMemo(
     () =>
       shown.adapt.draftPlan
-        ? applyMapToDraftPlan(shown.adapt.draftPlan, selectedMap)
+        ? applyMapToDraftPlan(
+            shown.adapt.draftPlan,
+            selectedMap,
+            shown.draft,
+          )
         : null,
-    [shown.adapt.draftPlan, selectedMap],
+    [shown.adapt.draftPlan, selectedMap, shown.draft],
   );
-  const side = plan?.sides?.[pickSide] ?? null;
+  const activeSide = pickSide ?? "theyFirst";
+  const side = plan?.sides?.[activeSide] ?? null;
   const theirPicks = side?.theirLikely ?? plan?.theirLikely ?? [];
-  const ourPicks = side?.ourLikely ?? plan?.ourLikely ?? [];
+  const ourPicks = useMemo(() => {
+    const raw = side?.ourLikely ?? plan?.ourLikely ?? [];
+    return normalizeBruiserLanes(raw);
+  }, [side?.ourLikely, plan?.ourLikely]);
   const ourBrief = side?.ourBrief ?? plan?.ourBrief ?? null;
-  const preferredLabel = `${report.teamName} Preferred Heroes`;
+  const setupReady = Boolean(selectedMap && pickSide);
   const toc = [
-    { id: "know-them", label: "1. Know them" },
-    { id: "preferred-heroes", label: `2. ${preferredLabel}` },
+    { id: "know-them", label: `1. ${report.teamName} Team` },
+    { id: "preferred-heroes", label: `2. ${report.teamName} - Individual` },
     { id: "draft", label: "3. Draft" },
   ] as const;
+
+  function scrollToId(id: string) {
+    requestAnimationFrame(() => {
+      document.getElementById(id)?.scrollIntoView({
+        behavior: "smooth",
+        block: "start",
+      });
+    });
+  }
+
+  function onPickSide(next: "weFirst" | "theyFirst") {
+    setPickSide(next);
+    if (!selectedMap) scrollToId("draft-map");
+    else scrollToId("draft-plan");
+  }
+
+  function onSelectMap(map: string | null) {
+    setSelectedMap(map);
+    if (!map) return;
+    if (!pickSide) scrollToId("draft-first-pick");
+    else scrollToId("draft-plan");
+  }
 
   return (
     <div className="flex flex-col gap-10">
@@ -100,20 +136,16 @@ export function ScoutReportView({ report }: { report: ScoutReport }) {
 
       <section id="know-them" className="scroll-mt-16 space-y-4">
         <h3 className="font-[family-name:var(--font-display)] text-2xl text-[var(--ink)]">
-          1. Know them
+          1. {report.teamName} Team
         </h3>
         <p className="max-w-2xl text-sm text-[var(--muted)]">
           Who they are and what they want to play. The counter plan below is
           built from this.
         </p>
         <div className="grid gap-4 sm:grid-cols-3">
-          <StatBlock
-            title="Archetype"
-            body={report.draft.archetype}
-            hint={
-              archetypeHint(report.draft.archetype) ??
-              DRAFT_TERM_HINTS.Archetype
-            }
+          <ArchetypeStatBlock
+            archetype={report.draft.archetype}
+            breakdown={report.draft.archetypeBreakdown ?? []}
           />
           <StatBlock
             title="Games analyzed"
@@ -224,7 +256,7 @@ export function ScoutReportView({ report }: { report: ScoutReport }) {
 
       <section id="preferred-heroes" className="scroll-mt-16 space-y-4">
         <h3 className="font-[family-name:var(--font-display)] text-2xl text-[var(--ink)]">
-          2. {preferredLabel}
+          2. {report.teamName} - Individual
         </h3>
         <p className="max-w-2xl text-sm text-[var(--muted)]">
           Per-player comfort — NGS is this season&apos;s league games; SL is Storm
@@ -251,21 +283,52 @@ export function ScoutReportView({ report }: { report: ScoutReport }) {
             </p>
           </div>
 
-          <div className="flex flex-wrap gap-2">
-            <PickButton
-              active={pickSide === "weFirst"}
-              onClick={() => setPickSide("weFirst")}
-              label="We pick first"
-            />
-            <PickButton
-              active={pickSide === "theyFirst"}
-              onClick={() => setPickSide("theyFirst")}
-              label="They pick first"
+          <div
+            id="draft-first-pick"
+            className="scroll-mt-16 space-y-2 rounded-md border border-[var(--line)] bg-[var(--panel)] px-4 py-4"
+          >
+            <h4 className="text-sm font-semibold uppercase tracking-wide text-[var(--muted)]">
+              First pick
+            </h4>
+            <p className="text-sm text-[var(--muted)]">
+              {pickSide
+                ? selectedMap
+                  ? "Both set — plan below."
+                  : "Next: pick the map."
+                : "Choose who has first pick."}
+            </p>
+            <div className="flex flex-wrap gap-2">
+              <PickButton
+                active={pickSide === "weFirst"}
+                onClick={() => onPickSide("weFirst")}
+                label="We pick first"
+              />
+              <PickButton
+                active={pickSide === "theyFirst"}
+                onClick={() => onPickSide("theyFirst")}
+                label="They pick first"
+              />
+            </div>
+          </div>
+
+          <div id="draft-map" className="scroll-mt-16">
+            <MapPicker
+              value={selectedMap}
+              onChange={onSelectMap}
+              hint={
+                selectedMap
+                  ? pickSide
+                    ? undefined
+                    : "Next: choose who has first pick."
+                  : pickSide
+                    ? "Choose the map to unlock the draft plan."
+                    : "Current NGS pool only. Draft plan updates for the map you pick."
+              }
             />
           </div>
 
-          <MapPicker value={selectedMap} onChange={setSelectedMap} />
-
+          {setupReady ? (
+          <div id="draft-plan" className="scroll-mt-16 space-y-6">
           <div className="space-y-4 rounded-md border border-[var(--line)] bg-[var(--panel)] px-5 py-5">
             <h4 className="font-[family-name:var(--font-display)] text-xl text-[var(--ink)]">
               Overall plan
@@ -357,8 +420,20 @@ export function ScoutReportView({ report }: { report: ScoutReport }) {
               ourBrief={ourBrief}
               theirArchetype={report.draft.archetype}
               archetypeCounter={plan.counter}
+              leaveDive={Boolean(plan.playbook?.antiDiveThreat)}
+              leaveDivePivot={plan.playbook?.recommended?.name ?? null}
               map={selectedMap}
               draftMeta={shown.adapt.draftMeta}
+              homeRoster={
+                report.homeRoster?.length
+                  ? report.homeRoster
+                  : report.teamName === "Little Buff Boyz"
+                    ? report.roster
+                    : []
+              }
+              theirRoster={
+                report.teamName === "Little Buff Boyz" ? [] : report.roster
+              }
               ourLabel="Little Buff Boyz"
               theirLabel={report.teamName}
             />
@@ -416,6 +491,11 @@ export function ScoutReportView({ report }: { report: ScoutReport }) {
                       <p className="text-sm text-[var(--ink)]">
                         <span className="font-semibold">Pick: </span>
                         {plan.playbook.recommended.heroes.join(" · ")}
+                        {" · "}
+                        Qhira if open
+                      </p>
+                      <p className="text-sm text-[var(--muted)]">
+                        Keep Qhira — change the tank/heal/range shell around her, do not force Genji/Greymane dive into their anti-dive.
                       </p>
                       <p className="text-sm text-[var(--muted)]">
                         {plan.playbook.recommended.objective}
@@ -458,6 +538,16 @@ export function ScoutReportView({ report }: { report: ScoutReport }) {
               </div>
             </details>
           )}
+          </div>
+          ) : (
+            <p className="rounded-md border border-dashed border-[var(--line)] px-4 py-6 text-sm text-[var(--muted)]">
+              {!pickSide && !selectedMap
+                ? "Pick who has first pick and the map to open the draft plan."
+                : !pickSide
+                  ? "Choose who has first pick to continue."
+                  : "Choose the map to continue."}
+            </p>
+          )}
         </section>
       )}
 
@@ -468,8 +558,9 @@ export function ScoutReportView({ report }: { report: ScoutReport }) {
           </summary>
           <div className="mt-3 space-y-2">
             <p className="max-w-3xl text-sm text-[var(--muted)]">
-              Predicted is what the scout expects to call. It is higher than
-              actual when a token error stops the rest of the pulls.
+              Predicted is what the scout expects to call. Actual is lower when
+              data is already cached (no network), or when a token error stops
+              the rest of the pulls.
             </p>
             <ul className="space-y-1 text-sm text-[var(--ink)]">
               {report.apiUsage.predicted.map((row) => {
@@ -560,6 +651,8 @@ function CompFaces({
   note?: string | null;
   brief?: OurCompBrief | null;
 }) {
+  const laneNote = extractLaneSplitNote(picks);
+  const holes = explainCompHoles(picks);
   return (
     <div className="space-y-3">
       <p
@@ -574,29 +667,41 @@ function CompFaces({
       )}
       {note && <p className="text-sm text-[var(--muted)]">{note}</p>}
       <ul className="flex flex-wrap gap-3">
-        {picks.map((p) => (
-          <li key={`${p.role}-${p.hero}`}>
-            <HeroFace
-              hero={p.hero}
-              kind="draft"
-              size="md"
-              label={p.player ? `${p.hero}` : p.hero}
-              title={`${p.hero} · ${p.role}${p.player ? ` · ${p.player}` : ""}${p.note ? ` · ${p.note}` : ""}`}
-            />
-            <p className="mt-0.5 max-w-[3.5rem] text-center text-[10px] text-[var(--muted)]">
-              {p.role}
-              {p.player ? (
-                <>
-                  <br />
-                  {p.player.split("#")[0]}
-                </>
-              ) : null}
-            </p>
-          </li>
-        ))}
+        {picks.map((p) => {
+          const job = planSeatJob(p);
+          return (
+            <li key={`${p.role}-${p.hero}`}>
+              <HeroFace
+                hero={p.hero}
+                kind="draft"
+                size="md"
+                label={p.player ? `${p.hero}` : p.hero}
+                title={`${p.hero} · ${job}${p.player ? ` · ${p.player}` : ""}${p.note ? ` · ${p.note}` : ""}`}
+              />
+              <p className="mt-0.5 max-w-[3.5rem] text-center text-[10px] text-[var(--muted)]">
+                {job}
+                {p.player ? (
+                  <>
+                    <br />
+                    {p.player.split("#")[0]}
+                  </>
+                ) : null}
+              </p>
+            </li>
+          );
+        })}
       </ul>
+      {laneNote && (
+        <p className="text-sm text-[var(--muted)]">{laneNote}</p>
+      )}
+      {holes && (
+        <p className="text-sm text-amber-800">Hole: {holes}</p>
+      )}
       {brief?.mapStrategy && (
         <p className="text-sm text-[var(--muted)]">{brief.mapStrategy}</p>
+      )}
+      {brief?.whyItWorks && (
+        <p className="text-sm text-[var(--muted)]">{brief.whyItWorks}</p>
       )}
     </div>
   );
@@ -623,6 +728,52 @@ function PickButton({
     >
       {label}
     </button>
+  );
+}
+
+function ArchetypeStatBlock({
+  archetype,
+  breakdown,
+}: {
+  archetype: string;
+  breakdown: { archetype: string; count: number; pct: number }[];
+}) {
+  const rows = archetypeTooltipRows(archetype, breakdown);
+  return (
+    <div className="group relative rounded-md border border-[var(--line)] bg-[var(--panel)] px-4 py-3">
+      <p className="cursor-help text-xs font-semibold uppercase tracking-wide text-[var(--muted)] underline decoration-dotted underline-offset-2">
+        Archetype
+      </p>
+      <p className="mt-1 cursor-help text-sm text-[var(--ink)]">{archetype}</p>
+      <div
+        role="tooltip"
+        className="pointer-events-none absolute left-0 top-full z-30 mt-2 hidden w-[min(22rem,calc(100vw-2rem))] rounded-md border border-[var(--line)] bg-[var(--panel)] px-3 py-2.5 text-left shadow-lg group-hover:block group-focus-within:block"
+      >
+        <p className="mb-2 text-[10px] font-semibold uppercase tracking-wide text-[var(--muted)]">
+          Fight shapes · their lean in bold
+        </p>
+        <ul className="max-h-72 space-y-2 overflow-y-auto text-xs leading-snug text-[var(--ink)]">
+          {rows.map((row) => (
+            <li
+              key={row.name}
+              className={row.preferred ? "font-bold" : "font-normal"}
+            >
+              <span>{row.name}</span>
+              {row.pct != null && row.pct > 0 ? (
+                <span className="font-normal text-[var(--muted)]">
+                  {" "}
+                  ({row.pct}%)
+                </span>
+              ) : null}
+              <span className="font-normal text-[var(--muted)]">
+                {" "}
+                — {row.description}
+              </span>
+            </li>
+          ))}
+        </ul>
+      </div>
+    </div>
   );
 }
 

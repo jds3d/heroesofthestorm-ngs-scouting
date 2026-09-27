@@ -55,7 +55,7 @@ export const NGS_MAP_POOL: readonly NgsMap[] = [
     name: "Infernal Shrines",
     size: "point",
     imagePath: "replaypreviews/replayspreviewimage_infernalshrines.png",
-    line: "clear the shrine as five, then fight on the punisher you just earned",
+    line: "push the lane that feeds the shrine before it pops, then fight on the Punisher while that wave arrives",
   },
   {
     name: "Sky Temple",

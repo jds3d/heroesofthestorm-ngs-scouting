@@ -1,11 +1,13 @@
 import { leagueConfig } from "@/config/league";
+import { divePlaybook } from "@/config/divePlaybook";
 import {
   type ApiCallCount,
   type ApiCallKind,
   countsFromMap,
 } from "@/lib/apiUsage";
-import { FOREVER, cacheHas, getCached } from "@/lib/cache";
+import { FOREVER, cacheHas, getCached, readCacheEntry } from "@/lib/cache";
 import {
+  countPendingMatchupCalls,
   globalHeroMapStatsKey,
   globalHeroStatsKey,
 } from "@/lib/heroesprofile/client";
@@ -19,6 +21,59 @@ import {
   teamMatchesCacheKey,
 } from "@/lib/ngs/client";
 import type { NgsMatch } from "@/lib/ngs/types";
+import { draftHeroPool } from "@/lib/scout/draftHeroPool";
+import type { ScoutReport } from "@/lib/scoring/types";
+import { heroKey } from "@/lib/scoring/heroMeta";
+
+const reportCacheKey = (teamName: string, starters?: string[]) => {
+  const base = `scout-report-${teamName}`;
+  if (!starters?.length) return base;
+  return `${base}::${[...starters].sort((a, b) => a.localeCompare(b)).join("|")}`;
+};
+
+/** Same heroes the post-scout matchup pass will request — not the whole dive book. */
+async function matchupHeroesForEstimate(
+  teamName: string,
+  starters?: string[],
+): Promise<string[]> {
+  const saved = await readCacheEntry<ScoutReport>(
+    reportCacheKey(teamName, starters),
+  );
+  if (saved?.data) {
+    const fromReport = draftHeroPool(saved.data);
+    if (fromReport.length) return fromReport;
+  }
+
+  const names = new Set<string>([...divePlaybook.priorityDiveCores]);
+  let team = await getCached<NgsTeam>(`ngs-team-${teamName}`);
+  if (!team) team = await getTeam(teamName).catch(() => null);
+  const starterSet = new Set((starters ?? []).map((s) => s.toLowerCase()));
+  const tags = (team?.teamMembers ?? [])
+    .map((m) => m.displayName)
+    .filter((tag) => starterSet.size === 0 || starterSet.has(tag.toLowerCase()));
+
+  for (const tag of tags) {
+    const cur = `hp-v1-ngs-profile-${tag}-s${leagueConfig.season}-${leagueConfig.division}`;
+    const profile = await getCached<NgsPlayerProfile>(cur);
+    for (const h of profile?.heroes?.slice(0, 3) ?? []) {
+      if (h.name) names.add(h.name);
+    }
+  }
+
+  const home = await readCacheEntry<ScoutReport>(
+    reportCacheKey(leagueConfig.homeTeam),
+  );
+  if (home?.data) {
+    for (const h of draftHeroPool(home.data)) names.add(h);
+  }
+
+  const byKey = new Map<string, string>();
+  for (const h of names) {
+    const k = heroKey(h);
+    if (!byKey.has(k)) byKey.set(k, h);
+  }
+  return [...byKey.values()];
+}
 
 async function replayNeedsFetch(id: number): Promise<"cached" | "bans" | "full"> {
   const replay = await getCached<HpReplayData>(`hp-v1-ngs-replay-${id}`, FOREVER);
@@ -59,13 +114,23 @@ export async function predictScoutCalls(
 
   if (!(await cacheHas(globalHeroStatsKey))) add("hp-global-heroes", 2);
   if (!(await cacheHas(globalHeroMapStatsKey))) add("hp-global-heroes", 1);
-  // Matchups for plan heroes are usually cached after the first scout of a patch.
-  add("hp-hero-matchups", 8);
 
+  // Matchups: only heroes this scout's draft pool needs, and only if TTL-stale.
+  const matchupProbe = await matchupHeroesForEstimate(
+    teamName,
+    opts?.starters,
+  );
+  const pendingMatchups = await countPendingMatchupCalls(matchupProbe);
+  if (pendingMatchups > 0) add("hp-hero-matchups", pendingMatchups);
+
+  // Current-season NGS schedule: 24h cache. Count a live pull only on
+  // refresh or cache miss.
+  const seasonKey = teamMatchesCacheKey(teamName, leagueConfig.season);
+  const seasonCached = await cacheHas(seasonKey);
+  if (refreshPlayerData || !seasonCached) add("ngs-schedule", 1);
   const matches = await getTeamMatches(teamName, leagueConfig.season, {
-    fresh: true,
+    fresh: refreshPlayerData,
   });
-  add("ngs-schedule", 1);
 
   const reported = matches.filter((m) => m.reported);
 
@@ -80,6 +145,9 @@ export async function predictScoutCalls(
   const priorKey = teamMatchesCacheKey(teamName, leagueConfig.priorSeason);
   const priorCached = await getCached<NgsMatch[]>(priorKey, FOREVER);
   if (refreshPlayerData || !priorCached) add("ngs-schedule");
+  if (!priorCached) {
+    await getTeamMatches(teamName, leagueConfig.priorSeason).catch(() => []);
+  }
 
   for (const tag of tags) {
     const slKey = `hp-v1-hero-all-${tag}-Storm League-${leagueConfig.stormLeagueStartDate}`;
