@@ -54,14 +54,45 @@ export type ArchetypeTooltipRow = {
 
 /**
  * Rows for the archetype hover: sample frequency first (high → low), then
- * unused catalog shapes. Preferred (their lean) is marked for bold rendering.
+ * unused catalog shapes. Preferred (their lean / ties) is marked for bold.
  */
+export function leadingArchetypes(
+  breakdown: { archetype: string; count: number; pct: number }[] = [],
+): { archetype: string; count: number; pct: number }[] {
+  if (!breakdown.length) return [];
+  const sorted = [...breakdown].sort(
+    (a, b) =>
+      b.pct - a.pct ||
+      b.count - a.count ||
+      a.archetype.localeCompare(b.archetype),
+  );
+  const top = sorted[0];
+  return sorted.filter(
+    (b) => b.pct === top.pct && Math.abs(b.count - top.count) < 0.05,
+  );
+}
+
+export function formatArchetypeLeaders(
+  breakdown: { archetype: string; count: number; pct: number }[] = [],
+  fallback = "flexible / mixed",
+): string {
+  const leaders = leadingArchetypes(breakdown);
+  if (!leaders.length) return fallback;
+  return leaders.map((l) => `${l.archetype} (${l.pct}%)`).join(", ");
+}
+
 export function archetypeTooltipRows(
-  preferred: string,
+  preferred: string | string[],
   breakdown: { archetype: string; count: number; pct: number }[] = [],
 ): ArchetypeTooltipRow[] {
-  const preferredKey = preferred.trim();
-  const preferredLower = preferredKey.toLowerCase();
+  const preferredList = (Array.isArray(preferred) ? preferred : [preferred])
+    .map((p) => p.trim())
+    .filter(Boolean);
+  const preferredKeys = new Set(preferredList.map((p) => p.toLowerCase()));
+  // Also treat tied leaders from the sample as preferred when preferred is a single stale string.
+  for (const l of leadingArchetypes(breakdown)) {
+    preferredKeys.add(l.archetype.toLowerCase());
+  }
   const byName = new Map(
     breakdown.map((b) => [b.archetype.toLowerCase(), b] as const),
   );
@@ -70,7 +101,11 @@ export function archetypeTooltipRows(
 
   const isPreferred = (name: string) => {
     const n = name.toLowerCase();
-    return n === preferredLower || preferredLower.startsWith(n);
+    if (preferredKeys.has(n)) return true;
+    for (const p of preferredKeys) {
+      if (p.startsWith(n) || n.startsWith(p)) return true;
+    }
+    return false;
   };
 
   const push = (name: string, pct: number | null) => {
@@ -97,8 +132,8 @@ export function archetypeTooltipRows(
     push(b.archetype, b.pct);
   }
 
-  if (preferredKey) {
-    const hit = byName.get(preferredLower);
+  for (const preferredKey of preferredList) {
+    const hit = byName.get(preferredKey.toLowerCase());
     push(preferredKey, hit?.pct ?? null);
   }
 
@@ -112,7 +147,7 @@ export function archetypeTooltipRows(
 
 export const DRAFT_TERM_HINTS: Record<string, string> = {
   Archetype:
-    "Hover for every fight shape, ordered by how often they draft it. Their lean is bold.",
+    "Hover for every fight shape, ordered by how often they draft it. Tied leads are all listed with %; their leans are bold.",
   "Games analyzed":
     "How many NGS maps with usable hero drafts fed this read.",
   "First-pick leans":

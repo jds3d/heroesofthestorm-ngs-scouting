@@ -719,20 +719,66 @@ type MatchupApiResponse = {
   [hero: string]: unknown;
 };
 
-/** Below this, a matchup edge is too thin on the minor patch — use major. */
-const SPARSE_MATCHUP_GAMES = 250;
-/** Enemy WR at/above this with sparse games triggers a major-patch refill. */
-const SPARSE_COUNTER_ENEMY_WR = 52;
+/**
+ * Target: 95% CI half-width ≤ 3pp on enemy WR.
+ * Variance p(1-p) peaks at 50%, so near-even matchups need the most games
+ * (~1,068 at 50% vs ~897 at 70%). Fixed game counts / "≥52% WR" gates do not.
+ */
+const MATCHUP_MOE_TARGET = 0.03;
+const MATCHUP_Z_95 = 1.96;
+/** Never walk back further than this many major-sub patches (2.55.17, .16, …). */
+const MAX_MAJOR_SUB_PATCHES = 8;
 
 export type HeroMatchupBundle = {
   enemies: MatchupEnemyRow[];
   allies: MatchupAllyRow[];
 };
 
-function majorPatchFromMinor(minor: string): string {
-  const parts = minor.split(".");
-  if (parts.length >= 2) return `${parts[0]}.${parts[1]}`;
-  return minor.slice(0, 4);
+type PatchRow = {
+  game_version?: string;
+  major?: number;
+  minor?: number;
+  patch?: number;
+  valid_globals?: boolean;
+};
+
+/** Binomial 95% margin of error on a win-rate proportion. */
+export function matchupMarginOfError(
+  games: number,
+  winRatePct: number,
+): number {
+  if (games <= 0) return 1;
+  const p = Math.min(0.99, Math.max(0.01, winRatePct / 100));
+  return MATCHUP_Z_95 * Math.sqrt((p * (1 - p)) / games);
+}
+
+/** Games needed for ±3pp at 95% CI given the current WR estimate. */
+export function gamesForMatchupPrecision(winRatePct: number): number {
+  const p = Math.min(0.99, Math.max(0.01, winRatePct / 100));
+  return Math.ceil(
+    (MATCHUP_Z_95 * MATCHUP_Z_95 * p * (1 - p)) /
+      (MATCHUP_MOE_TARGET * MATCHUP_MOE_TARGET),
+  );
+}
+
+/**
+ * Keep stacking while any enemy edge is wider than ±3pp.
+ * Near 50% needs ~1.1k games; extreme WRs need fewer. No WR floor —
+ * 50.5% and 58% are both refined until precision is met (or we hit the cap).
+ */
+function matchupsNeedMoreGames(bundle: HeroMatchupBundle): boolean {
+  return bundle.enemies.some(
+    (e) =>
+      e.games > 0 &&
+      matchupMarginOfError(e.games, e.enemyWinRate) > MATCHUP_MOE_TARGET,
+  );
+}
+
+/** `2.55.17.98025` → `2.55.17` (Heroes Profile "major sub patch"). */
+function majorSubPatchKey(gameVersion: string): string {
+  const parts = gameVersion.split(".");
+  if (parts.length >= 3) return `${parts[0]}.${parts[1]}.${parts[2]}`;
+  return gameVersion;
 }
 
 function rowHeroName(row: MatchupApiRow): string | null {
@@ -754,7 +800,7 @@ function parseEnemyRow(row: MatchupApiRow): MatchupEnemyRow | null {
     wins,
     losses,
     games,
-    // Opponent win% into you (HP enemy.win_rate / win_rate_against).
+    // Opponent win% into you (HP flat enemy.win_rate / nested win_rate_against).
     enemyWinRate: Number(row.win_rate ?? row.win_rate_against) || 0,
   };
 }
@@ -823,125 +869,172 @@ function parseMatchupBundle(
   return { enemies, allies };
 }
 
-function matchupsNeedMajor(bundle: HeroMatchupBundle): boolean {
-  const sparseEnemy = bundle.enemies.some(
-    (e) =>
-      e.games > 0 &&
-      e.games < SPARSE_MATCHUP_GAMES &&
-      e.enemyWinRate >= SPARSE_COUNTER_ENEMY_WR,
-  );
-  const sparseAlly = bundle.allies.some(
-    (a) => a.games > 0 && a.games < SPARSE_MATCHUP_GAMES,
-  );
-  return sparseEnemy || sparseAlly;
+function mergeEnemyAdditive(
+  a: MatchupEnemyRow,
+  b: MatchupEnemyRow,
+): MatchupEnemyRow {
+  const wins = a.wins + b.wins;
+  const losses = a.losses + b.losses;
+  const games = wins + losses || a.games + b.games;
+  const enemyWinRate =
+    a.games + b.games > 0
+      ? Math.round(
+          ((a.enemyWinRate * a.games + b.enemyWinRate * b.games) /
+            (a.games + b.games)) *
+            10,
+        ) / 10
+      : 0;
+  return { hero: a.hero, wins, losses, games, enemyWinRate };
 }
 
-function mergeEnemySparse(
-  minor: MatchupEnemyRow[],
-  major: MatchupEnemyRow[],
-): MatchupEnemyRow[] {
-  const byKey = new Map<string, MatchupEnemyRow>();
-  for (const row of minor) byKey.set(row.hero.toLowerCase(), row);
-  for (const row of major) {
-    const k = row.hero.toLowerCase();
-    const existing = byKey.get(k);
-    if (!existing || existing.games < SPARSE_MATCHUP_GAMES) byKey.set(k, row);
-  }
-  return [...byKey.values()];
+function mergeAllyAdditive(
+  a: MatchupAllyRow,
+  b: MatchupAllyRow,
+): MatchupAllyRow {
+  const wins = a.wins + b.wins;
+  const losses = a.losses + b.losses;
+  const games = wins + losses || a.games + b.games;
+  const allyWinRate =
+    a.games + b.games > 0
+      ? Math.round(
+          ((a.allyWinRate * a.games + b.allyWinRate * b.games) /
+            (a.games + b.games)) *
+            10,
+        ) / 10
+      : 0;
+  return { hero: a.hero, wins, losses, games, allyWinRate };
 }
 
-function mergeAllySparse(
-  minor: MatchupAllyRow[],
-  major: MatchupAllyRow[],
-): MatchupAllyRow[] {
-  const byKey = new Map<string, MatchupAllyRow>();
-  for (const row of minor) byKey.set(row.hero.toLowerCase(), row);
-  for (const row of major) {
-    const k = row.hero.toLowerCase();
-    const existing = byKey.get(k);
-    if (!existing || existing.games < SPARSE_MATCHUP_GAMES) byKey.set(k, row);
-  }
-  return [...byKey.values()];
-}
-
-function mergeMatchupBundles(
-  minor: HeroMatchupBundle,
-  major: HeroMatchupBundle,
+/** Sum two bundles (stack older major-sub patches onto newer). */
+function mergeMatchupsAdditive(
+  base: HeroMatchupBundle,
+  extra: HeroMatchupBundle,
 ): HeroMatchupBundle {
-  return {
-    enemies: mergeEnemySparse(minor.enemies, major.enemies),
-    allies: mergeAllySparse(minor.allies, major.allies),
-  };
+  const enemies = new Map<string, MatchupEnemyRow>();
+  for (const row of base.enemies) enemies.set(row.hero.toLowerCase(), row);
+  for (const row of extra.enemies) {
+    const k = row.hero.toLowerCase();
+    const existing = enemies.get(k);
+    enemies.set(k, existing ? mergeEnemyAdditive(existing, row) : row);
+  }
+  const allies = new Map<string, MatchupAllyRow>();
+  for (const row of base.allies) allies.set(row.hero.toLowerCase(), row);
+  for (const row of extra.allies) {
+    const k = row.hero.toLowerCase();
+    const existing = allies.get(k);
+    allies.set(k, existing ? mergeAllyAdditive(existing, row) : row);
+  }
+  return { enemies: [...enemies.values()], allies: [...allies.values()] };
 }
 
 function matchupsCacheKey(
-  timeframeType: "minor" | "major",
+  kind: "minor" | "sub",
   timeframe: string,
   hero: string,
 ): string {
-  return `hp-v3-matchups-sl-${timeframeType}-${timeframe}-${hero.replace(/[^a-zA-Z0-9._-]+/g, "_")}`;
+  return `hp-v4-matchups-sl-${kind}-${timeframe}-${hero.replace(/[^a-zA-Z0-9._-]+/g, "_")}`;
+}
+
+const majorSubPatchListKey = "hp-v1-major-sub-patches";
+
+/**
+ * Newest-first major-sub patch keys (`2.55.17`, `2.55.16`, …) with every
+ * minor build under each (for comma-separated HP timeframe queries).
+ */
+async function listMajorSubPatches(): Promise<
+  { key: string; builds: string[] }[]
+> {
+  return cachedFetch(
+    majorSubPatchListKey,
+    async () => {
+      const patches = await hpGet<PatchList>("patches");
+      const byKey = new Map<string, string[]>();
+      const order: string[] = [];
+      for (const p of patches.patches ?? []) {
+        const row = p as PatchRow;
+        if (
+          row.major == null ||
+          row.minor == null ||
+          row.patch == null ||
+          !row.game_version
+        ) {
+          continue;
+        }
+        const key = `${row.major}.${row.minor}.${row.patch}`;
+        if (!byKey.has(key)) {
+          byKey.set(key, []);
+          order.push(key);
+        }
+        byKey.get(key)!.push(row.game_version);
+      }
+      return order.map((key) => ({ key, builds: byKey.get(key)! }));
+    },
+    PATCH_TTL_MS,
+  );
 }
 
 /**
  * How many HeroesProfile matchup HTTP calls a scout would still need.
- * Only counts calls that would miss the weekly TTL cache — and does not
- * pre-count a major-patch refill until the minor is known to be sparse.
+ * Counts uncached current-minor pulls, plus uncached major-sub stacks when
+ * the minor is known to be sparse (never the full multi-year major).
  */
 export async function countPendingMatchupCalls(
   heroes: string[],
 ): Promise<number> {
   const gameVersion = await currentGlobalPatch();
   if (!gameVersion) return 0;
-  const major = majorPatchFromMinor(gameVersion);
   const unique = [...new Set(heroes.filter(Boolean))];
+  const subs = await listMajorSubPatches().catch(() => []);
+  const currentSub = majorSubPatchKey(gameVersion);
+  const startIdx = Math.max(
+    0,
+    subs.findIndex((s) => s.key === currentSub),
+  );
+  const stackKeys = subs
+    .slice(startIdx, startIdx + MAX_MAJOR_SUB_PATCHES)
+    .map((s) => s.key);
+
   let n = 0;
   for (const hero of unique) {
     const minorKey = matchupsCacheKey("minor", gameVersion, hero);
-    const minorFresh =
-      (await getCached<HeroMatchupBundle>(minorKey, GLOBAL_HERO_TTL_MS)) !==
-      null;
-    if (!minorFresh) {
-      // One call for minor. Major is only fetched after we see sparse edges.
+    const minorBundle = await getCached<HeroMatchupBundle>(
+      minorKey,
+      GLOBAL_HERO_TTL_MS,
+    );
+    if (!minorBundle) {
+      // Minor + up to one current-sub expand if sparse (can't know yet).
       n += 1;
       continue;
     }
-    try {
-      const minorBundle = await getCached<HeroMatchupBundle>(
-        minorKey,
-        GLOBAL_HERO_TTL_MS,
-      );
-      if (!minorBundle) {
-        n += 1;
-        continue;
-      }
+    if (!matchupsNeedMoreGames(minorBundle)) continue;
+    for (const sub of stackKeys) {
       if (
-        matchupsNeedMajor(minorBundle) &&
         (await getCached(
-          matchupsCacheKey("major", major, hero),
+          matchupsCacheKey("sub", sub, hero),
           GLOBAL_HERO_TTL_MS,
         )) === null
       ) {
         n += 1;
       }
-    } catch {
-      // Ignore estimate failures.
     }
   }
   return n;
 }
 
-async function fetchMatchupsForTimeframe(
+async function fetchMatchupsForMinorBuilds(
   hero: string,
-  timeframeType: "minor" | "major",
-  timeframe: string,
+  builds: string[],
+  cacheKind: "minor" | "sub",
+  cacheTimeframe: string,
 ): Promise<HeroMatchupBundle> {
   return cachedFetch(
-    matchupsCacheKey(timeframeType, timeframe, hero),
+    matchupsCacheKey(cacheKind, cacheTimeframe, hero),
     async () => {
       const raw = await hpGet<MatchupApiResponse>("heroes/matchups", {
         game_type: "Storm League",
-        timeframe_type: timeframeType,
-        timeframe,
+        timeframe_type: "minor",
+        // HP accepts comma-separated minors → one major-sub patch window.
+        timeframe: builds.join(","),
         hero,
       });
       return parseMatchupBundle(raw, hero);
@@ -952,7 +1045,9 @@ async function fetchMatchupsForTimeframe(
 
 /**
  * Enemy + ally matchup rows for one hero (Storm League).
- * Prefers the current minor patch; sparse edges (&lt;250g) fill from major.
+ * Starts on the current minor build. Stacks major-sub patches (2.55.17 → .16 → …)
+ * until every enemy edge has ±3pp precision at 95% CI (hardest near 50%), or
+ * we hit the subpatch cap — never the full multi-year `major` timeframe.
  */
 export async function getHeroMatchups(hero: string): Promise<{
   patch: string;
@@ -962,22 +1057,52 @@ export async function getHeroMatchups(hero: string): Promise<{
   const gameVersion = await currentGlobalPatch();
   if (!gameVersion) return { patch: "", enemies: [], allies: [] };
 
-  const minor = await fetchMatchupsForTimeframe(hero, "minor", gameVersion);
-
-  if (!matchupsNeedMajor(minor)) {
-    return { patch: gameVersion, ...minor };
+  let bundle = await fetchMatchupsForMinorBuilds(
+    hero,
+    [gameVersion],
+    "minor",
+    gameVersion,
+  );
+  if (!matchupsNeedMoreGames(bundle)) {
+    return { patch: gameVersion, ...bundle };
   }
 
-  const major = majorPatchFromMinor(gameVersion);
-  try {
-    const majorBundle = await fetchMatchupsForTimeframe(hero, "major", major);
-    return {
-      patch: `${major} (major+minor)`,
-      ...mergeMatchupBundles(minor, majorBundle),
-    };
-  } catch {
-    return { patch: gameVersion, ...minor };
+  const subs = await listMajorSubPatches();
+  const currentSub = majorSubPatchKey(gameVersion);
+  const startIdx = Math.max(
+    0,
+    subs.findIndex((s) => s.key === currentSub),
+  );
+  const used: string[] = [];
+
+  for (let i = startIdx; i < subs.length && used.length < MAX_MAJOR_SUB_PATCHES; i++) {
+    const sub = subs[i];
+    try {
+      // Replace single-build minor with the full current subpatch first
+      // (avoids double-counting the current build).
+      const next = await fetchMatchupsForMinorBuilds(
+        hero,
+        sub.builds,
+        "sub",
+        sub.key,
+      );
+      if (used.length === 0 && sub.key === currentSub) {
+        bundle = next;
+      } else {
+        bundle = mergeMatchupsAdditive(bundle, next);
+      }
+      used.push(sub.key);
+    } catch {
+      // Skip a missing subpatch; keep walking older ones.
+      continue;
+    }
+    if (!matchupsNeedMoreGames(bundle)) break;
   }
+
+  const patchLabel = used.length
+    ? `${used[used.length - 1]}…${used[0]} (${used.length} sub)`
+    : gameVersion;
+  return { patch: patchLabel, ...bundle };
 }
 
 /**

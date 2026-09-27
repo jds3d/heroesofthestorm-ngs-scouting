@@ -8,6 +8,8 @@ import type {
 } from "@/lib/scoring/types";
 import {
   archetypeTooltipRows,
+  formatArchetypeLeaders,
+  leadingArchetypes,
   DRAFT_TERM_HINTS,
 } from "@/lib/scoring/glossary";
 import { extractLaneSplitNote } from "@/lib/scoring/draftPlan";
@@ -195,7 +197,12 @@ export function ScoutReportView({ report }: { report: ScoutReport }) {
                     <ul className="list-disc space-y-2 pl-5">
                       {s.groups.map((g) => (
                         <li key={g.title}>
-                          <span className="font-semibold">{g.title}</span>
+                          <span className="font-semibold">
+                            {enrichStrategyGroupTitle(
+                              g.title,
+                              report.draft.archetypeBreakdown ?? [],
+                            )}
+                          </span>
                           {g.items && g.items.length > 0 && (
                             <ul className="mt-1 list-disc space-y-1 pl-5 text-sm text-[var(--muted)]">
                               {g.items.map((item) => (
@@ -415,6 +422,7 @@ export function ScoutReportView({ report }: { report: ScoutReport }) {
               tree={side?.tree ?? plan.tree}
               weFirst={pickSide === "weFirst"}
               banPriority={shown.adapt.banPriority}
+              theirCommonBans={report.draft.theirBans}
               ourLikely={ourPicks}
               theirLikely={theirPicks}
               ourBrief={ourBrief}
@@ -731,6 +739,27 @@ function PickButton({
   );
 }
 
+function enrichStrategyGroupTitle(
+  title: string,
+  breakdown: { archetype: string; count: number; pct: number }[],
+): string {
+  // Already has a % from a fresh scout build (draft.ts puts it in the title).
+  // Do not use \b after % — "%" is non-word, so "(26.7% · …)" failed the check
+  // and we duplicated the percentage.
+  if (/\(\d+(\.\d+)?%/.test(title)) return title;
+  const name = title.replace(/\s*\([^)]*\)\s*$/, "").trim();
+  const hit = breakdown.find(
+    (b) => b.archetype.toLowerCase() === name.toLowerCase(),
+  );
+  if (!hit || hit.pct <= 0) return title;
+  // "assassin-focused (3 this season)" → "assassin-focused (40% · 3 this season)"
+  const paren = title.match(/\(([^)]*)\)\s*$/);
+  if (paren) {
+    return `${name} (${hit.pct}% · ${paren[1]})`;
+  }
+  return `${name} (${hit.pct}%)`;
+}
+
 function ArchetypeStatBlock({
   archetype,
   breakdown,
@@ -738,19 +767,24 @@ function ArchetypeStatBlock({
   archetype: string;
   breakdown: { archetype: string; count: number; pct: number }[];
 }) {
-  const rows = archetypeTooltipRows(archetype, breakdown);
+  const leaders = leadingArchetypes(breakdown);
+  const body = formatArchetypeLeaders(breakdown, archetype);
+  const rows = archetypeTooltipRows(
+    leaders.length ? leaders.map((l) => l.archetype) : archetype,
+    breakdown,
+  );
   return (
     <div className="group relative rounded-md border border-[var(--line)] bg-[var(--panel)] px-4 py-3">
       <p className="cursor-help text-xs font-semibold uppercase tracking-wide text-[var(--muted)] underline decoration-dotted underline-offset-2">
         Archetype
       </p>
-      <p className="mt-1 cursor-help text-sm text-[var(--ink)]">{archetype}</p>
+      <p className="mt-1 cursor-help text-sm text-[var(--ink)]">{body}</p>
       <div
         role="tooltip"
         className="pointer-events-none absolute left-0 top-full z-30 mt-2 hidden w-[min(22rem,calc(100vw-2rem))] rounded-md border border-[var(--line)] bg-[var(--panel)] px-3 py-2.5 text-left shadow-lg group-hover:block group-focus-within:block"
       >
         <p className="mb-2 text-[10px] font-semibold uppercase tracking-wide text-[var(--muted)]">
-          Fight shapes · their lean in bold
+          Fight shapes · their lean{leaders.length > 1 ? "s" : ""} in bold
         </p>
         <ul className="max-h-72 space-y-2 overflow-y-auto text-xs leading-snug text-[var(--ink)]">
           {rows.map((row) => (

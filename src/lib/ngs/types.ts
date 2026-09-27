@@ -69,9 +69,35 @@ export type NgsMatch = {
   scheduledTime?: { startTime?: string };
 };
 
+export type NgsStandingRow = {
+  teamName: string;
+  wins: number;
+  losses: number;
+  points: number;
+  dominations?: number;
+  matchesPlayed?: number;
+  standing?: number;
+  logo?: string;
+  id?: string;
+};
+
 export type LeagueTeamSummary = {
   name: string;
   slug: string;
   profileUrl: string;
   withdrawn?: boolean;
+  /** NGS schedule round (= week). */
+  week?: number | null;
+  /** ISO date when the match is/was scheduled, if known. */
+  scheduledAt?: string | null;
+  /** True when the match vs us is reported. */
+  played?: boolean;
+  /** Division standing place (1 = first). */
+  place?: number | null;
+  /** Division standing points (from NGS /division standings). */
+  points?: number | null;
+  /** Map wins (NGS standings column). */
+  wins?: number | null;
+  /** Map losses (NGS standings column). */
+  losses?: number | null;
 };

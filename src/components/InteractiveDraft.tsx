@@ -22,6 +22,11 @@ import {
   planSeatJob,
 } from "@/lib/scoring/draftPlan";
 import {
+  gradeFinishedDraft,
+  type DraftReportCard,
+  type LetterGrade,
+} from "@/lib/scoring/draftGrade";
+import {
   credibleOpenCounters,
   counterPoolNote,
   counterRoleFillNote,
@@ -37,6 +42,11 @@ import {
   type DraftMetaTable,
   type MatchupEdge,
 } from "@/lib/scoring/draftMeta";
+import {
+  isDoublePickWindow,
+  rankDoublePickPairs,
+  type PairSeatCand,
+} from "@/lib/scoring/pickPairs";
 import {
   assignUniqueOwners,
   bestFreeOwner,
@@ -73,16 +83,87 @@ type ScoredOption = {
   factors: ScoreFactor[];
   /** Who should lock this — display name, no battletag. */
   player?: string | null;
+  /** When set, this option is a double-pick pair: lock `hero`, then `pairWith`. */
+  pairWith?: string;
+  pairPlayer?: string | null;
 };
+
+type DeviationSeverity = "solid" | "minor" | "major" | "info";
 
 type DeviationReport = {
   summary: string;
-  solid: boolean;
+  severity: DeviationSeverity;
   /** Ban vs pick — drives "why you should have banned/picked" tooltip copy. */
   kind: "ban" | "pick";
   suggested: ScoredOption;
   chosen: ScoredOption;
 };
+
+/**
+ * Structural draft throws always major — never softened by a close scoreboard.
+ * Score gap only decides minor vs major when the lock was structurally fine.
+ */
+function classifyDeviationSeverity(args: {
+  solid?: boolean;
+  /** Opened offlane, missed OP, walked into answers, etc. — primary criterion. */
+  structural?: boolean;
+  suggestedTotal: number;
+  chosenTotal: number;
+}): Exclude<DeviationSeverity, "info"> {
+  if (args.solid) return "solid";
+  // 1) Structure first — scores must not turn a throw into a judgment call.
+  if (args.structural) return "major";
+  // 2) Scoreboard only when the lock was structurally legal.
+  const gap = args.suggestedTotal - args.chosenTotal;
+  const bothStrong =
+    args.suggestedTotal >= 28 && args.chosenTotal >= 22;
+  const close = gap <= 12;
+  const worthless =
+    args.chosenTotal < 8 ||
+    (args.suggestedTotal >= 30 && args.chosenTotal < 15) ||
+    gap >= 22;
+  if (worthless) return "major";
+  if (bothStrong && close) return "minor";
+  if (gap <= 15 && args.chosenTotal >= 15) return "minor";
+  return "major";
+}
+
+function mistakeLabel(
+  severity: "minor" | "major",
+  kind: "ban" | "pick",
+  chosen: string,
+  suggested: string,
+): string {
+  const verb = kind === "ban" ? "banned" : "locked";
+  if (severity === "minor") {
+    return `Minor mistake: ${verb} ${chosen} over ${suggested}.`;
+  }
+  return `Major mistake: ${verb} ${chosen} over ${suggested}.`;
+}
+
+/** Slam the chosen score so a structural throw never looks like +50 vs +41. */
+function applyStructuralThrowToCard(
+  card: ScoredOption,
+  reasons: string[],
+): ScoredOption {
+  if (!reasons.length) return card;
+  const penalty = -Math.min(42, 24 + reasons.length * 8);
+  const factor: ScoreFactor = {
+    id: "structural",
+    label: "Structural throw",
+    points: penalty,
+    detail: reasons.join(" · "),
+  };
+  const factors = [
+    ...card.factors.filter((f) => f.id !== "structural"),
+    factor,
+  ];
+  return {
+    ...card,
+    factors,
+    total: factors.reduce((s, f) => s + f.points, 0),
+  };
+}
 
 type Suggestion = {
   hero: string;
@@ -150,6 +231,8 @@ function buildPickScorecard(args: {
   theirLikely: DraftCompPick[];
   banPriority: { hero: string; reason: string }[];
   comfort: number;
+  /** Who owns the comfort signal (for the factor detail line). */
+  comfortWho?: string | null;
   swapDelta: number;
   takeAndRebuild: boolean;
   kind: "ban" | "pick";
@@ -160,6 +243,12 @@ function buildPickScorecard(args: {
    * `ours` = we answer their pick; `theirs` = they answer our pick.
    */
   answerPerspective?: "ours" | "theirs";
+  /** Our bans already locked this draft (0 = first opening ban). */
+  ourBanCount?: number;
+  /** Heroes they commonly ban (may take a mutual deny for us). */
+  theirCommonBans?: { hero: string; count: number }[];
+  /** True when someone on our roster plays this hero. */
+  wePlayHero?: boolean;
 }): ScoredOption {
   const factors: ScoreFactor[] = [];
   const meta = heroDraftMeta(args.table, args.hero);
@@ -295,11 +384,13 @@ function buildPickScorecard(args: {
   const answerDetail = args.lastPick
     ? "Last pick of the draft — nobody gets a pick after this, so counter-picks cannot answer."
     : openAnswers.length
-      ? perspective === "ours"
-        ? args.kind === "ban"
-          ? `If they take ${args.hero}, we still have ${answerList}. Lower ban urgency — we can answer later.`
-          : `We can still take ${answerList} into ${args.hero}. Locking ${args.hero} while that answer was open was soft for them — consider those counters on our next pick if the seat fits.`
-        : `They can still answer ${args.hero} with ${answerList}. Do not lock ${args.hero} while those counters are still available.`
+      ? args.kind === "ban"
+        ? perspective === "theirs"
+          ? `If we had taken ${args.hero}, they could still answer with ${answerList} — lower ban urgency.`
+          : `If they take ${args.hero}, we can still answer with ${answerList} — lower ban urgency.`
+        : perspective === "ours"
+          ? `We can still take ${answerList} into ${args.hero}. Locking ${args.hero} while that answer was open was soft for them — consider those counters on our next pick if the seat fits.`
+          : `They can still answer ${args.hero} with ${answerList}. Do not lock ${args.hero} while those counters are still available.`
       : fillNote
         ? fillNote
         : poolNote
@@ -345,7 +436,7 @@ function buildPickScorecard(args: {
     "Player comfort",
     comfortPts,
     args.comfort > 0.02
-      ? `Seat comfort ${(args.comfort * 100).toFixed(0)}`
+      ? `${args.comfortWho ? `${args.comfortWho} · ` : ""}seat comfort ${(args.comfort * 100).toFixed(0)}`
       : "No strong comfort signal",
   );
 
@@ -410,6 +501,38 @@ function buildPickScorecard(args: {
         ? `#${idx + 1} on ban list — ${args.banPriority[idx].reason}`
         : "Not on current ban priority",
     );
+
+    // Mutual deny: we should ban it, but they may ban it for us. Hold on
+    // opening ban round 1; clean it up on opening ban round 2 if they leave it.
+    // (Only two opening bans — this is not a third ban later.)
+    const banCount = args.theirCommonBans?.find(
+      (b) => heroKey(b.hero) === heroKey(args.hero),
+    )?.count;
+    const theyBanIt = (banCount ?? 0) > 0;
+    const mutual =
+      idx >= 0 && (Boolean(args.wePlayHero) || theyBanIt);
+    const ourBans = args.ourBanCount ?? 0;
+    if (mutual && ourBans === 0) {
+      addFactor(
+        factors,
+        "mutualBan",
+        "Mutual ban timing",
+        -36,
+        theyBanIt && args.wePlayHero
+          ? `They ban ${args.hero} (${banCount}) and we play it — hold for opening ban round 2 (not a 3rd ban)`
+          : theyBanIt
+            ? `They often ban ${args.hero} (${banCount}) — may take it for us; hold for opening ban round 2 (not a 3rd ban)`
+            : `We play ${args.hero} too — they may ban it for us; hold for opening ban round 2 (not a 3rd ban)`,
+      );
+    } else if (mutual && ourBans === 1) {
+      addFactor(
+        factors,
+        "mutualBan",
+        "Mutual ban timing",
+        22,
+        `Still up — this is our opening ban round 2; take ${args.hero} now`,
+      );
+    }
   }
 
   const total = factors.reduce((s, f) => s + f.points, 0);
@@ -425,24 +548,31 @@ function theirOwnerName(
   return displayPlayer(who?.player ?? null);
 }
 
-function comfortForHero(
-  home: PlayerScout[],
+/** Best comfort on this hero in the roster (optionally pinned to one player). */
+function comfortSignal(
+  roster: PlayerScout[],
   hero: string,
   player: string | null,
-): number {
-  if (!home.length) return 0;
+): { comfort: number; who: string | null } {
+  if (!roster.length) return { comfort: 0, who: null };
   const want = displayPlayer(player)?.toLowerCase();
-  for (const p of home) {
-    const name = displayPlayer(p.battletag)?.toLowerCase();
-    if (want && name !== want) continue;
+  let best: { comfort: number; who: string | null } = {
+    comfort: 0,
+    who: null,
+  };
+  for (const p of roster) {
+    const name = displayPlayer(p.battletag);
+    const nameKey = name?.toLowerCase();
+    if (want && nameKey !== want) continue;
     const hit = p.topHeroes.find((h) => heroKey(h.hero) === heroKey(hero));
-    if (hit) return hit.comfort;
-    if (want) return 0;
-  }
-  let best = 0;
-  for (const p of home) {
-    const hit = p.topHeroes.find((h) => heroKey(h.hero) === heroKey(hero));
-    if (hit && hit.comfort > best) best = hit.comfort;
+    if (!hit) {
+      if (want) return { comfort: 0, who: name };
+      continue;
+    }
+    if (want) return { comfort: hit.comfort, who: name };
+    if (hit.comfort > best.comfort) {
+      best = { comfort: hit.comfort, who: name };
+    }
   }
   return best;
 }
@@ -816,6 +946,80 @@ function pickCandidates(
     }
   }
   return out;
+}
+
+/** Open plan seats with their hero + alt candidates (for double-pick pairs). */
+function seatPairCandidates(
+  picks: DraftCompPick[],
+  gone: Set<string>,
+  takenPlayers: Set<string>,
+): { role: string; player: string | null; cands: PairSeatCand[] }[] {
+  const seats: { role: string; player: string | null; cands: PairSeatCand[] }[] =
+    [];
+  for (const p of picks) {
+    if (isLockedPlanSeat(p)) continue;
+    const who = displayPlayer(p.player);
+    if (who && takenPlayers.has(who.toLowerCase())) continue;
+    const cands: PairSeatCand[] = [];
+    const seen = new Set<string>();
+    const add = (hero: string, player: string | null, fromAlt: boolean) => {
+      const k = heroKey(hero);
+      if (seen.has(k) || isGone(hero, gone)) return;
+      seen.add(k);
+      cands.push({
+        hero,
+        role: p.role,
+        player: displayPlayer(player) ?? player,
+        fromAlt,
+      });
+    };
+    add(p.hero, p.player, false);
+    for (const a of p.alternatives ?? []) {
+      add(a.hero, a.player ?? p.player, true);
+    }
+    // Offlane seat — surface real offlaners even if plan primary is stale.
+    const roleL = p.role.toLowerCase();
+    const offlaneSeat =
+      roleL.includes("off") ||
+      roleL.includes("solo") ||
+      roleL.includes("clear") ||
+      heroIsOfflaner(p.hero);
+    if (offlaneSeat) {
+      for (const h of [
+        "Malthael",
+        "Leoric",
+        "Sonya",
+        "Blaze",
+        "Xul",
+        "Dehaka",
+        "Hogger",
+      ]) {
+        if (!heroIsOfflaner(h)) continue;
+        add(h, p.player, true);
+      }
+    }
+    // Tank seat — common shells so E.T.C. can beat a stale Stitches primary.
+    if (heroRole(p.hero) === "Tank" || roleL.includes("tank")) {
+      for (const h of [
+        "E.T.C.",
+        "Stitches",
+        "Garrosh",
+        "Anub'arak",
+        "Diablo",
+        "Johanna",
+        "Mal'Ganis",
+        "Arthas",
+        "Tyrael",
+      ]) {
+        if (heroRole(h) !== "Tank") continue;
+        add(h, p.player, true);
+      }
+    }
+    if (cands.length) {
+      seats.push({ role: p.role, player: displayPlayer(p.player), cands });
+    }
+  }
+  return seats;
 }
 
 function heroFromTitle(title: string): string | null {
@@ -1379,7 +1583,7 @@ function pickReason(args: {
 
 /**
  * After locking something other than the suggestion — say why that was a
- * mistake (power, timing, answers). No seat / NEED bookkeeping.
+ * minor/major miss (power, timing, answers). No seat / NEED bookkeeping.
  */
 function gradeDeviation(args: {
   ours: boolean;
@@ -1399,16 +1603,26 @@ function gradeDeviation(args: {
   answeringTeamLocked?: string[];
   /** Heroes the answering team actually plays. */
   answeringTeamPool?: string[] | null;
-}): string | null {
+  /** Scorecard totals — drive minor vs major when both options are fine. */
+  suggestedTotal: number;
+  chosenTotal: number;
+}): { summary: string; severity: DeviationSeverity; structuralReasons: string[] } | null {
   if (heroKey(args.suggested) === heroKey(args.chosen)) return null;
 
   if (!args.ours) {
     const did = args.kind === "ban" ? "banned" : "picked";
-    const want = args.kind === "ban" ? "ban" : "pick";
     if (args.isLastStep) {
-      return `They ${did} ${args.chosen} — we expected them to ${want} ${args.suggested}. Last pick of the draft; nothing left to deny.`;
+      return {
+        summary: `They ${did} ${args.chosen} — they should have ${did} ${args.suggested}. Last pick of the draft; nothing left to deny.`,
+        severity: "info",
+        structuralReasons: [],
+      };
     }
-    return `They ${did} ${args.chosen} — we expected them to ${want} ${args.suggested}. Adjust the next deny around what they showed.`;
+    return {
+      summary: `They ${did} ${args.chosen} — they should have ${did} ${args.suggested}. Adjust the next deny around what they showed.`,
+      severity: "info",
+      structuralReasons: [],
+    };
   }
 
   if (args.kind === "ban") {
@@ -1418,15 +1632,30 @@ function gradeDeviation(args: {
     const chose = args.banPriority.find(
       (b) => heroKey(b.hero) === heroKey(args.chosen),
     );
+    // Off the ban list while the suggestion was on it = worthless slot.
+    const structuralReasons =
+      sug && !chose
+        ? [`${args.chosen} was not on the ban list; ${args.suggested} was`]
+        : [];
+    const severity = classifyDeviationSeverity({
+      structural: structuralReasons.length > 0,
+      suggestedTotal: args.suggestedTotal,
+      chosenTotal: args.chosenTotal,
+    });
+    const labelSev = severity === "solid" ? "minor" : severity;
     const bits: string[] = [
-      `Mistake: banned ${args.chosen} over ${args.suggested}.`,
+      mistakeLabel(labelSev, "ban", args.chosen, args.suggested),
     ];
     if (sug) bits.push(sug.reason);
     else bits.push(`${args.suggested} was the higher-value deny this step.`);
     if (!chose) {
       bits.push(`${args.chosen} was not worth the ban slot over that.`);
+    } else if (severity === "minor") {
+      bits.push(
+        `Both were fine denies (${args.chosenTotal > 0 ? "+" : ""}${args.chosenTotal} vs ${args.suggestedTotal > 0 ? "+" : ""}${args.suggestedTotal}) — preference more than a throw.`,
+      );
     }
-    return bits.join(" ");
+    return { summary: bits.join(" "), severity, structuralReasons };
   }
 
   const sugSeat = findSeatForCandidate(args.planPicks, args.suggested);
@@ -1503,23 +1732,29 @@ function gradeDeviation(args: {
   // Comfort/deny heal with damage outs left — not a mistake.
   if (healFirstOk) {
     if (healThreat) {
-      return (
+      return {
+        summary:
+          `Solid: locked ${args.chosen} over ${args.suggested}. ` +
+          healBlockWhy(args.chosen, healThreat, [
+            args.suggested,
+            ...damageOuts,
+          ]),
+        severity: "solid",
+        structuralReasons: [],
+      };
+    }
+    return {
+      summary:
         `Solid: locked ${args.chosen} over ${args.suggested}. ` +
-        healBlockWhy(args.chosen, healThreat, [
+        `Comfort heal now is fine — second damage still has outs (${[
           args.suggested,
           ...damageOuts,
-        ])
-      );
-    }
-    return (
-      `Solid: locked ${args.chosen} over ${args.suggested}. ` +
-      `Comfort heal now is fine — second damage still has outs (${[
-        args.suggested,
-        ...damageOuts,
-      ]
-        .slice(0, 4)
-        .join(", ")}), so you are not forced to take damage before heal.`
-    );
+        ]
+          .slice(0, 4)
+          .join(", ")}), so you are not forced to take damage before heal.`,
+      severity: "solid",
+      structuralReasons: [],
+    };
   }
 
   const forceDamageFirst =
@@ -1528,16 +1763,52 @@ function gradeDeviation(args: {
     !sugIsHeal &&
     preferDamage;
 
-  const harsh =
-    missedOp ||
-    openedOfflane ||
+  const walkedIntoAnswers =
     (choseThreats.length >= 2 && sugThreats.length === 0) ||
-    forceDamageFirst;
+    (choseThreats.length >= 2 &&
+      choseThreats.length >= sugThreats.length + 2);
+
+  const structuralReasons: string[] = [];
+  if (missedOp) {
+    structuralReasons.push(
+      `Passed the take-and-rebuild pocket (${args.suggested})`,
+    );
+  }
+  if (openedOfflane) {
+    structuralReasons.push(
+      isFlexibleAnchorRole(sugRole)
+        ? `Opened committed offlane instead of flexible ${args.suggested}`
+        : `Opened committed offlane into answers`,
+    );
+  }
+  if (forceDamageFirst) {
+    structuralReasons.push(
+      `Took heal before damage while ${args.suggested} (and outs) were still open`,
+    );
+  }
+  if (walkedIntoAnswers) {
+    structuralReasons.push(
+      `Locked into open answers (${choseThreats
+        .slice(0, 2)
+        .map((t) => t.hero)
+        .join(", ")})`,
+    );
+  }
+
+  const structural = structuralReasons.length > 0;
+  const severity = classifyDeviationSeverity({
+    structural,
+    suggestedTotal: args.suggestedTotal,
+    chosenTotal: args.chosenTotal,
+  });
 
   const bits: string[] = [
-    harsh
-      ? `Mistake: locked ${args.chosen} over ${args.suggested}.`
-      : `Locked ${args.chosen} over ${args.suggested} — mistake because:`,
+    mistakeLabel(
+      severity === "solid" ? "minor" : severity,
+      "pick",
+      args.chosen,
+      args.suggested,
+    ),
   ];
 
   if (missedOp) {
@@ -1556,6 +1827,10 @@ function gradeDeviation(args: {
         .slice(0, 2)
         .map(formatCounter)
         .join(", ")}.`,
+    );
+  } else if (openedOfflane) {
+    bits.push(
+      `First-picking the offlane commit shows the lane before they have to.`,
     );
   }
 
@@ -1635,7 +1910,14 @@ function gradeDeviation(args: {
     );
   }
 
-  return bits.join(" ");
+  // Never paint a structural throw as "both scored well".
+  if (severity === "minor" && !structural) {
+    bits.push(
+      `Both scored well (${args.chosenTotal > 0 ? "+" : ""}${args.chosenTotal} vs ${args.suggestedTotal > 0 ? "+" : ""}${args.suggestedTotal}) — judgment call more than a throw.`,
+    );
+  }
+
+  return { summary: bits.join(" "), severity, structuralReasons };
 }
 
 function ownerForHero(
@@ -1772,6 +2054,7 @@ export function InteractiveDraft({
   draftMeta = null,
   homeRoster = [],
   theirRoster = [],
+  theirCommonBans = [],
   ourLabel = "Us",
   theirLabel = "Them",
 }: {
@@ -1792,10 +2075,10 @@ export function InteractiveDraft({
   leaveDivePivot?: string | null;
   map?: string | null;
   draftMeta?: DraftMetaTable | null;
-  /** Our roster comfort — used for post-pick swaps. */
   homeRoster?: PlayerScout[];
-  /** Their scouted roster — open answers must be heroes they actually play. */
   theirRoster?: PlayerScout[];
+  /** Heroes they commonly ban — mutual denies they may take for us. */
+  theirCommonBans?: { hero: string; count: number }[];
   ourLabel?: string;
   theirLabel?: string;
 }) {
@@ -1852,6 +2135,14 @@ export function InteractiveDraft({
     }
     return out;
   }, [theirRoster, theirLikely]);
+
+  // One player per hero — specialist locks can steal earlier flex seats.
+  const stampedHistory = useMemo(() => {
+    let h = history;
+    h = restampSidePlayers(h, "our", homeRoster, planPicks);
+    h = restampSidePlayers(h, "their", theirRoster, theirLikely);
+    return h;
+  }, [history, homeRoster, theirRoster, planPicks, theirLikely]);
 
   const leaveDiveLive = useMemo(() => {
     const locked = history
@@ -1915,46 +2206,103 @@ export function InteractiveDraft({
       }
       if (!banPool.length) return null;
       const options = banPool
-        .map((h) => ({
-          ...buildPickScorecard({
-            hero: h,
-            table: draftMeta,
-            gone,
-            map,
-            ourPickCount,
-            inPlan: false,
-            fromAlt: false,
-            planRole: null,
-            lockedAllies: ourLockedHeroes,
-            // answering side = us (open counters we can still take)
-            theirLocked: ourLockedHeroes,
-            answeringTeamPool: ourHeroPool,
-            answerPerspective: "ours",
-            theirLikely,
-            banPriority,
-            comfort: 0,
-            swapDelta: 0,
-            takeAndRebuild: false,
-            kind: "ban",
-            lastPick,
-          }),
-          player: theirOwnerName(h, theirLikely),
-        }))
+        .map((h) => {
+          const sig = comfortSignal(
+            theirRoster,
+            h,
+            theirOwnerName(h, theirLikely),
+          );
+          const wePlay =
+            comfortSignal(homeRoster, h, null).comfort > 0;
+          return {
+            ...buildPickScorecard({
+              hero: h,
+              table: draftMeta,
+              gone,
+              map,
+              ourPickCount,
+              inPlan: false,
+              fromAlt: false,
+              planRole: null,
+              lockedAllies: ourLockedHeroes,
+              // answering side = us (open counters we can still take)
+              theirLocked: ourLockedHeroes,
+              answeringTeamPool: ourHeroPool,
+              answerPerspective: "ours",
+              theirLikely,
+              banPriority,
+              comfort: sig.comfort,
+              comfortWho: sig.who,
+              swapDelta: 0,
+              takeAndRebuild: false,
+              kind: "ban",
+              lastPick,
+              ourBanCount,
+              theirCommonBans,
+              wePlayHero: wePlay,
+            }),
+            player: theirOwnerName(h, theirLikely),
+          };
+        })
         .sort((a, b) => b.total - a.total || a.hero.localeCompare(b.hero))
         .slice(0, 3);
       const hero = options[0]?.hero;
       if (!hero) return null;
+      const mutualFactor = options[0]?.factors.find((f) => f.id === "mutualBan");
+      const heldForRound2 =
+        ourBanCount === 0
+          ? options
+              .filter(
+                (o) =>
+                  heroKey(o.hero) !== heroKey(hero) &&
+                  o.factors.some(
+                    (f) => f.id === "mutualBan" && f.points < 0,
+                  ),
+              )
+              .map((o) => o.hero)
+          : [];
+      // Also surface held mutuals that scored off the top-3 cards.
+      const heldOffCard =
+        ourBanCount === 0
+          ? banPool
+              .filter((h) => {
+                if (heroKey(h) === heroKey(hero)) return false;
+                if (heldForRound2.some((x) => heroKey(x) === heroKey(h))) {
+                  return false;
+                }
+                const wePlay = comfortSignal(homeRoster, h, null).comfort > 0;
+                const theyBan = theirCommonBans.some(
+                  (b) => heroKey(b.hero) === heroKey(h),
+                );
+                const onList = banPriority.some(
+                  (b) => heroKey(b.hero) === heroKey(h),
+                );
+                return onList && (wePlay || theyBan);
+              })
+              .slice(0, 2)
+          : [];
+      const heldNames = [...heldForRound2, ...heldOffCard];
+      const holdNote =
+        heldNames.length > 0
+          ? `Holding ${heldNames.join(", ")} for opening ban round 2 (our second of two opening bans — not a free 3rd).`
+          : null;
       const banReason =
+        mutualFactor?.detail ??
         banPriority.find((b) => heroKey(b.hero) === heroKey(hero))?.reason ??
         `Ban ${hero} before they can take it.`;
       return {
         hero,
-        badge: "Suggested ban",
+        badge:
+          ourBanCount === 0
+            ? "Suggested ban · opening round 1"
+            : ourBanCount === 1
+              ? "Suggested ban · opening round 2"
+              : "Suggested ban",
         showOurPlan: true,
         planPicks: livePicks,
         compLine: comp,
         expectLine: expect,
-        cautionLine: null,
+        cautionLine: holdNote,
         swapLine: null,
         reason: banReason,
         options,
@@ -1979,9 +2327,150 @@ export function InteractiveDraft({
       const theirLockedHeroes = history
         .filter((a) => a.side === "their" && a.kind === "pick")
         .map((a) => a.hero);
+
+      // Their consecutive double — expect a pair, not one hero at a time.
+      if (
+        step.kind === "pick" &&
+        isDoublePickWindow(DRAFT_ORDER, stepIndex) &&
+        theirLikely.length >= 2
+      ) {
+        const theirMarked: DraftCompPick[] = theirLikely.map((p) => {
+          const filled = theirLockedHeroes.some(
+            (h) =>
+              heroKey(h) === heroKey(p.hero) ||
+              (p.alternatives ?? []).some(
+                (a) => heroKey(a.hero) === heroKey(h),
+              ),
+          );
+          return filled ? { ...p, note: "locked" } : p;
+        });
+        const openCount = theirMarked.filter((p) => !isLockedPlanSeat(p))
+          .length;
+        if (openCount >= 2) {
+          const seats = seatPairCandidates(
+            theirMarked,
+            gone,
+            new Set(),
+          );
+          if (seats.length >= 2) {
+            const soloCache = new Map<string, ScoredOption>();
+            const soloFor = (hero: string) => {
+              const k = heroKey(hero);
+              const hit = soloCache.get(k);
+              if (hit) return hit;
+              const matched = matchTheirPlanSeat(hero, theirLikely);
+              const seatWho = theirOwnerName(hero, theirLikely);
+              const sig = comfortSignal(theirRoster, hero, seatWho);
+              const card = buildPickScorecard({
+                hero,
+                table: draftMeta,
+                gone,
+                map,
+                ourPickCount: theirPickCount,
+                inPlan: Boolean(matched),
+                fromAlt: Boolean(matched && !matched.exact),
+                planRole: matched?.seat.role ?? null,
+                lockedAllies: theirLockedHeroes,
+                theirLocked: ourLockedHeroes,
+                answeringTeamPool: ourHeroPool,
+                answerPerspective: "ours",
+                theirLikely: [],
+                banPriority: [],
+                comfort: sig.comfort,
+                comfortWho: sig.who,
+                swapDelta: 0,
+                takeAndRebuild: false,
+                kind: "pick",
+                lastPick: false,
+              });
+              soloCache.set(k, card);
+              return card;
+            };
+            const pairs = rankDoublePickPairs({
+              seats,
+              soloScore: (h) => soloFor(h).total,
+              contested: () => false,
+              beforePlan: theirMarked,
+              projectBoth: (first, second) => {
+                const p1 = seats
+                  .flatMap((s) => s.cands)
+                  .find((c) => heroKey(c.hero) === heroKey(first));
+                const p2 = seats
+                  .flatMap((s) => s.cands)
+                  .find((c) => heroKey(c.hero) === heroKey(second));
+                return showSuggestionOnPlan(
+                  showSuggestionOnPlan(
+                    theirMarked,
+                    first,
+                    p1?.player ?? null,
+                  ),
+                  second,
+                  p2?.player ?? null,
+                );
+              },
+              table: draftMeta,
+            });
+            if (pairs.length) {
+              const options: ScoredOption[] = pairs.slice(0, 3).map((pair) => ({
+                hero: pair.first,
+                pairWith: pair.second,
+                player: theirOwnerName(pair.first, theirLikely),
+                pairPlayer: theirOwnerName(pair.second, theirLikely),
+                total: pair.total,
+                factors: [
+                  ...pair.pairFactors,
+                  {
+                    id: "first-solo",
+                    label: `First · ${pair.first}`,
+                    points: pair.firstSolo,
+                    detail: "Their likely first of the double",
+                  },
+                  {
+                    id: "second-solo",
+                    label: `Then · ${pair.second}`,
+                    points: pair.secondSolo,
+                    detail: "Their likely follow-up",
+                  },
+                ],
+              }));
+              const best = pairs[0];
+              const who = theirOwnerName(best.first, theirLikely);
+              const who2 = theirOwnerName(best.second, theirLikely);
+              const archetype = theirCompRead(
+                history,
+                theirLikely,
+                gone,
+                theirArchetype,
+              );
+              return {
+                hero: best.first,
+                badge: "Their pair",
+                showOurPlan: false,
+                planPicks: [],
+                compLine: `Going for: ${archetype}.`,
+                expectLine: null,
+                cautionLine: null,
+                swapLine: null,
+                reason: `Likely pair: ${best.first}${who ? ` (${who})` : ""} then ${best.second}${who2 ? ` (${who2})` : ""}.`,
+                options,
+              };
+            }
+          }
+        }
+      }
+
       const options = pool
         .map((h) => {
           const matched = matchTheirPlanSeat(h, theirLikely);
+          const seatWho = theirOwnerName(h, theirLikely);
+          // Ban denies our pockets; pick uses their comfort.
+          const sig = comfortSignal(
+            step.kind === "ban" ? homeRoster : theirRoster,
+            h,
+            step.kind === "ban" ? null : seatWho,
+          );
+          // Ban: if we take it, they answer. Pick: if they take it, we answer.
+          const theyAnswer = step.kind === "ban";
           return {
             ...buildPickScorecard({
               hero: h,
@@ -1993,18 +2482,19 @@ export function InteractiveDraft({
               fromAlt: Boolean(matched && !matched.exact),
               planRole: matched?.seat.role ?? null,
               lockedAllies: theirLockedHeroes,
-              theirLocked: ourLockedHeroes,
-              answeringTeamPool: ourHeroPool,
-              answerPerspective: "ours",
+              theirLocked: theyAnswer ? theirLockedHeroes : ourLockedHeroes,
+              answeringTeamPool: theyAnswer ? theirHeroPool : ourHeroPool,
+              answerPerspective: theyAnswer ? "theirs" : "ours",
               theirLikely: [],
               banPriority: [],
-              comfort: 0,
+              comfort: sig.comfort,
+              comfortWho: sig.who,
               swapDelta: 0,
               takeAndRebuild: false,
               kind: step.kind,
               lastPick,
             }),
-            player: theirOwnerName(h, theirLikely),
+            player: seatWho,
           };
         })
         .sort((a, b) => b.total - a.total || a.hero.localeCompare(b.hero))
@@ -2042,10 +2532,154 @@ export function InteractiveDraft({
       if (who && takenPlayers.has(who.toLowerCase())) return false;
       return true;
     });
+
+    // Consecutive double-pick: rank seat pairs (e.g. Malthael + E.T.C.), not
+    // one hero that leaves the plan stuck on a stale Stitches primary.
+    const theirLockedForPairs = history
+      .filter((a) => a.side === "their" && a.kind === "pick")
+      .map((a) => a.hero);
+    const ourLockedForPairs = locked.map((l) => l.hero);
+    if (
+      step.kind === "pick" &&
+      isDoublePickWindow(DRAFT_ORDER, stepIndex) &&
+      livePicks.filter((p) => !isLockedPlanSeat(p)).length >= 2
+    ) {
+      const seats = seatPairCandidates(livePicks, gone, takenPlayers);
+      if (seats.length >= 2) {
+        const soloCache = new Map<string, ScoredOption>();
+        const soloFor = (hero: string) => {
+          const k = heroKey(hero);
+          const hit = soloCache.get(k);
+          if (hit) return hit;
+          const meta = seats
+            .flatMap((s) => s.cands)
+            .find((c) => heroKey(c.hero) === k);
+          const sig = comfortSignal(homeRoster, hero, meta?.player ?? null);
+          const card = buildPickScorecard({
+            hero,
+            table: draftMeta,
+            gone,
+            map,
+            ourPickCount,
+            inPlan: !meta?.fromAlt,
+            fromAlt: Boolean(meta?.fromAlt),
+            planRole: meta?.role ?? null,
+            lockedAllies: ourLockedForPairs,
+            theirLocked: theirLockedForPairs,
+            answeringTeamPool: theirHeroPool,
+            answerPerspective: "theirs",
+            theirLikely,
+            banPriority,
+            comfort: sig.comfort,
+            comfortWho: sig.who,
+            swapDelta: 0,
+            takeAndRebuild: shouldTakeAndRebuild(draftMeta, hero),
+            kind: "pick",
+            lastPick: false,
+          });
+          soloCache.set(k, card);
+          return card;
+        };
+        const pairs = rankDoublePickPairs({
+          seats,
+          soloScore: (h) => soloFor(h).total,
+          contested: (h) => Boolean(theyMightTake(h, theirLikely, banPriority)),
+          beforePlan: livePicks,
+          projectBoth: (first, second) => {
+            const p1 = seats
+              .flatMap((s) => s.cands)
+              .find((c) => heroKey(c.hero) === heroKey(first));
+            const p2 = seats
+              .flatMap((s) => s.cands)
+              .find((c) => heroKey(c.hero) === heroKey(second));
+            return showSuggestionOnPlan(
+              showSuggestionOnPlan(livePicks, first, p1?.player ?? null),
+              second,
+              p2?.player ?? null,
+            );
+          },
+          table: draftMeta,
+        });
+        if (pairs.length) {
+          const options: ScoredOption[] = pairs.slice(0, 3).map((pair) => {
+            const firstCard = soloFor(pair.first);
+            const secondCard = soloFor(pair.second);
+            const factors: ScoreFactor[] = [
+              ...pair.pairFactors,
+              {
+                id: "first-solo",
+                label: `First · ${pair.first}`,
+                points: pair.firstSolo,
+                detail:
+                  firstCard.factors
+                    .filter((f) => f.points !== 0)
+                    .slice(0, 3)
+                    .map(
+                      (f) =>
+                        `${f.label} ${f.points > 0 ? "+" : ""}${f.points}`,
+                    )
+                    .join(" · ") || "Solo base",
+              },
+              {
+                id: "second-solo",
+                label: `Then · ${pair.second}`,
+                points: pair.secondSolo,
+                detail:
+                  secondCard.factors
+                    .filter((f) => f.points !== 0)
+                    .slice(0, 3)
+                    .map(
+                      (f) =>
+                        `${f.label} ${f.points > 0 ? "+" : ""}${f.points}`,
+                    )
+                    .join(" · ") || "Solo base",
+              },
+            ];
+            return {
+              hero: pair.first,
+              pairWith: pair.second,
+              player: displayPlayer(pair.firstPlayer) ?? pair.firstPlayer,
+              pairPlayer:
+                displayPlayer(pair.secondPlayer) ?? pair.secondPlayer,
+              total: pair.total,
+              factors,
+            };
+          });
+          const best = pairs[0];
+          const shownPlan = showSuggestionOnPlan(
+            showSuggestionOnPlan(livePicks, best.first, best.firstPlayer),
+            best.second,
+            best.secondPlayer,
+          );
+          const whoFirst = displayPlayer(best.firstPlayer);
+          const whoSecond = displayPlayer(best.secondPlayer);
+          return {
+            hero: best.first,
+            badge: "Suggested pair",
+            showOurPlan: true,
+            planPicks: shownPlan,
+            compLine: compMatchupLine(
+              ourBrief,
+              theirArchetype,
+              archetypeCounter,
+              shownPlan,
+              theirLikely,
+            ),
+            expectLine: expect,
+            cautionLine: null,
+            swapLine: null,
+            reason: `Lock ${best.first}${whoFirst ? ` (${whoFirst})` : ""} now, then ${best.second}${whoSecond ? ` (${whoSecond})` : ""} — scored as a pair for these two picks.`,
+            options,
+          };
+        }
+      }
+    }
+
     const candidates = candMeta.map((c) => c.hero);
     if (!candidates.length) {
       const fallback = allHeroes.find((h) => !isGone(h, gone));
       if (!fallback) return null;
+      const fallbackSig = comfortSignal(homeRoster, fallback, null);
       const opt = buildPickScorecard({
         hero: fallback,
         table: draftMeta,
@@ -2063,7 +2697,8 @@ export function InteractiveDraft({
         answerPerspective: "theirs",
         theirLikely,
         banPriority,
-        comfort: comfortForHero(homeRoster, fallback, null),
+        comfort: fallbackSig.comfort,
+        comfortWho: fallbackSig.who,
         swapDelta: 0,
         takeAndRebuild: false,
         kind: "pick",
@@ -2107,6 +2742,11 @@ export function InteractiveDraft({
     const scorecards = candidates.map((hero) => {
       const cand = metaOf(hero);
       const swap = swapFor(hero);
+      const sig = comfortSignal(
+        homeRoster,
+        hero,
+        seatPlayerOf(hero) ?? cand?.player ?? null,
+      );
       const card = buildPickScorecard({
         hero,
         table: draftMeta,
@@ -2122,11 +2762,8 @@ export function InteractiveDraft({
         answerPerspective: "theirs",
         theirLikely,
         banPriority,
-        comfort: comfortForHero(
-          homeRoster,
-          hero,
-          seatPlayerOf(hero) ?? cand?.player ?? null,
-        ),
+        comfort: sig.comfort,
+        comfortWho: sig.who,
         swapDelta: swap?.comfortDelta ?? 0,
         takeAndRebuild: shouldTakeAndRebuild(draftMeta, hero),
         kind: "pick",
@@ -2476,15 +3113,18 @@ export function InteractiveDraft({
     planPicks,
     theirLikely,
     history,
-    history,
     map,
     ourPickCount,
+    theirPickCount,
+    ourBanCount,
     allHeroes,
     ourBrief,
     theirArchetype,
     archetypeCounter,
     draftMeta,
     homeRoster,
+    theirRoster,
+    theirCommonBans,
     theirHeroPool,
     ourHeroPool,
     leaveDiveLive,
@@ -2497,6 +3137,42 @@ export function InteractiveDraft({
       locked: ourLockedPicks(history, planPicks, homeRoster),
     });
   }, [done, homeRoster, history, planPicks]);
+
+  /** Fantasy-football style grades + win% once all ten locks land. */
+  const draftReport = useMemo((): DraftReportCard | null => {
+    if (!done) return null;
+    const ourLocked = ourLockedPicks(history, planPicks, homeRoster);
+    const theirLocked = history
+      .filter((a) => a.side === "their" && a.kind === "pick")
+      .map((a) => ({
+        hero: a.hero,
+        player: displayPlayer(a.player),
+      }));
+    if (ourLocked.length < 5 || theirLocked.length < 5) return null;
+    return gradeFinishedDraft({
+      ourLocked,
+      theirLocked,
+      ourOptimal: planPicks,
+      theirOptimal: theirLikely,
+      homeRoster,
+      theirRoster,
+      table: draftMeta,
+      map: map ?? null,
+      ourLabel,
+      theirLabel,
+    });
+  }, [
+    done,
+    history,
+    planPicks,
+    theirLikely,
+    homeRoster,
+    theirRoster,
+    draftMeta,
+    map,
+    ourLabel,
+    theirLabel,
+  ]);
 
   /** Heal we locked as comfort/deny — talents + teamfight script at the end. */
   const healDenyEnd = useMemo(() => {
@@ -2568,9 +3244,87 @@ export function InteractiveDraft({
       const theirLockedHeroes = history
         .filter((a) => a.side === "their" && a.kind === "pick")
         .map((a) => a.hero);
-      const answeringTeamLocked = ours ? theirLockedHeroes : ourLockedHeroes;
-      const answeringPool = ours ? theirHeroPool : ourHeroPool;
-      const summary = gradeDeviation({
+      // Ban: answering side is the team that didn't ban (denial target's answers).
+      // Pick: answering side is the opponent of the locker.
+      const weAnswer =
+        (ours && step.kind === "ban") || (!ours && step.kind === "pick");
+      const answeringTeamLocked = weAnswer
+        ? ourLockedHeroes
+        : theirLockedHeroes;
+      const answeringPool = weAnswer ? ourHeroPool : theirHeroPool;
+      const answerPerspective = weAnswer ? "ours" : "theirs";
+      const cardFor = (h: string): ScoredOption => {
+        const fromOpts = suggestion.options.find(
+          (o) => heroKey(o.hero) === heroKey(h),
+        );
+        if (fromOpts) return fromOpts;
+        if (!ours) {
+          const matched = matchTheirPlanSeat(h, theirLikely);
+          const seatWho = theirOwnerName(h, theirLikely);
+          const sig = comfortSignal(
+            step.kind === "ban" ? homeRoster : theirRoster,
+            h,
+            step.kind === "ban" ? null : seatWho,
+          );
+          return buildPickScorecard({
+            hero: h,
+            table: draftMeta,
+            gone,
+            map: map ?? null,
+            ourPickCount: theirPickCount,
+            inPlan: Boolean(matched),
+            fromAlt: Boolean(matched && !matched.exact),
+            planRole: matched?.seat.role ?? null,
+            lockedAllies: theirLockedHeroes,
+            theirLocked: answeringTeamLocked,
+            answeringTeamPool: answeringPool,
+            answerPerspective,
+            theirLikely: [],
+            banPriority: [],
+            comfort: sig.comfort,
+            comfortWho: sig.who,
+            swapDelta: 0,
+            takeAndRebuild: false,
+            kind: step.kind,
+            lastPick: isLastStep,
+          });
+        }
+        const seat = findSeatForCandidate(
+          suggestion.planPicks.length ? suggestion.planPicks : planPicks,
+          h,
+        );
+        const seatWho = seat ? displayPlayer(seat.seat.player) : null;
+        const sig = comfortSignal(
+          step.kind === "ban" ? theirRoster : homeRoster,
+          h,
+          step.kind === "ban" ? null : seatWho,
+        );
+        return buildPickScorecard({
+          hero: h,
+          table: draftMeta,
+          gone,
+          map: map ?? null,
+          ourPickCount,
+          inPlan: Boolean(seat) && !seat?.asAlt,
+          fromAlt: Boolean(seat?.asAlt),
+          planRole: seat?.seat.role ?? null,
+          lockedAllies: ourLockedHeroes,
+          theirLocked: answeringTeamLocked,
+          answeringTeamPool: answeringPool,
+          answerPerspective,
+          theirLikely,
+          banPriority,
+          comfort: sig.comfort,
+          comfortWho: sig.who,
+          swapDelta: 0,
+          takeAndRebuild: shouldTakeAndRebuild(draftMeta, h),
+          kind: step.kind,
+          lastPick: isLastStep,
+        });
+      };
+      const suggestedCard = cardFor(suggestion.hero);
+      let chosenCard = cardFor(hero);
+      const graded = gradeDeviation({
         ours,
         kind: step.kind,
         suggested: suggestion.hero,
@@ -2587,75 +3341,26 @@ export function InteractiveDraft({
         isLastStep,
         answeringTeamLocked,
         answeringTeamPool: answeringPool,
+        suggestedTotal: suggestedCard.total,
+        chosenTotal: chosenCard.total,
       });
-      if (!summary) {
+      if (!graded) {
         setDeviationNote(null);
       } else {
-        const cardFor = (h: string): ScoredOption => {
-          const fromOpts = suggestion.options.find(
-            (o) => heroKey(o.hero) === heroKey(h),
+        // Structural throws get a heavy score slam so the board never looks
+        // like a close judgment call (+50 vs +41) when the pick was illegal.
+        if (graded.structuralReasons.length) {
+          chosenCard = applyStructuralThrowToCard(
+            chosenCard,
+            graded.structuralReasons,
           );
-          if (fromOpts) return fromOpts;
-          if (!ours) {
-            const matched = matchTheirPlanSeat(h, theirLikely);
-            return buildPickScorecard({
-              hero: h,
-              table: draftMeta,
-              gone,
-              map: map ?? null,
-              ourPickCount: theirPickCount,
-              inPlan: Boolean(matched),
-              fromAlt: Boolean(matched && !matched.exact),
-              planRole: matched?.seat.role ?? null,
-              lockedAllies: theirLockedHeroes,
-              theirLocked: answeringTeamLocked,
-              answeringTeamPool: answeringPool,
-              answerPerspective: "ours",
-              theirLikely: [],
-              banPriority: [],
-              comfort: 0,
-              swapDelta: 0,
-              takeAndRebuild: false,
-              kind: step.kind,
-              lastPick: isLastStep,
-            });
-          }
-          const seat = findSeatForCandidate(
-            suggestion.planPicks.length ? suggestion.planPicks : planPicks,
-            h,
-          );
-          return buildPickScorecard({
-            hero: h,
-            table: draftMeta,
-            gone,
-            map: map ?? null,
-            ourPickCount,
-            inPlan: Boolean(seat) && !seat?.asAlt,
-            fromAlt: Boolean(seat?.asAlt),
-            planRole: seat?.seat.role ?? null,
-            lockedAllies: ourLockedHeroes,
-            theirLocked: answeringTeamLocked,
-            answeringTeamPool: answeringPool,
-            answerPerspective: "theirs",
-            theirLikely,
-            banPriority,
-            comfort: comfortForHero(
-              homeRoster,
-              h,
-              seat ? displayPlayer(seat.seat.player) : null,
-            ),
-            swapDelta: 0,
-            takeAndRebuild: shouldTakeAndRebuild(draftMeta, h),
-            kind: step.kind,
-            lastPick: isLastStep,
-          });
-        };
+        }
         setDeviationNote({
-          summary,
-          solid: /^Solid:/i.test(summary),
+          summary: graded.summary,
+          severity: graded.severity,
           kind: step.kind,
-          suggested: cardFor(suggestion.hero),
-          chosen: cardFor(hero),
+          suggested: suggestedCard,
+          chosen: chosenCard,
         });
       }
     } else {
@@ -2709,8 +3414,8 @@ export function InteractiveDraft({
 
   const ourBans = slotsFor(history, "our", "ban", 3);
   const theirBans = slotsFor(history, "their", "ban", 3);
-  const ourPicks = slotsFor(history, "our", "pick", 5);
-  const theirPicks = slotsFor(history, "their", "pick", 5);
+  const ourPicks = slotsFor(stampedHistory, "our", "pick", 5);
+  const theirPicks = slotsFor(stampedHistory, "their", "pick", 5);
 
   const stepOrdinal =
     step == null
@@ -2803,6 +3508,7 @@ export function InteractiveDraft({
             <p className="text-sm font-semibold text-[#9dceb0]">
               Draft walk complete. Undo if something was logged wrong.
             </p>
+            {draftReport && <DraftReportCardView report={draftReport} />}
             {deviationNote && (
               <DeviationCallout note={deviationNote} />
             )}
@@ -2928,15 +3634,23 @@ export function InteractiveDraft({
                 <div className="flex flex-wrap items-start gap-3">
                   {suggestion.options.map((opt, i) => (
                     <ScoredHeroOption
-                      key={opt.hero}
+                      key={
+                        opt.pairWith
+                          ? `${opt.hero}+${opt.pairWith}`
+                          : opt.hero
+                      }
                       option={opt}
                       rank={i + 1}
                       badge={
                         i === 0
                           ? suggestion.badge
                           : i === 1
-                            ? "Alt #2"
-                            : "Alt #3"
+                            ? opt.pairWith
+                              ? "Alt pair #2"
+                              : "Alt #2"
+                            : opt.pairWith
+                              ? "Alt pair #3"
+                              : "Alt #3"
                       }
                       banned={step?.kind === "ban"}
                       onLock={() =>
@@ -2944,7 +3658,9 @@ export function InteractiveDraft({
                           opt.hero,
                           i === 0
                             ? suggestion.reason
-                            : `${opt.hero} scored ${opt.total}`,
+                            : opt.pairWith
+                              ? `${opt.hero} then ${opt.pairWith} scored ${opt.total}`
+                              : `${opt.hero} scored ${opt.total}`,
                         )
                       }
                     />
@@ -3040,11 +3756,18 @@ export function InteractiveDraft({
                     {ours
                       ? step?.kind === "ban"
                         ? "Ban"
-                        : "Lock"
+                        : suggestion.options[0]?.pairWith
+                          ? "Lock first ·"
+                          : "Lock"
                       : step?.kind === "ban"
                         ? "They banned"
-                        : "They picked"}{" "}
+                        : suggestion.options[0]?.pairWith
+                          ? "They pick first ·"
+                          : "They picked"}{" "}
                     {suggestion.hero}
+                    {suggestion.options[0]?.pairWith
+                      ? ` (then ${suggestion.options[0].pairWith})`
+                      : ""}
                   </button>
                 </div>
               </div>
@@ -3064,7 +3787,10 @@ export function InteractiveDraft({
                   const fromSuggestion =
                     !filter.trim() &&
                     suggestion?.options.some(
-                      (o) => heroKey(o.hero) === heroKey(hero),
+                      (o) =>
+                        heroKey(o.hero) === heroKey(hero) ||
+                        (o.pairWith != null &&
+                          heroKey(o.pairWith) === heroKey(hero)),
                     );
                   const highlighted = fromSearch || fromSuggestion;
                   return (
@@ -3096,8 +3822,99 @@ export function InteractiveDraft({
   );
 }
 
+function gradeTone(grade: LetterGrade): string {
+  if (grade.startsWith("A")) return "border-emerald-500/50 bg-emerald-950/40 text-emerald-200";
+  if (grade.startsWith("B")) return "border-sky-500/45 bg-sky-950/35 text-sky-200";
+  if (grade.startsWith("C")) return "border-amber-500/45 bg-amber-950/35 text-amber-100";
+  if (grade === "D") return "border-orange-500/50 bg-orange-950/40 text-orange-200";
+  return "border-rose-500/50 bg-rose-950/40 text-rose-200";
+}
+
+function winPctTone(pct: number): string {
+  if (pct >= 58) return "text-emerald-300";
+  if (pct >= 48) return "text-[#e8eef2]";
+  if (pct >= 40) return "text-amber-200";
+  return "text-rose-300";
+}
+
+function DraftReportCardView({ report }: { report: DraftReportCard }) {
+  return (
+    <div className="space-y-3 rounded-md border border-[#3d5163] bg-[#0f1821] px-3 py-3">
+      <div className="flex flex-wrap items-end justify-between gap-3">
+        <div>
+          <p className="text-[10px] font-bold uppercase tracking-wide text-[#8aa0b2]">
+            Draft report card
+          </p>
+          <p className="mt-1 text-sm font-semibold text-[#e8eef2]">
+            {report.headline}
+          </p>
+        </div>
+        <div className="text-right">
+          <p className="text-[10px] font-bold uppercase tracking-wide text-[#8aa0b2]">
+            Win likelihood
+          </p>
+          <p
+            className={`text-3xl font-bold tabular-nums leading-none ${winPctTone(report.winPct)}`}
+          >
+            {report.winPct}%
+          </p>
+        </div>
+      </div>
+
+      <div className="grid gap-2 sm:grid-cols-2">
+        {[report.ours, report.theirs].map((side) => (
+          <div
+            key={side.label}
+            className="rounded-md border border-[#2a3a48] bg-[#162230] px-3 py-2.5"
+          >
+            <div className="flex items-center justify-between gap-2">
+              <p className="text-xs font-semibold uppercase tracking-wide text-[#8aa0b2]">
+                {side.label}
+              </p>
+              <span
+                className={`inline-flex min-w-[2.5rem] items-center justify-center rounded border px-2 py-0.5 text-lg font-bold tabular-nums ${gradeTone(side.grade)}`}
+                title={`${side.fidelity}% of optimal · quality ${side.quality}/100`}
+              >
+                {side.grade}
+              </span>
+            </div>
+            <p className="mt-1 text-xs text-[#8aa0b2]">
+              Quality {side.quality}
+              {side.optimalQuality > 0
+                ? ` / optimal ${side.optimalQuality}`
+                : ""}
+              {" · "}
+              {side.fidelity}% of plan
+            </p>
+            <ul className="mt-2 space-y-1">
+              {side.notes.map((n) => (
+                <li
+                  key={n}
+                  className="text-sm leading-snug text-[#c5d4e0]"
+                >
+                  {n}
+                </li>
+              ))}
+            </ul>
+          </div>
+        ))}
+      </div>
+
+      {report.reasons.length > 0 && (
+        <ul className="space-y-1 border-t border-[#2a3a48] pt-2">
+          {report.reasons.map((r) => (
+            <li key={r} className="text-xs leading-snug text-[#8aa0b2]">
+              {r}
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
 function DeviationCallout({ note }: { note: DeviationReport }) {
-  const solid = note.solid;
+  const severity = note.severity;
   const verb = note.kind === "ban" ? "banned" : "picked";
   const factorIds = [
     ...new Set([
@@ -3125,32 +3942,46 @@ function DeviationCallout({ note }: { note: DeviationReport }) {
         ? "text-amber-200/90"
         : "text-[#8aa0b2]";
 
+  const shell =
+    severity === "solid"
+      ? "rounded-md border border-teal-500/40 bg-teal-950/35 px-3 py-2.5"
+      : severity === "minor"
+        ? "rounded-md border border-sky-500/35 bg-sky-950/30 px-3 py-2.5"
+        : severity === "major"
+          ? "rounded-md border border-amber-500/45 bg-amber-950/40 px-3 py-2.5"
+          : "rounded-md border border-[#3d5163] bg-[#0f1821]/80 px-3 py-2.5";
+
+  const eyebrow =
+    severity === "solid"
+      ? "text-[10px] font-bold uppercase tracking-wide text-teal-200/90"
+      : severity === "minor"
+        ? "text-[10px] font-bold uppercase tracking-wide text-sky-200/90"
+        : severity === "major"
+          ? "text-[10px] font-bold uppercase tracking-wide text-amber-200/90"
+          : "text-[10px] font-bold uppercase tracking-wide text-[#8aa0b2]";
+
+  const body =
+    severity === "solid"
+      ? "mt-1 text-sm leading-snug text-teal-50/95"
+      : severity === "minor"
+        ? "mt-1 text-sm leading-snug text-sky-50/95"
+        : severity === "major"
+          ? "mt-1 text-sm leading-snug text-amber-100/95"
+          : "mt-1 text-sm leading-snug text-[#c5d4e0]";
+
+  const title =
+    severity === "solid"
+      ? "Solid call vs suggestion"
+      : severity === "minor"
+        ? "Judgment call vs suggestion"
+        : severity === "major"
+          ? "Major miss vs suggestion"
+          : "Last lock vs suggestion";
+
   return (
-    <div
-      className={
-        solid
-          ? "rounded-md border border-teal-500/40 bg-teal-950/35 px-3 py-2.5"
-          : "rounded-md border border-amber-500/40 bg-amber-950/40 px-3 py-2.5"
-      }
-    >
-      <p
-        className={
-          solid
-            ? "text-[10px] font-bold uppercase tracking-wide text-teal-200/90"
-            : "text-[10px] font-bold uppercase tracking-wide text-amber-200/90"
-        }
-      >
-        {solid ? "Solid call vs suggestion" : "Last lock vs suggestion"}
-      </p>
-      <p
-        className={
-          solid
-            ? "mt-1 text-sm leading-snug text-teal-50/95"
-            : "mt-1 text-sm leading-snug text-amber-100/95"
-        }
-      >
-        {note.summary}
-      </p>
+    <div className={shell}>
+      <p className={eyebrow}>{title}</p>
+      <p className={body}>{note.summary}</p>
 
       <div className="mt-2 w-full overflow-x-auto">
         <div className="grid min-w-[36rem] grid-cols-[minmax(6.5rem,auto)_2.75rem_minmax(8rem,1fr)_2.75rem_minmax(8rem,1fr)] gap-x-2 text-xs">
@@ -3171,7 +4002,7 @@ function DeviationCallout({ note }: { note: DeviationReport }) {
             hero={note.chosen.hero}
             total={note.chosen.total}
             title={
-              solid
+              severity === "solid"
                 ? `Why ${note.chosen.hero} scored`
                 : `Why ${note.chosen.hero} scored instead`
             }
@@ -3306,6 +4137,7 @@ function ScoredHeroOption({
   onLock: () => void;
 }) {
   const primary = rank === 1;
+  const pair = option.pairWith;
   return (
     <div className="group relative flex flex-col items-center">
       <button
@@ -3324,16 +4156,39 @@ function ScoredHeroOption({
         >
           {badge}
         </span>
-        <HeroFace
-          hero={option.hero}
-          kind="select"
-          size={primary ? "lg" : "md"}
-          banned={banned}
-        />
-        <span className="text-sm font-semibold text-[#e8eef2]">
-          {option.hero}
+        {pair ? (
+          <div className="flex items-center gap-1">
+            <HeroFace
+              hero={option.hero}
+              kind="select"
+              size={primary ? "lg" : "md"}
+              banned={banned}
+            />
+            <span className="text-sm font-bold text-[#8aa0b2]">+</span>
+            <HeroFace
+              hero={pair}
+              kind="select"
+              size={primary ? "lg" : "md"}
+              banned={banned}
+            />
+          </div>
+        ) : (
+          <HeroFace
+            hero={option.hero}
+            kind="select"
+            size={primary ? "lg" : "md"}
+            banned={banned}
+          />
+        )}
+        <span className="max-w-[9rem] text-center text-sm font-semibold leading-tight text-[#e8eef2]">
+          {pair ? `${option.hero} + ${pair}` : option.hero}
         </span>
-        {option.player ? (
+        {pair ? (
+          <span className="max-w-[9rem] truncate text-center text-[11px] leading-tight text-[#9dceb0]">
+            {[option.player, option.pairPlayer].filter(Boolean).join(" · ") ||
+              "then next pick"}
+          </span>
+        ) : option.player ? (
           <span className="max-w-[6.5rem] truncate text-center text-[11px] leading-tight text-[#9dceb0]">
             {option.player}
           </span>
@@ -3349,6 +4204,7 @@ function ScoredHeroOption({
       <div className="pointer-events-none absolute left-1/2 top-full z-30 mt-2 w-72 -translate-x-1/2 rounded-md border border-[#3d5163] bg-[#0f1821] px-3 py-2 opacity-0 shadow-xl transition group-hover:opacity-100 group-focus-within:opacity-100">
         <p className="mb-1.5 text-[10px] font-bold uppercase tracking-wide text-[#8aa0b2]">
           Score breakdown · total {option.total}
+          {pair ? ` · lock ${option.hero} first` : ""}
         </p>
         <ul className="space-y-1">
           {option.factors.map((f) => (

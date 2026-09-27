@@ -1,7 +1,7 @@
 import { leagueConfig } from "@/config/league";
 import type { HpMatchGame, HpNgsMatch } from "@/lib/heroesprofile/types";
 import type { NgsMatch } from "@/lib/ngs/types";
-import { labelArchetypeTag } from "@/lib/scoring/glossary";
+import { formatArchetypeLeaders, labelArchetypeTag } from "@/lib/scoring/glossary";
 import { heroRole, heroTags } from "@/lib/scoring/heroMeta";
 import type {
   DraftDataQuality,
@@ -380,9 +380,10 @@ export function buildDraftInsights(
   };
 
   if (trustNgsDrafts) {
+    const identityLean = formatArchetypeLeaders(archetypeBreakdown, archetype);
     add(
       "Identity",
-      `${archetype}` +
+      `${identityLean}` +
         (topComfort ? ` — standout comfort threat: ${topComfort.hero}` : ""),
     );
   } else if (dataQuality === "early_season") {
@@ -491,6 +492,7 @@ export function buildDraftInsights(
           b.current - a.current ||
           a.label.localeCompare(b.label),
       );
+    const voteTotal = groups.reduce((s, g) => s + g.total, 0);
     return groups.map((g) => {
       const comps = [...(compsByStrategy.get(g.label)?.values() ?? [])]
         .map((c) => ({ ...c, total: c.current + c.prior }))
@@ -522,8 +524,10 @@ export function buildDraftInsights(
           }
         }
       }
+      const pct =
+        voteTotal > 0 ? Math.round((g.total / voteTotal) * 1000) / 10 : 0;
       return {
-        title: `${g.label} (${countLabel(g.current, g.prior)})`,
+        title: `${g.label} (${pct}% · ${countLabel(g.current, g.prior)})`,
         items,
       };
     });

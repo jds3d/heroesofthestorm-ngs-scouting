@@ -6,6 +6,7 @@ import type {
   NgsApiEnvelope,
   NgsDivision,
   NgsMatch,
+  NgsStandingRow,
   NgsTeam,
 } from "@/lib/ngs/types";
 
@@ -110,18 +111,113 @@ export async function getTeamMatches(
   return cachedFetch(key, fetcher, ttl);
 }
 
+export async function getDivisionStandings(
+  division: string = leagueConfig.divisionConcat,
+  season: number = leagueConfig.season,
+): Promise<NgsStandingRow[]> {
+  return cachedFetch(
+    `ngs-standings-${season}-${division}`,
+    () =>
+      ngsPost<NgsStandingRow[]>("/api/standings/fetch/division", {
+        division,
+        season,
+      }),
+    // Same cadence as current-season schedule — standings move weekly.
+    season === leagueConfig.season ? 24 * 60 * 60 * 1000 : null,
+  );
+}
+
 export async function listOpponentTeams(): Promise<LeagueTeamSummary[]> {
   const division = await getDivision();
-  return division.teams
+  const opponents = division.teams
     .filter((name) => name !== leagueConfig.homeTeam)
-    .filter((name) => !name.toLowerCase().includes("withdrawn"))
-    .map((name) => ({
-      name,
-      slug: teamSlug(name),
-      profileUrl: teamProfileUrl(name),
-      withdrawn: name.toLowerCase().includes("withdrawn"),
-    }))
-    .sort((a, b) => a.name.localeCompare(b.name));
+    .filter((name) => !name.toLowerCase().includes("withdrawn"));
+
+  const [homeMatches, standingRows] = await Promise.all([
+    getTeamMatches(leagueConfig.homeTeam, leagueConfig.season).catch(
+      () => [] as NgsMatch[],
+    ),
+    // Same source as https://www.nexusgamingseries.org/division/a standings tab.
+    getDivisionStandings().catch(() => [] as NgsStandingRow[]),
+  ]);
+
+  const scheduleByOpp = new Map<
+    string,
+    {
+      week: number;
+      scheduledAt: string | null;
+      played: boolean;
+    }
+  >();
+  for (const match of homeMatches) {
+    const oppName =
+      match.home.teamName === leagueConfig.homeTeam
+        ? match.away.teamName
+        : match.home.teamName;
+    if (!oppName || oppName === leagueConfig.homeTeam) continue;
+    const startRaw = match.scheduledTime?.startTime;
+    const startMs = startRaw != null ? Number(startRaw) : NaN;
+    const scheduledAt =
+      Number.isFinite(startMs) && startMs > 0
+        ? new Date(startMs).toISOString()
+        : null;
+    scheduleByOpp.set(oppName.toLowerCase(), {
+      week: match.round,
+      scheduledAt,
+      played: Boolean(match.reported),
+    });
+  }
+
+  const standings = new Map(
+    standingRows.map((s) => [
+      s.teamName.toLowerCase(),
+      {
+        place: Number(s.standing) || 0,
+        points: Number(s.points) || 0,
+        wins: Number(s.wins) || 0,
+        losses: Number(s.losses) || 0,
+      },
+    ]),
+  );
+
+  // If NGS omitted `standing`, rank by points then wins.
+  const ranked = [...standings.entries()].sort(
+    (a, b) =>
+      b[1].points - a[1].points ||
+      b[1].wins - a[1].wins ||
+      a[1].losses - b[1].losses ||
+      a[0].localeCompare(b[0]),
+  );
+  ranked.forEach(([key, row], i) => {
+    if (!row.place) {
+      standings.set(key, { ...row, place: i + 1 });
+    }
+  });
+
+  return opponents
+    .map((name) => {
+      const sched = scheduleByOpp.get(name.toLowerCase());
+      const standing = standings.get(name.toLowerCase());
+      return {
+        name,
+        slug: teamSlug(name),
+        profileUrl: teamProfileUrl(name),
+        withdrawn: name.toLowerCase().includes("withdrawn"),
+        week: sched?.week ?? null,
+        scheduledAt: sched?.scheduledAt ?? null,
+        played: Boolean(sched?.played),
+        place: standing?.place && standing.place > 0 ? standing.place : null,
+        points: standing?.points ?? null,
+        wins: standing?.wins ?? null,
+        losses: standing?.losses ?? null,
+      } satisfies LeagueTeamSummary;
+    })
+    .sort((a, b) => {
+      const aw = a.week ?? 999;
+      const bw = b.week ?? 999;
+      if (aw !== bw) return aw - bw;
+      return a.name.localeCompare(b.name);
+    });
 }
 
 /** Extract HeroesProfile replay IDs from NGS match replay URLs. */

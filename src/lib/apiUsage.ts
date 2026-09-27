@@ -59,6 +59,7 @@ export function classifyHeroesProfile(endpoint: string): ApiCallKind | null {
 
 export function classifyNgs(path: string): ApiCallKind | null {
   if (path.includes("/api/schedule/fetch/matches/team")) return "ngs-schedule";
+  if (path.includes("/api/standings/fetch/division")) return "ngs-schedule";
   if (path.includes("/api/team/get")) return "ngs-team";
   return null;
 }
