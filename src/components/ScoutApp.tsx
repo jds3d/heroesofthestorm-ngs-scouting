@@ -20,6 +20,18 @@ type LeagueTeam = {
 type CallCount = { kind: string; label: string; count: number };
 type RosterPlayer = { battletag: string; games: number };
 
+function scoutHeaders(): HeadersInit {
+  const secret = process.env.NEXT_PUBLIC_SCOUT_API_SECRET?.trim();
+  return secret ? { "x-scout-secret": secret } : {};
+}
+
+async function scoutFetch(path: string, init?: RequestInit): Promise<Response> {
+  return fetch(path, {
+    ...init,
+    headers: { ...scoutHeaders(), ...init?.headers },
+  });
+}
+
 type TeamsResponse = {
   teams: LeagueTeam[];
   season: number;
@@ -112,7 +124,7 @@ export function ScoutApp() {
     let cancelled = false;
     (async () => {
       try {
-        const res = await fetch("/api/league/teams");
+        const res = await scoutFetch("/api/league/teams");
         const data = (await res.json()) as TeamsResponse;
         if (cancelled) return;
         setTeams(data.teams);
@@ -183,14 +195,16 @@ export function ScoutApp() {
     params.set("theirs", (scoutingSelf ? ourFive : theirFive).join("|"));
     const fresh = `?${params.toString()}`;
     try {
-      const estimateRes = await fetch(`/api/scout/${teamPath}/estimate${fresh}`);
+      const estimateRes = await scoutFetch(
+        `/api/scout/${teamPath}/estimate${fresh}`,
+      );
       if (estimateRes.ok) {
         const estimate = (await estimateRes.json()) as {
           predicted?: CallCount[];
         };
         setPredictedCalls(estimate.predicted ?? null);
       }
-      const res = await fetch(`/api/scout/${teamPath}${fresh}`);
+      const res = await scoutFetch(`/api/scout/${teamPath}${fresh}`);
       const raw = await res.text();
       let data: unknown;
       try {
@@ -319,7 +333,7 @@ export function ScoutApp() {
                 ))}
             </ul>
           ) : predictedCalls ? (
-            <p>Predicted API calls: none — this report is already saved.</p>
+            <p>Predicted API calls: none — no new source pulls expected.</p>
           ) : null}
         </div>
       )}
@@ -592,7 +606,7 @@ function TeamRowInline({ team }: { team: LeagueTeam }) {
 }
 
 async function loadRoster(team: string): Promise<RosterPlayer[]> {
-  const res = await fetch(
+  const res = await scoutFetch(
     `/api/league/roster?team=${encodeURIComponent(team)}`,
   );
   if (!res.ok) return [];

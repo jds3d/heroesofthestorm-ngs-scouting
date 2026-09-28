@@ -10,6 +10,10 @@ WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 ENV NEXT_TELEMETRY_DISABLED=1
+# NEXT_PUBLIC_* is inlined at build time. .env.local is dockerignored, so pass
+# the browser secret as a build-arg (see docker compose --env-file .env.local).
+ARG NEXT_PUBLIC_SCOUT_API_SECRET=
+ENV NEXT_PUBLIC_SCOUT_API_SECRET=$NEXT_PUBLIC_SCOUT_API_SECRET
 RUN npm run build
 
 FROM node:20-alpine AS runner

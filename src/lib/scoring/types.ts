@@ -228,7 +228,7 @@ export type AdaptPlan = {
   firstPickDenies: string[];
   recommendations: AdaptRecommendation[];
   confidence: "high" | "medium" | "low";
-  draftPlan: DraftPlan;
+  draftPlan: DraftPlan | null;
   /** Maps we should ban vs leave up, from relative NGS records. */
   mapPlan?: MapPlan | null;
   /**

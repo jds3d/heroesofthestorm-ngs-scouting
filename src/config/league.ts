@@ -20,6 +20,10 @@ export const leagueConfig = {
   },
   /** Volatile scout data (rosters, profiles, Storm League). Replays stay until invalidated. */
   cacheTtlMs: 7 * 24 * 60 * 60 * 1000,
+  /** NGS current-season schedule freshness. */
+  scheduleTtlMs: 24 * 60 * 60 * 1000,
+  /** Scout report JSON freshness (rebuilds scoring; sources may be forever). */
+  reportTtlMs: 7 * 24 * 60 * 60 * 1000,
   ngsBaseUrl: "https://www.nexusgamingseries.org",
   /** Heroes Profile external API v1 */
   heroesProfileBaseUrl: "https://www.heroesprofile.com/api/external/v1",

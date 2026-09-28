@@ -326,6 +326,42 @@ export function liveCountersUp(
   });
 }
 
+export function nakedOfflaneOpeningRisk(args: {
+  table: DraftMetaTable | null | undefined;
+  hero: string;
+  gone: Set<string>;
+  ourPickCount: number;
+  inPlan: boolean;
+  planRole?: string | null;
+  answeringTeamLocked?: string[];
+  answeringTeamPool?: string[] | null;
+  lastPick?: boolean;
+}): { points: number; detail: string; isRisk: boolean } {
+  const opening = args.ourPickCount === 0;
+  if (!opening || !args.inPlan || !isOfflanePlanRole(args.planRole)) {
+    return { points: 0, detail: "Naked offlane first pick — not punished yet", isRisk: false };
+  }
+
+  const rawAnswers = liveCountersUp(args.table, args.hero, args.gone);
+  const liveAnswers = args.lastPick
+    ? []
+    : credibleOpenCounters(
+        rawAnswers,
+        args.answeringTeamLocked ?? [],
+        args.answeringTeamPool,
+      );
+
+  if (!liveAnswers.length) {
+    return { points: 0, detail: "Naked offlane first pick — not punished yet", isRisk: false };
+  }
+
+  return {
+    points: -16,
+    detail: "Naked offlane first pick — punishable",
+    isRisk: true,
+  };
+}
+
 /**
  * Collapse linked dual-hero counters (Cho'Gall) into a single edge so we
  * don't double-penalize open-answers risk or trip "≥2 counters" mistake copy.
@@ -441,15 +477,27 @@ export function counterPoolNote(
   return `Not fearing ${bits.join(", ")} — not in their played pool.`;
 }
 
+function normalizeMapName(value: string | null | undefined): string | null {
+  if (!value) return null;
+  return value.trim().replace(/[_-]+/g, " ").toLowerCase();
+}
+
+/**
+ * Map-specialist status must come from the current HeroesProfile map rows.
+ * We intentionally do not hard-code any hero/map list here — if the API data
+ * says there is no specialist edge for this map, the score stays at zero.
+ */
 export function isMapSpecialist(
   table: DraftMetaTable | null | undefined,
   hero: string,
   map: string | null,
 ): { map: string; winRate: number; deltaPp: number; games: number } | null {
   if (!map) return null;
-  const hit = heroDraftMeta(table, hero).mapStrong.find(
-    (m) => m.map.toLowerCase() === map.toLowerCase(),
-  );
+  const target = normalizeMapName(map);
+  const hit = heroDraftMeta(table, hero).mapStrong.find((m) => {
+    const candidate = normalizeMapName(m.map);
+    return candidate !== null && candidate === target;
+  });
   return hit ?? null;
 }
 
@@ -549,9 +597,8 @@ export function earlyPickScore(
   if (meta.winRate < 46) score -= 10;
   if (meta.influence < -50) score -= 6;
 
-  if (meta.timing === "early") score += 8;
-  if (meta.timing === "late") score -= 10;
-  if (opening && meta.timing === "late" && !takeNow) score -= 10;
+  // Draft timing (early/late) is redundant; open answers risk below already
+  // penalizes heroes with unavailable counter windows.
 
   const threats = args.lastPick
     ? []

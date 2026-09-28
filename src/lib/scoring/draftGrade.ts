@@ -497,3 +497,8 @@ export function gradeFinishedDraft(args: {
     reasons: reasons.slice(0, 4),
   };
 }
+
+/** UI label — not a calibrated P(win). */
+export function draftEdgeLabel(winPct: number): string {
+  return `~${winPct}% draft edge`;
+}

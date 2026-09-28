@@ -1,6 +1,10 @@
 services:
   ngs-scouting:
-    build: .
+    build:
+      context: .
+      args:
+        # Inlined into the client at build time (must match SCOUT_API_SECRET).
+        NEXT_PUBLIC_SCOUT_API_SECRET: ${NEXT_PUBLIC_SCOUT_API_SECRET:-}
     container_name: ngs-scouting
     ports:
       - "3000:3000"

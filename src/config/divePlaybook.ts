@@ -10,11 +10,19 @@ export const divePlaybook = {
     "Tyrael",
     "Brightwing",
     "Johanna",
-    "Falstad",
     "Uther",
     "Anduin",
     "Garrosh",
+    // Gust is locked in when we draft dive (our default). Blast only matters if
+    // we already left dive — by then leave-dive is decided.
+    "Falstad",
   ] as const,
+
+  /**
+   * Soft anti-dive — situational / talent-dependent, do not force leave-dive alone.
+   * (Empty for now: Falstad is hard while we play dive.)
+   */
+  softAntiDiveHeroes: [] as const,
 
   /**
    * Situational dive assassins — mask in picks 1–2 unless they are patch-OP

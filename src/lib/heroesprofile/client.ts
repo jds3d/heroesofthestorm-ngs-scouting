@@ -1,6 +1,6 @@
 import { classifyHeroesProfile, noteApiCall } from "@/lib/apiUsage";
 import { leagueConfig } from "@/config/league";
-import { FOREVER, cacheHas, cachedFetch, getCached } from "@/lib/cache";
+import { FOREVER, cacheHas, cachedFetch, getCached, setCached } from "@/lib/cache";
 import type { GlobalHeroStat } from "@/lib/scoring/metaPressure";
 import type {
   HeroMapStat,
@@ -357,54 +357,61 @@ export async function getNgsReplayData(
 ): Promise<HpReplayData | null> {
   const key = `hp-v1-ngs-replay-${replayId}`;
   const existing = await getCached<HpReplayData>(key, FOREVER);
+  // Forever hits must have real battletags (not draft-only unknown-* shells).
+  if (
+    existing?.players?.length &&
+    existing.players.some((p) => p.battletag && !p.battletag.startsWith("unknown-"))
+  ) {
+    return existing;
+  }
+  // Soft draft-only shell still usable for comps within TTL.
   if (existing?.players?.length) return existing;
 
+  const asDraftShell = (picks: ReturnType<typeof normalizeDraft>): HpReplayData => {
+    const real = picks.filter((e) => !isBanEntry(e) && heroName(e.hero || e));
+    return {
+      players: real.map((e, idx) => {
+        const hero = heroName(e.hero || e);
+        const team = typeof e.team === "number" ? e.team : idx < 5 ? 0 : 1;
+        return {
+          battletag: `unknown-${team}-${hero}`,
+          hero,
+          team,
+          winner: false,
+        };
+      }),
+      winner_team: undefined,
+    };
+  };
+
   try {
+    // 1) Cheap draft API first — soft-cache only (never forever with unknown tags).
+    try {
+      const [draftRaw, bansRaw] = await Promise.all([
+        hpGet<unknown>(`replay/${replayId}/draft`),
+        hpGet<unknown>(`replay/${replayId}/bans`).catch(() => null),
+      ]);
+      const draft = normalizeDraft(draftRaw);
+      normalizeBans(bansRaw);
+      const picks = draft.filter((e) => !isBanEntry(e) && heroName(e.hero || e));
+      if (picks.length >= 5) {
+        const shell = asDraftShell(draft);
+        await setCached(key, shell, 6 * 60 * 60 * 1000);
+        return shell;
+      }
+    } catch (err) {
+      if (
+        err instanceof HeroesProfileError &&
+        (err.status === 401 || err.status === 403)
+      ) {
+        throw err;
+      }
+    }
+
+    // 2) Full NGS replay — forever-cache real battletags / winners.
     return await cachedFetch(
       key,
       async () => {
-        // 1) Component APIs (replay_draft / replay_ban — typically ~10x ngs_replay_data)
-        try {
-          const [draftRaw, bansRaw] = await Promise.all([
-            hpGet<unknown>(`replay/${replayId}/draft`),
-            hpGet<unknown>(`replay/${replayId}/bans`).catch(() => null),
-          ]);
-          const draft = normalizeDraft(draftRaw);
-          const banSides = normalizeBans(bansRaw);
-          const picks = draft.filter((e) => !isBanEntry(e) && heroName(e.hero || e));
-          if (picks.length >= 5) {
-            const players: HpReplayData["players"] = picks.map((e, idx) => {
-              const hero = heroName(e.hero || e);
-              const team =
-                typeof e.team === "number" ? e.team : idx < 5 ? 0 : 1;
-              return {
-                battletag: `unknown-${team}-${hero}`,
-                hero,
-                team,
-                winner: false,
-              };
-            });
-            // Attach bans onto a side channel via empty battletags is awkward;
-            // full ngs/replay is better when we need winners/tags. Still usable for comps.
-            if (banSides[0]?.length || banSides[1]?.length) {
-              /* bans consumed in getNgsMatch via separate cache */
-            }
-            return {
-              players,
-              winner_team: undefined,
-            } satisfies HpReplayData;
-          }
-        } catch (err) {
-          if (
-            err instanceof HeroesProfileError &&
-            (err.status === 401 || err.status === 403)
-          ) {
-            throw err;
-          }
-          // Fall through to full NGS replay
-        }
-
-        // 2) Full NGS replay (ngs_replay_data — scarce; last resort)
         const raw = await hpGet<V1NgsReplay>(`ngs/replay/${replayId}`);
         const players: HpReplayData["players"] = [];
         const teams = raw.players ?? [];
@@ -424,7 +431,6 @@ export async function getNgsReplayData(
         });
 
         if (!players.length) {
-          // Quota / empty — do not forever-cache
           throw new HeroesProfileError(
             `Empty NGS replay ${replayId}`,
             404,

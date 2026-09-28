@@ -72,7 +72,7 @@ export function HeroFace({
               x2="92"
               y2="8"
               stroke="#e11d48"
-              strokeWidth="10"
+              strokeWidth="4"
               strokeLinecap="round"
             />
           </svg>

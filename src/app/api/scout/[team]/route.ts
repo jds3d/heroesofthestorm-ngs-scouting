@@ -16,7 +16,9 @@ import {
   loadSavedHomeReport,
   loadSavedHomeRoster,
   loadScoutReport,
+  reportKey,
 } from "@/lib/scout/reportCache";
+import { setCached } from "@/lib/cache";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 120;
@@ -139,6 +141,13 @@ export async function GET(request: Request, context: RouteContext) {
         mapStats,
       });
     });
+
+    // Persist enrichments so fallback / estimate see draftMeta + final plan.
+    await setCached(
+      reportKey(teamName, theirs.length ? theirs : undefined),
+      report,
+      leagueConfig.reportTtlMs,
+    );
 
     if (report.apiUsage) {
       report.apiUsage = {

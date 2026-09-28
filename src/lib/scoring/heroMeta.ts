@@ -128,7 +128,26 @@ const HERO_ALIASES: Record<string, string> = {
 };
 
 export function heroKey(hero: string): string {
-  return HERO_ALIASES[hero] ?? hero;
+  const trimmed = hero.trim();
+  const aliased = HERO_ALIASES[trimmed] ?? trimmed;
+  // Case-fold so "qhira" and "Qhira" collide; keep display names elsewhere.
+  const lower = aliased.toLowerCase();
+  for (const [name, canon] of Object.entries(HERO_ALIASES)) {
+    if (name.toLowerCase() === lower || canon.toLowerCase() === lower) {
+      return canon;
+    }
+  }
+  for (const name of Object.keys(HERO_META)) {
+    if (name.toLowerCase() === lower) return name;
+  }
+  return aliased;
+}
+
+/** Battletag without the #discriminator — for UI labels. */
+export function shortBattletag(tag: string | null | undefined): string | null {
+  if (!tag) return null;
+  const base = tag.split("#")[0]?.trim();
+  return base || null;
 }
 
 /** Every spelling that should count as this hero already being taken. */

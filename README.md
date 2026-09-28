@@ -15,7 +15,13 @@ Edit `.env.local`:
 
 ```
 HEROESPROFILE_API_TOKEN=your_token_here
+
+# Optional but recommended for the public tunnel — gates all /api/* routes.
+SCOUT_API_SECRET=pick-a-long-random-string
+NEXT_PUBLIC_SCOUT_API_SECRET=pick-a-long-random-string
 ```
+
+(Use the same value for both so the browser can send `x-scout-secret`.)
 
 3. Install and run (dev):
 
@@ -27,26 +33,31 @@ npm run dev
 Or run as a Docker container (recommended for always-on local use):
 
 ```bash
-docker compose up -d --build
+# --env-file so NEXT_PUBLIC_SCOUT_API_SECRET is available at *build* time
+# (.env.local is dockerignored and otherwise never reaches `next build`).
+docker compose --env-file .env.local up -d --build
 ```
 
-Open [http://localhost:3000](http://localhost:3000).
+Open [http://localhost:3000](http://localhost:3000) in Chrome/Edge (not the Cursor Simple Browser — it cannot load localhost).
 
 ### Auto-start on PC boot
 
 Docker Desktop starts at login. The app and Cloudflare tunnel both use `restart: unless-stopped`.
 
 - Local: [http://localhost:3000](http://localhost:3000)
-- Public: [https://ngs-scouting.jstaff.trade](https://ngs-scouting.jstaff.trade)
+- Public: [https://ngs-scouting.jstaff.trade](https://ngs-scouting.jstaff.trade) (Cloudflare Access Google sign-in)
 
 Useful commands:
 
 ```bash
-docker compose up -d --build   # build / (re)start app + tunnel
-docker compose logs -f         # follow logs
-docker compose stop            # stop until next reboot / until you start again
-docker compose down            # stop and remove containers
+docker compose --env-file .env.local up -d --build
+docker compose logs -f ngs-scouting
+docker compose restart tunnel
+docker compose stop
+docker compose down
+npm test
 ```
+
 ## Usage
 
 1. Choose an A-league opponent from the dropdown (home team is excluded).

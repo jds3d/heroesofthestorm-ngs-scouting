@@ -33,7 +33,7 @@ export async function loadSavedHomeReport(
   return newest?.data ?? null;
 }
 
-const reportKey = (teamName: string, starters?: string[]) => {
+export const reportKey = (teamName: string, starters?: string[]) => {
   const base = `scout-report-${teamName}`;
   if (!starters?.length) return base;
   return `${base}::${[...starters].sort((a, b) => a.localeCompare(b)).join("|")}`;
@@ -103,7 +103,11 @@ async function buildScoutReport(
     }
 
     const report = await generateScoutReport(teamName, starters);
-    await setCached(reportKey(teamName, starters), report, leagueConfig.cacheTtlMs);
+    await setCached(
+      reportKey(teamName, starters),
+      report,
+      leagueConfig.reportTtlMs,
+    );
     return report;
   } catch (err) {
     if (!fallback) throw err;

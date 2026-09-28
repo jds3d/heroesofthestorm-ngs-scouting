@@ -22,14 +22,9 @@ import {
 } from "@/lib/ngs/client";
 import type { NgsMatch } from "@/lib/ngs/types";
 import { draftHeroPool } from "@/lib/scout/draftHeroPool";
+import { reportKey } from "@/lib/scout/reportCache";
 import type { ScoutReport } from "@/lib/scoring/types";
 import { heroKey } from "@/lib/scoring/heroMeta";
-
-const reportCacheKey = (teamName: string, starters?: string[]) => {
-  const base = `scout-report-${teamName}`;
-  if (!starters?.length) return base;
-  return `${base}::${[...starters].sort((a, b) => a.localeCompare(b)).join("|")}`;
-};
 
 /** Same heroes the post-scout matchup pass will request — not the whole dive book. */
 async function matchupHeroesForEstimate(
@@ -37,7 +32,7 @@ async function matchupHeroesForEstimate(
   starters?: string[],
 ): Promise<string[]> {
   const saved = await readCacheEntry<ScoutReport>(
-    reportCacheKey(teamName, starters),
+    reportKey(teamName, starters),
   );
   if (saved?.data) {
     const fromReport = draftHeroPool(saved.data);
@@ -61,7 +56,7 @@ async function matchupHeroesForEstimate(
   }
 
   const home = await readCacheEntry<ScoutReport>(
-    reportCacheKey(leagueConfig.homeTeam),
+    reportKey(leagueConfig.homeTeam),
   );
   if (home?.data) {
     for (const h of draftHeroPool(home.data)) names.add(h);
@@ -123,14 +118,19 @@ export async function predictScoutCalls(
   const pendingMatchups = await countPendingMatchupCalls(matchupProbe);
   if (pendingMatchups > 0) add("hp-hero-matchups", pendingMatchups);
 
-  // Current-season NGS schedule: 24h cache. Count a live pull only on
-  // refresh or cache miss.
+  // Current-season NGS schedule: count a live pull only on refresh or cache miss.
+  // Estimate is read-only — never pass fresh:true (generate owns refresh pulls).
   const seasonKey = teamMatchesCacheKey(teamName, leagueConfig.season);
   const seasonCached = await cacheHas(seasonKey);
   if (refreshPlayerData || !seasonCached) add("ngs-schedule", 1);
-  const matches = await getTeamMatches(teamName, leagueConfig.season, {
-    fresh: refreshPlayerData,
-  });
+  let matches =
+    (await getCached<NgsMatch[]>(seasonKey, leagueConfig.scheduleTtlMs)) ?? [];
+  if (!matches.length && !refreshPlayerData) {
+    // Cold cache: one normal pull so round estimates work; not a refresh.
+    matches = await getTeamMatches(teamName, leagueConfig.season).catch(
+      () => [],
+    );
+  }
 
   const reported = matches.filter((m) => m.reported);
 
@@ -145,9 +145,7 @@ export async function predictScoutCalls(
   const priorKey = teamMatchesCacheKey(teamName, leagueConfig.priorSeason);
   const priorCached = await getCached<NgsMatch[]>(priorKey, FOREVER);
   if (refreshPlayerData || !priorCached) add("ngs-schedule");
-  if (!priorCached) {
-    await getTeamMatches(teamName, leagueConfig.priorSeason).catch(() => []);
-  }
+  // Do not fetch prior season here — generate owns that pull.
 
   for (const tag of tags) {
     const slKey = `hp-v1-hero-all-${tag}-Storm League-${leagueConfig.stormLeagueStartDate}`;

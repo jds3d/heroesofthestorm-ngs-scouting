@@ -43,9 +43,13 @@ function isFresh(
   envelope: CacheEnvelope<unknown>,
   now = Date.now(),
 ): boolean {
+  // Explicit TTL always wins — even on "immutable" key prefixes
+  // (used for draft-only soft shells on replay keys).
+  if (envelope.ttlMs != null) {
+    return now - envelope.storedAt <= envelope.ttlMs;
+  }
   if (isImmutableGameCacheKey(key)) return true;
-  if (envelope.ttlMs == null) return true;
-  return now - envelope.storedAt <= envelope.ttlMs;
+  return true;
 }
 
 async function readDisk<T>(key: string): Promise<CacheEnvelope<T> | null> {
@@ -204,6 +208,7 @@ export async function cachedFetch<T>(
   key: string,
   fetcher: () => Promise<T>,
   ttlMs: number | null = leagueConfig.cacheTtlMs,
+  opts?: { isEmpty?: (data: T) => boolean },
 ): Promise<T> {
   const effectiveTtl = isImmutableGameCacheKey(key) ? FOREVER : ttlMs;
   const hit = await getCached<T>(key, effectiveTtl);
@@ -215,8 +220,15 @@ export async function cachedFetch<T>(
   const promise = (async () => {
     const data = await fetcher();
     // Never forever-cache empty / failed payloads — retry later when quota recovers.
-    if (data !== null && data !== undefined) {
+    const hollow =
+      data === null ||
+      data === undefined ||
+      (opts?.isEmpty?.(data) ?? isHollowCachePayload(data));
+    if (!hollow) {
       await setCached(key, data, effectiveTtl);
+    } else if (effectiveTtl !== FOREVER) {
+      // Volatile keys: still cache empties briefly so we don't hammer the API.
+      await setCached(key, data, Math.min(effectiveTtl ?? 0, 60 * 60 * 1000) || 60 * 60 * 1000);
     }
     return data;
   })().finally(() => {
@@ -225,4 +237,28 @@ export async function cachedFetch<T>(
 
   inflight.set(key, promise);
   return promise;
+}
+
+/** Empty arrays / double-empty ban sides should not lock forever. */
+function isHollowCachePayload(data: unknown): boolean {
+  if (Array.isArray(data)) {
+    if (data.length === 0) return true;
+    // Ban sides: [[], []]
+    if (
+      data.length === 2 &&
+      Array.isArray(data[0]) &&
+      Array.isArray(data[1]) &&
+      data[0].length === 0 &&
+      data[1].length === 0
+    ) {
+      return true;
+    }
+  }
+  if (data && typeof data === "object") {
+    const rec = data as Record<string, unknown>;
+    if ("players" in rec && Array.isArray(rec.players) && rec.players.length === 0) {
+      return true;
+    }
+  }
+  return false;
 }

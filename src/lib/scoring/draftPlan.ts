@@ -462,14 +462,23 @@ export function buildDraftPlan(
   const canBait = certainty !== "low" && key !== "default" && baitBans.length > 0;
   const runHeavyDive = key === "poke/siege" || key === "hypercarry";
 
-  const antiDiveHeroesSeen = [
+  const hardAntiDiveSeen = [
     ...predicted.map((p) => p.hero),
     ...players.flatMap((p) => p.topHeroes.slice(0, 3).map((h) => h.hero)),
   ].filter((h, i, arr) =>
     (divePlaybook.antiDiveHeroes as readonly string[]).includes(h) &&
     arr.indexOf(h) === i,
   );
-  const antiDiveThreat = antiDiveHeroesSeen.length > 0;
+  const softAntiDiveSeen = [
+    ...predicted.map((p) => p.hero),
+    ...players.flatMap((p) => p.topHeroes.slice(0, 3).map((h) => h.hero)),
+  ].filter((h, i, arr) =>
+    (divePlaybook.softAntiDiveHeroes as readonly string[]).includes(h) &&
+    arr.indexOf(h) === i,
+  );
+  // Falstad counts as hard anti-dive: if we are on dive, they take Gust.
+  const antiDiveHeroesSeen = [...hardAntiDiveSeen, ...softAntiDiveSeen];
+  const antiDiveThreat = hardAntiDiveSeen.length > 0;
   const chosen = antiDiveThreat ? chooseDivePivot(antiDiveHeroesSeen) : null;
   // When anti-dive is already in their pool, the *plan five* must follow the
   // pivot — not keep drafting Anub/Rehgar dive while the playbook says leave.
@@ -597,7 +606,7 @@ export function buildDraftPlan(
     undefined,
     allowDoubleHealer,
   );
-  const base = ourLikelyComp(home, planSlots, planKey, leaveDive);
+  const base = ourLikelyComp(home, planSlots, planKey, leaveDive, true);
   const ourVsTheirHeroes = dropClaimedHeroes(
     base.picks,
     claimKeys(theirLikely.map((p) => p.hero)),
@@ -716,7 +725,7 @@ export function buildDraftPlan(
     fight: answer.fight,
     counter: answer.counter,
     macro,
-    slots: answer.slots,
+    slots: planSlots,
     steps,
     theirLikely,
     ourLikely: ours.picks,
@@ -1371,6 +1380,115 @@ function comfortSlotScore(
   return comfort + named + tagHit + coreHit + roleFit;
 }
 
+export function solveSeatAssignments(args: {
+  players: PlayerScout[];
+  slots: DraftPlanSlot[];
+  preferredTags?: string[];
+  allowSeatReshuffle?: boolean;
+}): Array<{
+  player: string | null;
+  hero: string;
+  role: string;
+  score: number;
+}> {
+  const slots = args.slots ?? [];
+  const players = args.players ?? [];
+  const preferredTags = args.preferredTags ?? [];
+  const allowSeatReshuffle = args.allowSeatReshuffle ?? true;
+
+  if (!allowSeatReshuffle || !slots.length || !players.length) {
+    return slots.map((slot) => ({
+      player: null,
+      hero: slot.heroes[0] ?? "Open",
+      role: slot.role,
+      score: 0,
+    }));
+  }
+
+  const candidateMap = slots.map((slot) => {
+    const options: Array<{ player: string; hero: string; score: number }> = [];
+    for (const p of players) {
+      const player = playerName(p.battletag);
+      for (const h of p.topHeroes) {
+        if (!slotFits(slot.role, heroRole(h.hero), h.hero, slot.heroes)) continue;
+        options.push({
+          player,
+          hero: h.hero,
+          score: comfortSlotScore(h.hero, h.comfort, slot, preferredTags),
+        });
+      }
+    }
+    return options.sort((a, b) => b.score - a.score);
+  });
+
+  const best = {
+    total: Number.NEGATIVE_INFINITY,
+    picks: [] as Array<{ player: string | null; hero: string; role: string; score: number }>,
+  };
+
+  const dfs = (
+    slotIndex: number,
+    usedPlayers: Set<string>,
+    usedHeroes: Set<string>,
+    total: number,
+    picks: Array<{ player: string | null; hero: string; role: string; score: number }>,
+  ) => {
+    if (slotIndex === slots.length) {
+      if (total > best.total) {
+        best.total = total;
+        best.picks = picks.map((pick) => ({ ...pick }));
+      }
+      return;
+    }
+
+    const slot = slots[slotIndex];
+    const options = candidateMap[slotIndex];
+    if (!options.length) {
+      const hero = slot.heroes.find((h) => !usedHeroes.has(heroKey(h))) ?? "Open";
+      picks.push({
+        player: null,
+        hero,
+        role: slot.role,
+        score: 0,
+      });
+      dfs(slotIndex + 1, usedPlayers, new Set(usedHeroes), total, picks);
+      picks.pop();
+      return;
+    }
+
+    for (const option of options) {
+      if (usedPlayers.has(option.player) || usedHeroes.has(heroKey(option.hero))) {
+        continue;
+      }
+      const nextPlayers = new Set(usedPlayers);
+      const nextHeroes = new Set(usedHeroes);
+      nextPlayers.add(option.player);
+      nextHeroes.add(heroKey(option.hero));
+      picks.push({
+        player: option.player,
+        hero: option.hero,
+        role: slot.role,
+        score: option.score,
+      });
+      dfs(slotIndex + 1, nextPlayers, nextHeroes, total + option.score, picks);
+      picks.pop();
+    }
+  };
+
+  dfs(0, new Set<string>(), new Set<string>(), 0, []);
+
+  if (!best.picks.length) {
+    return slots.map((slot) => ({
+      player: null,
+      hero: slot.heroes[0] ?? "Open",
+      role: slot.role,
+      score: 0,
+    }));
+  }
+
+  return best.picks;
+}
+
 /**
  * Seat OP / priority pockets first (Qhira), then fill the rest around them.
  * When anti-dive forced a pivot, she stays — the shell changes, not the pocket.
@@ -1380,6 +1498,7 @@ function ourLikelyComp(
   slots: DraftPlanSlot[],
   answerKey = "default",
   leaveDive = false,
+  allowSeatReshuffle = true,
 ): { picks: DraftCompPick[]; note: string | null } {
   const preferredTags = preferredTagsForAnswer(answerKey);
   const coreNote = leaveDive
@@ -1402,137 +1521,20 @@ function ourLikelyComp(
     };
   }
 
-  const usedH = new Set<string>();
-  const usedP = new Set<string>();
-  const picks: (DraftCompPick | null)[] = slots.map(() => null);
-
-  const tryPlace = (
-    slotIndex: number,
-    hero: string,
-    player: string,
-    name: string,
-    note: string,
-  ): boolean => {
-    if (picks[slotIndex]) return false;
-    if (usedH.has(heroKey(hero))) return false;
-    if (setHasPlayer(usedP, player) || setHasPlayer(usedP, name)) return false;
-    usedH.add(heroKey(hero));
-    markPlayer(usedP, player);
-    markPlayer(usedP, name);
-    picks[slotIndex] = {
-      role: slots[slotIndex].role,
-      hero,
-      player: name,
-      note,
-    };
-    return true;
-  };
-
-  // 1) Lock priority dive cores (Qhira) onto the best-fitting damage seat.
-  type CoreHit = {
-    hero: string;
-    player: string;
-    name: string;
-    comfort: number;
-    slotIndex: number;
-    score: number;
-  };
-  const cores: CoreHit[] = [];
-  for (const p of home) {
-    const name = playerName(p.battletag);
-    for (const h of p.topHeroes) {
-      if (
-        !divePlaybook.priorityDiveCores.some(
-          (c) => heroKey(c) === heroKey(h.hero),
-        )
-      ) {
-        continue;
-      }
-      slots.forEach((slot, slotIndex) => {
-        if (
-          !slotFits(slot.role, heroRole(h.hero), h.hero, slot.heroes)
-        ) {
-          return;
-        }
-        // Prefer ranged / flex / follow / burst seats over tank/heal/offlane.
-        const r = slot.role.toLowerCase();
-        if (r.includes("tank") || r.includes("heal") || r.includes("off")) {
-          return;
-        }
-        cores.push({
-          hero: h.hero,
-          player: p.battletag,
-          name,
-          comfort: h.comfort,
-          slotIndex,
-          score:
-            comfortSlotScore(h.hero, h.comfort, slot, preferredTags) +
-            (r.includes("flex") ||
-            r.includes("follow") ||
-            r.includes("threat") ||
-            r.includes("burst")
-              ? 0.05
-              : 0),
-        });
-      });
-    }
-  }
-  cores.sort((a, b) => b.score - a.score || b.comfort - a.comfort);
-  for (const c of cores) {
-    if (tryPlace(c.slotIndex, c.hero, c.player, c.name, coreNote)) {
-      break;
-    }
-  }
-
-  // 2) Fill remaining seats by comfort vs the answer shape.
-  slots.forEach((slot, slotIndex) => {
-    if (picks[slotIndex]) return;
-    let best: { hero: string; player: string; name: string; score: number } | null =
-      null;
-    for (const p of home) {
-      const name = playerName(p.battletag);
-      if (setHasPlayer(usedP, p.battletag) || setHasPlayer(usedP, name)) continue;
-      for (const h of p.topHeroes) {
-        if (usedH.has(heroKey(h.hero))) continue;
-        if (!slotFits(slot.role, heroRole(h.hero), h.hero, slot.heroes)) continue;
-        const score = comfortSlotScore(h.hero, h.comfort, slot, preferredTags);
-        if (!best || score > best.score) {
-          best = { hero: h.hero, player: p.battletag, name, score };
-        }
-      }
-    }
-    if (best) {
-      tryPlace(
-        slotIndex,
-        best.hero,
-        best.player,
-        best.name,
-        slot.heroes.some((n) => heroKey(n) === heroKey(best.hero))
-          ? "matches the plan"
-          : "closest comfort we have",
-      );
-    } else {
-      const hero = slot.heroes.find((h) => !usedH.has(heroKey(h)));
-      if (hero) usedH.add(heroKey(hero));
-      picks[slotIndex] = {
-        role: slot.role,
-        hero: hero ?? "Open",
-        player: null,
-        note: "not in our saved pool",
-      };
-    }
+  const optimized = solveSeatAssignments({
+    players: home,
+    slots,
+    preferredTags,
+    allowSeatReshuffle,
   });
 
   return {
-    picks: picks.map(
-      (p, i) =>
-        p ?? {
-          role: slots[i].role,
-          hero: "Open",
-          player: null,
-          note: "not in our saved pool",
-        },
-    ),
+    picks: optimized.map((pick) => ({
+      role: pick.role,
+      hero: pick.hero,
+      player: pick.player,
+      note: pick.player ? "seat optimized" : "not in our saved pool",
+    })),
     note: leaveDive
       ? "Anti-dive on their side — shell is the pivot; Qhira stays if she was open."
       : null,
@@ -1594,10 +1596,10 @@ function fourManBruiserFitness(hero: string): number {
 }
 
 /**
- * Human-readable seat for the plan UI — never call a Bruiser "Ranged"
- * just because they filled a damage template slot.
- * Never call Kael'thas / Valla "Offlane" just because they sat in that seat.
- * Dehaka / Sonya / etc. show as Offlane even when the raw role is Bruiser.
+ * Human-readable seat for the plan UI.
+ * Core seats are always Tank / Healer / Offlane.
+ * The last two are the damage Assassin seat and the open Flex seat, regardless
+ * of the currently slotted hero's raw class.
  */
 export function planSeatJob(p: DraftCompPick): string {
   const slot = p.role.toLowerCase();
@@ -1613,9 +1615,20 @@ export function planSeatJob(p: DraftCompPick): string {
   if (slot.includes("off") || slot.includes("solo") || slot.includes("clear")) {
     if (heroIsOfflaner(p.hero)) return "Offlane";
   }
-  if (actual === "Bruiser" || actual.includes("Melee")) return "4-man";
-  if (actual.includes("Ranged")) return "Ranged";
-  if (slot.includes("flex")) return "Flex";
+  if (slot.includes("flex") || slot.includes("4-man")) return "Flex";
+  if (
+    slot.includes("range") ||
+    slot.includes("siege") ||
+    slot.includes("percent") ||
+    slot.includes("poke") ||
+    slot.includes("burst") ||
+    slot.includes("follow") ||
+    slot.includes("assassin")
+  ) {
+    return "Assassin";
+  }
+  if (actual.includes("Assassin") || actual.includes("Ranged")) return "Assassin";
+  if (actual === "Bruiser" || actual.includes("Melee")) return "Flex";
   if (actual === "Tank") return "Tank";
   return actual;
 }

@@ -3,6 +3,7 @@
  * Score the two locks as a pair so tank+offlane (etc.) stay coherent.
  */
 import {
+  heroIsOfflaner,
   planHasOfflane,
   planHasRangedDamage,
   planHasWaveclear,
@@ -117,9 +118,18 @@ export function pairStructureDelta(
   const afterRoles = after.map((p) => heroRole(p.hero));
   const hasTank = afterRoles.some((r) => r === "Tank");
   const hasHeal = afterRoles.some((r) => r === "Healer" || r === "Support");
+  const tankHero = after.find((p) => heroRole(p.hero) === "Tank")?.hero ?? null;
+  const healHero =
+    after.find((p) => {
+      const r = heroRole(p.hero);
+      return r === "Healer" || r === "Support";
+    })?.hero ?? null;
+  const offHero = after.find((p) => heroIsOfflaner(p.hero))?.hero ?? null;
   if (hasTank && hasHeal && hasOff) {
     points += 8;
-    bits.push("Core seats covered (tank / heal / offlane)");
+    bits.push(
+      `Core seats covered: ${tankHero ?? "tank"} (tank) / ${healHero ?? "heal"} (heal) / ${offHero ?? "offlane"} (offlane)`,
+    );
   } else if (!hasTank) {
     points -= 24;
     bits.push("No tank after both locks");
@@ -134,13 +144,19 @@ export function pairDuoSynergy(
   a: string,
   b: string,
 ): { points: number; detail: string } {
-  const edges = liveAllySynergies(table, a, [b]);
-  const edge = edges[0];
+  const edges = [
+    ...liveAllySynergies(table, a, [b]).map((edge) => ({ ...edge, hero: a })),
+    ...liveAllySynergies(table, b, [a]).map((edge) => ({ ...edge, hero: b })),
+  ];
+  const edge = edges.sort((left, right) => right.games - left.games || Math.abs(right.deltaPp) - Math.abs(left.deltaPp))[0];
   if (!edge) {
-    const meta = heroDraftMeta(table, a);
-    const raw = meta.synergiesWith.find(
-      (s) => heroKey(s.hero) === heroKey(b),
-    );
+    const raw =
+      heroDraftMeta(table, a).synergiesWith.find(
+        (s) => heroKey(s.hero) === heroKey(b),
+      ) ??
+      heroDraftMeta(table, b).synergiesWith.find(
+        (s) => heroKey(s.hero) === heroKey(a),
+      );
     if (!raw) {
       return { points: 0, detail: "No duo sample between these two yet" };
     }
@@ -223,23 +239,6 @@ export function rankDoublePickPairs(args: {
       const projected = args.projectBoth(first.hero, second.hero);
       const structure = pairStructureDelta(args.beforePlan, projected);
 
-      let orderPts = 0;
-      const orderBits: string[] = [];
-      const cFirst = args.contested(first.hero);
-      const cSecond = args.contested(second.hero);
-      if (cFirst && !cSecond) {
-        orderPts += 8;
-        orderBits.push(`Lock ${first.hero} first — they may want it`);
-      } else if (!cFirst && cSecond) {
-        orderPts -= 6;
-        orderBits.push(
-          `Locking ${first.hero} first leaves contested ${second.hero} for next`,
-        );
-      }
-      if (firstSolo >= secondSolo) {
-        orderPts += 2;
-      }
-
       const pairFactors = [
         {
           id: "duo",
@@ -255,18 +254,10 @@ export function rankDoublePickPairs(args: {
             ? structure.bits.join(" · ")
             : "No structural change",
         },
-        {
-          id: "order",
-          label: "Lock order",
-          points: Math.round(orderPts),
-          detail: orderBits.length
-            ? orderBits.join(" · ")
-            : `Lock ${first.hero} now, then ${second.hero}`,
-        },
       ];
 
       const total = Math.round(
-        firstSolo + secondSolo + duo.points + structure.points + orderPts,
+        firstSolo + secondSolo + duo.points + structure.points,
       );
 
       return {

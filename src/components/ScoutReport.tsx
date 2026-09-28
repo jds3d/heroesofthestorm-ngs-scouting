@@ -444,6 +444,7 @@ export function ScoutReportView({ report }: { report: ScoutReport }) {
               }
               ourLabel="Little Buff Boyz"
               theirLabel={report.teamName}
+              allowSeatReshuffle={true}
             />
           </div>
 
@@ -779,33 +780,40 @@ function ArchetypeStatBlock({
         Archetype
       </p>
       <p className="mt-1 cursor-help text-sm text-[var(--ink)]">{body}</p>
+      {/*
+        Hover bridge: outer `pt-2` keeps :hover while moving from the card
+        into the panel (so the scrollbar is reachable). Do not use
+        pointer-events-none on the panel.
+      */}
       <div
         role="tooltip"
-        className="pointer-events-none absolute left-0 top-full z-30 mt-2 hidden w-[min(22rem,calc(100vw-2rem))] rounded-md border border-[var(--line)] bg-[var(--panel)] px-3 py-2.5 text-left shadow-lg group-hover:block group-focus-within:block"
+        className="absolute left-0 top-full z-30 hidden w-[min(22rem,calc(100vw-2rem))] pt-2 group-hover:block group-focus-within:block"
       >
-        <p className="mb-2 text-[10px] font-semibold uppercase tracking-wide text-[var(--muted)]">
-          Fight shapes · their lean{leaders.length > 1 ? "s" : ""} in bold
-        </p>
-        <ul className="max-h-72 space-y-2 overflow-y-auto text-xs leading-snug text-[var(--ink)]">
-          {rows.map((row) => (
-            <li
-              key={row.name}
-              className={row.preferred ? "font-bold" : "font-normal"}
-            >
-              <span>{row.name}</span>
-              {row.pct != null && row.pct > 0 ? (
+        <div className="rounded-md border border-[var(--line)] bg-[var(--panel)] px-3 py-2.5 text-left shadow-lg">
+          <p className="mb-2 text-[10px] font-semibold uppercase tracking-wide text-[var(--muted)]">
+            Fight shapes · their lean{leaders.length > 1 ? "s" : ""} in bold
+          </p>
+          <ul className="max-h-72 space-y-2 overflow-y-auto text-xs leading-snug text-[var(--ink)]">
+            {rows.map((row) => (
+              <li
+                key={row.name}
+                className={row.preferred ? "font-bold" : "font-normal"}
+              >
+                <span>{row.name}</span>
+                {row.pct != null && row.pct > 0 ? (
+                  <span className="font-normal text-[var(--muted)]">
+                    {" "}
+                    ({row.pct}%)
+                  </span>
+                ) : null}
                 <span className="font-normal text-[var(--muted)]">
                   {" "}
-                  ({row.pct}%)
+                  — {row.description}
                 </span>
-              ) : null}
-              <span className="font-normal text-[var(--muted)]">
-                {" "}
-                — {row.description}
-              </span>
-            </li>
-          ))}
-        </ul>
+              </li>
+            ))}
+          </ul>
+        </div>
       </div>
     </div>
   );

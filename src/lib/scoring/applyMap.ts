@@ -1,9 +1,16 @@
-import { divePlaybook, chooseDivePivot } from "@/config/divePlaybook";
+import {
+  chooseDivePivot,
+  divePlaybook,
+  pivotPlanSlots,
+} from "@/config/divePlaybook";
 import { ngsMapByName, type NgsMap } from "@/config/ngsMaps";
 import { mapBriefForSelectedMap } from "@/lib/scoring/draftPlan";
+import { heroKey, heroRole } from "@/lib/scoring/heroMeta";
 import type {
+  DraftCompPick,
   DraftInsights,
   DraftPlan,
+  DraftPlanSlot,
   DraftPlaybookPivot,
   OurCompBrief,
 } from "@/lib/scoring/types";
@@ -86,6 +93,54 @@ function patchBrief(
   };
 }
 
+/** Remap an existing five onto new pivot seats — keep players, swap heroes when roles match. */
+function remapLikelyToSlots(
+  current: DraftCompPick[],
+  slots: DraftPlanSlot[],
+): DraftCompPick[] {
+  if (!slots.length) return current;
+  const used = new Set<string>();
+  const out: DraftCompPick[] = [];
+  for (const slot of slots) {
+    const preferred = slot.heroes.find((h) => {
+      const k = heroKey(h);
+      if (used.has(k)) return false;
+      return current.some((c) => heroKey(c.hero) === k);
+    });
+    const fromCurrent = preferred
+      ? current.find((c) => heroKey(c.hero) === heroKey(preferred))
+      : current.find((c) => {
+          const k = heroKey(c.hero);
+          if (used.has(k)) return false;
+          const role = heroRole(c.hero).toLowerCase();
+          const slotRole = slot.role.toLowerCase();
+          return (
+            role.includes(slotRole.split(" ")[0] ?? "") ||
+            slotRole.includes(role.split(" ")[0] ?? "") ||
+            slot.heroes.some((h) => heroKey(h) === k)
+          );
+        });
+    const hero =
+      preferred ??
+      fromCurrent?.hero ??
+      slot.heroes.find((h) => !used.has(heroKey(h))) ??
+      slot.heroes[0];
+    if (!hero) continue;
+    used.add(heroKey(hero));
+    const player =
+      current.find((c) => heroKey(c.hero) === heroKey(hero))?.player ??
+      fromCurrent?.player ??
+      null;
+    out.push({
+      role: slot.role,
+      hero,
+      player,
+      note: `Map pivot — ${slot.why}`,
+    });
+  }
+  return out.length === slots.length ? out : current;
+}
+
 /** Rewrite plan text / playbook for the selected NGS map. */
 export function applyMapToDraftPlan(
   plan: DraftPlan,
@@ -96,6 +151,10 @@ export function applyMapToDraftPlan(
   const map = ngsMapByName(mapName);
   if (!map) return plan;
 
+  const prevPivotId = plan.playbook?.recommended?.id ?? null;
+  let nextSlots = plan.slots;
+  let nextOurLikely = plan.ourLikely;
+
   const playbook = plan.playbook
     ? (() => {
         if (!plan.playbook.antiDiveThreat) {
@@ -105,6 +164,16 @@ export function applyMapToDraftPlan(
           };
         }
         const next = pivotForMap(plan.playbook.antiDiveHeroesSeen, map);
+        // Rebuild seats when the map changes the recommended pivot.
+        if (next.recommended.id !== prevPivotId) {
+          const pivot = divePlaybook.pivots.find(
+            (p) => p.id === next.recommended.id,
+          );
+          if (pivot) {
+            nextSlots = pivotPlanSlots(pivot);
+            nextOurLikely = remapLikelyToSlots(plan.ourLikely, nextSlots);
+          }
+        }
         return {
           ...plan.playbook,
           intro: `Map locked: ${map.name}. Their pool has anti-dive — leave Genji / Greymane / Kerrigan, keep Qhira if open, and take the pivot below.`,
@@ -127,12 +196,20 @@ export function applyMapToDraftPlan(
       mapTendencies: [{ map: map.name, games: 0, wins: 0, winRate: 0 }],
     } as DraftInsights);
 
-  const patchSide = (side: DraftPlan["sides"]["theyFirst"]) => ({
-    ...side,
-    // Keep the lobby plan; do not prepend the map one-liner on top of it.
-    summary: side.summary,
-    ourBrief: patchBrief(side.ourBrief, side.ourLikely, map.name, draftStub),
-  });
+  const patchSide = (
+    side: DraftPlan["sides"]["theyFirst"],
+  ): DraftPlan["sides"]["theyFirst"] => {
+    const ourLikely =
+      nextOurLikely !== plan.ourLikely
+        ? remapLikelyToSlots(side.ourLikely, nextSlots)
+        : side.ourLikely;
+    return {
+      ...side,
+      summary: side.summary,
+      ourLikely,
+      ourBrief: patchBrief(side.ourBrief, ourLikely, map.name, draftStub),
+    };
+  };
 
   const rec = playbook?.recommended;
   const summary = rec
@@ -144,10 +221,12 @@ export function applyMapToDraftPlan(
     summary,
     macro,
     playbook,
+    slots: nextSlots,
+    ourLikely: nextOurLikely,
     sides: {
       theyFirst: patchSide(plan.sides.theyFirst),
       weFirst: patchSide(plan.sides.weFirst),
     },
-    ourBrief: patchBrief(plan.ourBrief, plan.ourLikely, map.name, draftStub),
+    ourBrief: patchBrief(plan.ourBrief, nextOurLikely, map.name, draftStub),
   };
 }

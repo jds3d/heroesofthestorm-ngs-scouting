@@ -1,4 +1,3 @@
-import { buildDraftPlan } from "@/lib/scoring/draftPlan";
 import { buildMapPlan } from "@/lib/scoring/mapPlan";
 import { rosterWeakRole } from "@/lib/scoring/draft";
 import {
@@ -286,7 +285,8 @@ export function buildAdaptPlan(
     firstPickDenies: uniqDenies,
     recommendations: uniqRecs,
     confidence,
-    draftPlan: buildDraftPlan(players, draft, null, meta),
+    // Built once in the scout route with homeRoster + live meta (avoid double plan).
+    draftPlan: null,
     mapPlan,
   };
 }
