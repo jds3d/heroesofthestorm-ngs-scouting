@@ -1,5 +1,6 @@
 import { classifyHeroesProfile, noteApiCall } from "@/lib/apiUsage";
 import { leagueConfig } from "@/config/league";
+import { NGS_MAP_POOL } from "@/config/ngsMaps";
 import { FOREVER, cacheHas, cachedFetch, getCached, setCached } from "@/lib/cache";
 import type { GlobalHeroStat } from "@/lib/scoring/metaPressure";
 import type {
@@ -53,6 +54,55 @@ async function sleep(ms: number) {
   await new Promise((r) => setTimeout(r, ms));
 }
 
+const HP_MIN_REQUEST_INTERVAL_MS = 1_250;
+const HP_MAX_RATE_LIMIT_RETRIES = 3;
+let hpRequestTail: Promise<void> = Promise.resolve();
+let hpNextRequestAt = 0;
+
+/** Parse both delta-seconds and HTTP-date Retry-After header forms. */
+export function heroesProfileRetryDelayMs(
+  retryAfter: string | null,
+  retryNumber: number,
+): number {
+  const seconds = retryAfter == null ? Number.NaN : Number(retryAfter);
+  if (Number.isFinite(seconds) && seconds >= 0) {
+    return Math.max(seconds * 1_000, HP_MIN_REQUEST_INTERVAL_MS);
+  }
+  if (retryAfter) {
+    const dateDelay = Date.parse(retryAfter) - Date.now();
+    if (Number.isFinite(dateDelay) && dateDelay > 0) {
+      return Math.max(dateDelay, HP_MIN_REQUEST_INTERVAL_MS);
+    }
+  }
+  // The API omits Retry-After for some 429 responses; use bounded exponential backoff.
+  return 8_000 * 2 ** retryNumber;
+}
+
+/**
+ * Serialize quota-consuming API requests and leave a gap between them. This
+ * protects global stats from concurrent matchup/replay calls in one scout run.
+ */
+async function hpFetch(url: string, headers: HeadersInit): Promise<Response> {
+  let release!: () => void;
+  const previous = hpRequestTail;
+  hpRequestTail = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+
+  await previous;
+  const waitMs = Math.max(0, hpNextRequestAt - Date.now());
+  if (waitMs) await sleep(waitMs);
+  try {
+    return await fetch(url, { headers });
+  } finally {
+    hpNextRequestAt = Math.max(
+      hpNextRequestAt,
+      Date.now() + HP_MIN_REQUEST_INTERVAL_MS,
+    );
+    release();
+  }
+}
+
 /**
  * GET against Heroes Profile external v1.
  * Handles 202 async jobs via Location / Retry-After polling.
@@ -72,7 +122,20 @@ async function hpGet<T>(
 
   const kind = classifyHeroesProfile(endpoint);
   if (kind) noteApiCall(kind);
-  let res = await fetch(url.toString(), { headers: authHeaders() });
+  const headers = authHeaders();
+  let res = await hpFetch(url.toString(), headers);
+  let rateLimitRetries = 0;
+  while (res.status === 429 && rateLimitRetries < HP_MAX_RATE_LIMIT_RETRIES) {
+    const retryMs = heroesProfileRetryDelayMs(
+      res.headers.get("Retry-After"),
+      rateLimitRetries,
+    );
+    // Extend the shared cooldown before waiting so queued requests also slow down.
+    hpNextRequestAt = Math.max(hpNextRequestAt, Date.now() + retryMs);
+    await sleep(retryMs);
+    res = await hpFetch(url.toString(), headers);
+    rateLimitRetries += 1;
+  }
   let polls = 0;
   const maxPolls = opts?.maxPolls ?? 18;
 
@@ -90,7 +153,7 @@ async function hpGet<T>(
     const jobUrl = location.startsWith("http")
       ? location
       : `https://www.heroesprofile.com${location}`;
-    res = await fetch(jobUrl, { headers: authHeaders() });
+    res = await fetch(jobUrl, { headers });
     polls += 1;
   }
 
@@ -613,54 +676,109 @@ type HeroStatsResponse = {
 const PATCH_TTL_MS = leagueConfig.cacheTtlMs;
 const patchCacheKey = "hp-v1-current-global-patch";
 
+function patchVersionValue(version: string): number[] {
+  return version
+    .split(".")
+    .map((part) => Number.parseInt(part, 10) || 0)
+    .slice(0, 4);
+}
+
+function comparePatchVersionsDesc(a: string, b: string): number {
+  const left = patchVersionValue(a);
+  const right = patchVersionValue(b);
+  const len = Math.max(left.length, right.length);
+  for (let i = 0; i < len; i++) {
+    const lv = left[i] ?? 0;
+    const rv = right[i] ?? 0;
+    if (lv !== rv) return rv - lv;
+  }
+  return 0;
+}
+
+export function selectLatestGlobalPatch(
+  patches: { game_version?: string; valid_globals?: boolean }[] = [],
+): string | null {
+  const usable = patches
+    .filter((p) => p.game_version && p.valid_globals !== false)
+    .sort((a, b) => comparePatchVersionsDesc(a.game_version!, b.game_version!));
+
+  return usable[0]?.game_version ?? null;
+}
+
 async function currentGlobalPatch(): Promise<string | null> {
   return cachedFetch(
     patchCacheKey,
     async () => {
       const patches = await hpGet<PatchList>("patches");
-      const patch =
-        patches.patches?.find((p) => p.valid_globals && p.game_version) ??
-        patches.patches?.find((p) => p.game_version);
-      return patch?.game_version ?? null;
+      return selectLatestGlobalPatch(patches.patches ?? []);
     },
     PATCH_TTL_MS,
   );
 }
 
+async function recentGlobalPatchBuilds(): Promise<string[]> {
+  const patches = await hpGet<PatchList>("patches");
+  const versions = (patches.patches ?? [])
+    .map((p) => p.game_version)
+    .filter((v): v is string => Boolean(v))
+    .filter((v) => {
+      const row = (patches.patches ?? []).find((p) => p.game_version === v);
+      return !row || row.valid_globals !== false;
+    })
+    .sort(comparePatchVersionsDesc)
+    .slice(0, 8);
+
+  return versions;
+}
+
 /** Current minor patch, Storm League. One cached pull for the whole meta table. */
 export async function getGlobalHeroStats(): Promise<GlobalHeroStat[]> {
   return cachedFetch(globalHeroStatsKey, async () => {
-    const gameVersion = await currentGlobalPatch();
-    if (!gameVersion) return [];
-    const stats = await hpGet<HeroStatsResponse>("heroes/stats", {
-      game_type: "Storm League",
-      timeframe_type: "minor",
-      timeframe: gameVersion,
-    });
-    return (stats.data ?? [])
-      .filter((row) => row.name)
-      .map((row) => ({
-        hero: row.name as string,
-        influence: Number(row.influence) || 0,
-        popularity: Number(row.popularity) || 0,
-        banRate: Number(row.ban_rate) || 0,
-        pickRate: Number(row.pick_rate) || 0,
-        winRate: Number(row.win_rate) || 0,
-        games: Number(row.games_played) || 0,
-      }));
+    const patchWindow = await recentGlobalPatchBuilds();
+    if (!patchWindow.length) return [];
+
+    try {
+      const stats = await hpGet<HeroStatsResponse>("heroes/stats", {
+        game_type: "Storm League",
+        timeframe_type: "minor",
+        timeframe: patchWindow.join(","),
+      });
+      return (stats.data ?? [])
+        .filter((row) => row.name)
+        .map((row) => ({
+          hero: row.name as string,
+          influence: Number(row.influence) || 0,
+          popularity: Number(row.popularity) || 0,
+          banRate: Number(row.ban_rate) || 0,
+          pickRate: Number(row.pick_rate) || 0,
+          winRate: Number(row.win_rate) || 0,
+          games: Number(row.games_played) || 0,
+        }));
+    } catch (err) {
+      if (err instanceof HeroesProfileError) {
+        throw new HeroesProfileError(
+          `HeroesProfile global stats for patch window ${patchWindow.join(", ")} are unavailable yet. This usually means the newest patch has not published global data; retrying with the latest valid older patch window.`,
+          err.status,
+          err.code,
+        );
+      }
+      throw err;
+    }
   }, GLOBAL_HERO_TTL_MS);
 }
 
-export const globalHeroMapStatsKey = "hp-v1-global-heroes-sl-minor-by-map";
+export const globalHeroMapStatsKey = "hp-v2-global-heroes-sl-minor-by-map";
 
 type HeroStatsByMapResponse = {
-  data?: {
+  data?: unknown;
+};
+
+type HeroStatsByMapRow = {
     name?: string;
     map?: string | { name?: string };
     game_map?: string | { name?: string };
     win_rate?: number;
     games_played?: number;
-  }[];
 };
 
 function mapNameFromRow(row: {
@@ -673,33 +791,118 @@ function mapNameFromRow(row: {
   return raw.name ?? null;
 }
 
+const hpMapNames = new Set(NGS_MAP_POOL.map((map) => map.name.toLowerCase()));
+
+function mapStatsRow(
+  row: HeroStatsByMapRow,
+  inheritedHero?: string,
+  inheritedMap?: string,
+): HeroMapStat | null {
+  const hasStats = "win_rate" in row || "games_played" in row;
+  const map = mapNameFromRow(row) ?? inheritedMap ?? null;
+  const hero = row.name ?? inheritedHero ?? null;
+  if (!hasStats || !hero || !map) return null;
+  return {
+    hero,
+    map,
+    winRate: Number(row.win_rate) || 0,
+    games: Number(row.games_played) || 0,
+  };
+}
+
+/** Accept flat rows and grouped map objects, whether returned at the root or under `data`. */
+export function parseHeroMapStats(data: unknown): HeroMapStat[] {
+  const rows: HeroMapStat[] = [];
+  const visit = (
+    value: unknown,
+    inheritedHero?: string,
+    inheritedMap?: string,
+  ) => {
+    if (Array.isArray(value)) {
+      for (const entry of value) visit(entry, inheritedHero, inheritedMap);
+      return;
+    }
+    if (!value || typeof value !== "object") return;
+
+    const record = value as HeroStatsByMapRow;
+    const row = mapStatsRow(record, inheritedHero, inheritedMap);
+    if (row) {
+      rows.push(row);
+      return;
+    }
+    for (const [key, child] of Object.entries(value)) {
+      const isMap = hpMapNames.has(key.toLowerCase());
+      visit(
+        child,
+        isMap ? inheritedHero : inheritedHero ?? key,
+        isMap ? key : inheritedMap,
+      );
+    }
+  };
+
+  visit(data);
+  return rows;
+}
+
+export function validateHeroMapStats(rows: HeroMapStat[] | null | undefined): HeroMapStat[] {
+  if (!rows || rows.length === 0) {
+    throw new HeroesProfileError(
+      "HeroesProfile map stats are empty for the current patch; map fit cannot be calculated.",
+      502,
+      "empty_map_stats",
+    );
+  }
+  return rows;
+}
+
 /** Per-hero-per-map Storm League WR for the current minor patch. */
 export async function getGlobalHeroStatsByMap(): Promise<HeroMapStat[]> {
   return cachedFetch(
     globalHeroMapStatsKey,
     async () => {
-      const gameVersion = await currentGlobalPatch();
-      if (!gameVersion) return [];
-      const stats = await hpGet<HeroStatsByMapResponse>("heroes/stats", {
-        game_type: "Storm League",
-        timeframe_type: "minor",
-        timeframe: gameVersion,
-        group_by_map: "true",
-      });
-      return (stats.data ?? [])
-        .map((row) => {
-          const map = mapNameFromRow(row);
-          if (!row.name || !map) return null;
-          return {
-            hero: row.name,
-            map,
-            winRate: Number(row.win_rate) || 0,
-            games: Number(row.games_played) || 0,
-          } satisfies HeroMapStat;
-        })
-        .filter((r): r is HeroMapStat => r != null);
+      const minorBuilds = await recentGlobalPatchBuilds();
+      if (!minorBuilds.length) {
+        throw new HeroesProfileError(
+          "HeroesProfile global patch metadata is unavailable; map stats cannot be loaded.",
+          502,
+          "missing_patch_metadata",
+        );
+      }
+
+      let lastEmptyDataError: HeroesProfileError | null = null;
+      for (const minorBuild of minorBuilds) {
+        try {
+          const stats = await hpGet<HeroStatsByMapResponse>("heroes/stats", {
+            game_type: "Storm League",
+            timeframe_type: "minor",
+            timeframe: minorBuild,
+            group_by_map: "true",
+          });
+          const rows = parseHeroMapStats(stats.data ?? stats);
+          return validateHeroMapStats(rows);
+        } catch (err) {
+          // Only try an older build when this build returned an otherwise valid,
+          // but empty, map dataset. Auth, rate-limit, and transport failures are
+          // not patch freshness problems and must not burn the remaining quota.
+          if (
+            err instanceof HeroesProfileError &&
+            err.code === "empty_map_stats"
+          ) {
+            lastEmptyDataError = err;
+            continue;
+          }
+          throw err;
+        }
+      }
+
+      throw new HeroesProfileError(
+        `HeroesProfile returned no map-stat rows for minor builds ${minorBuilds.join(", ")}.`,
+        lastEmptyDataError?.status ?? 502,
+        "empty_map_stats",
+      );
     },
     GLOBAL_HERO_TTL_MS,
+    { isEmpty: (rows) => !Array.isArray(rows) || rows.length === 0 },
   );
 }
 
@@ -768,15 +971,16 @@ export function gamesForMatchupPrecision(winRatePct: number): number {
 }
 
 /**
- * Keep stacking while any enemy edge is wider than ±3pp.
+ * Keep stacking while any enemy or ally duo is wider than ±3pp.
  * Near 50% needs ~1.1k games; extreme WRs need fewer. No WR floor —
  * 50.5% and 58% are both refined until precision is met (or we hit the cap).
  */
-function matchupsNeedMoreGames(bundle: HeroMatchupBundle): boolean {
-  return bundle.enemies.some(
-    (e) =>
-      e.games > 0 &&
-      matchupMarginOfError(e.games, e.enemyWinRate) > MATCHUP_MOE_TARGET,
+export function matchupsNeedMoreGames(bundle: HeroMatchupBundle): boolean {
+  const imprecise = (games: number, wr: number) =>
+    games > 0 && matchupMarginOfError(games, wr) > MATCHUP_MOE_TARGET;
+  return (
+    bundle.enemies.some((e) => imprecise(e.games, e.enemyWinRate)) ||
+    bundle.allies.some((a) => imprecise(a.games, a.allyWinRate))
   );
 }
 
@@ -1173,6 +1377,24 @@ export async function checkHeroesProfileAuth(): Promise<{
           : "HeroesProfile auth check failed",
     };
   }
+}
+
+/** Replay attribute id (e.g. "Crus") → hero name. New heroes appear here first. */
+export async function getHeroAttributeNames(): Promise<Record<string, string>> {
+  return cachedFetch(
+    "hp-v1-hero-attribute-ids",
+    async () => {
+      const data = await hpGet<{
+        heroes?: { name?: string; attribute_id?: string }[];
+      }>("heroes");
+      const out: Record<string, string> = {};
+      for (const h of data.heroes ?? []) {
+        if (h.attribute_id && h.name) out[h.attribute_id] = h.name;
+      }
+      return out;
+    },
+    7 * 24 * 60 * 60 * 1000,
+  );
 }
 
 export function heroesProfilePlayerUrl(battletag: string): string {

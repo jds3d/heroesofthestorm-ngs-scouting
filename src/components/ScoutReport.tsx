@@ -1,6 +1,7 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
+import type { ReviewGame } from "@/lib/review/replayDraft";
 import type {
   DraftCompPick,
   OurCompBrief,
@@ -25,9 +26,29 @@ import { HeroFace } from "@/components/HeroFace";
 import { InteractiveDraft } from "@/components/InteractiveDraft";
 import { MapPicker } from "@/components/MapPicker";
 
-export function ScoutReportView({ report }: { report: ScoutReport }) {
-  const [pickSide, setPickSide] = useState<"theyFirst" | "weFirst" | null>(null);
-  const [selectedMap, setSelectedMap] = useState<string | null>(null);
+export function ScoutReportView({
+  report,
+  review = null,
+}: {
+  report: ScoutReport;
+  /** Played game to replay into the interactive draft. */
+  review?: ReviewGame | null;
+}) {
+  const [pickSide, setPickSide] = useState<"theyFirst" | "weFirst" | null>(
+    review ? (review.weFirst ? "weFirst" : "theyFirst") : null,
+  );
+  const [selectedMap, setSelectedMap] = useState<string | null>(
+    review?.map ?? null,
+  );
+  useEffect(() => {
+    if (!review) return;
+    const t = window.setTimeout(() => {
+      document
+        .getElementById("interactive-draft")
+        ?.scrollIntoView({ behavior: "smooth", block: "start" });
+    }, 150);
+    return () => window.clearTimeout(t);
+  }, [review]);
   const shown = report;
   const plan = useMemo(
     () =>
@@ -105,6 +126,28 @@ export function ScoutReportView({ report }: { report: ScoutReport }) {
           Generated {new Date(report.generatedAt).toLocaleString()} · Confidence:{" "}
           {shown.adapt.confidence}
         </p>
+        {review && (
+          <div className="space-y-1 rounded-md border border-[var(--accent)]/50 bg-[var(--accent)]/10 px-4 py-3 text-sm text-[var(--ink)]">
+            <p>
+              <span className="font-semibold">Draft review</span> · Week{" "}
+              {review.round} game {review.game} vs {review.opponent}
+              {review.map ? ` on ${review.map}` : ""} ·{" "}
+              {review.weFirst ? "we picked first" : "they picked first"}
+              {review.won != null ? ` · ${review.won ? "won" : "lost"}` : ""}
+            </p>
+            {review.problems.map((p) => (
+              <p key={p} className="text-amber-800">
+                {p}
+              </p>
+            ))}
+            <a
+              href="#interactive-draft"
+              className="text-[var(--accent)] underline-offset-2 hover:underline"
+            >
+              Jump to the graded draft ↓
+            </a>
+          </div>
+        )}
         {report.warnings?.length > 0 && (
           <ul className="space-y-1 rounded-md border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900">
             {report.warnings.map((w) => (
@@ -409,16 +452,24 @@ export function ScoutReportView({ report }: { report: ScoutReport }) {
             </ul>
           </div>
 
-          <div className="space-y-3">
+          <div id="interactive-draft" className="scroll-mt-16 space-y-3">
             <h4 className="font-[family-name:var(--font-display)] text-xl text-[var(--ink)]">
-              Interactive draft
+              {review ? "Draft review" : "Interactive draft"}
             </h4>
             <p className="max-w-3xl text-sm text-[var(--muted)]">
-              Step through the lobby like HotS draft. Use the suggestion, search
-              for a hero, or tap any face. Undo if you mis-click.
+              {review
+                ? "Filled in from the replay and graded step by step. Undo to try a different line from any point."
+                : "Step through the lobby like HotS draft. Use the suggestion, search for a hero, or tap any face. Undo if you mis-click."}
             </p>
             <InteractiveDraft
-              key={`${pickSide}-${selectedMap ?? "any"}`}
+              key={`${review?.id ?? "live"}-${pickSide}-${selectedMap ?? "any"}`}
+              replay={
+                review &&
+                pickSide === (review.weFirst ? "weFirst" : "theyFirst") &&
+                selectedMap === review.map
+                  ? review.actions
+                  : null
+              }
               tree={side?.tree ?? plan.tree}
               weFirst={pickSide === "weFirst"}
               banPriority={shown.adapt.banPriority}
@@ -444,6 +495,8 @@ export function ScoutReportView({ report }: { report: ScoutReport }) {
               }
               ourLabel="Little Buff Boyz"
               theirLabel={report.teamName}
+              ourMmr={report.homeHpMmrAvg ?? null}
+              theirMmr={report.hpMmrAvg}
               allowSeatReshuffle={true}
             />
           </div>

@@ -263,6 +263,8 @@ export type ScoutReport = {
   roster: PlayerScout[];
   /** Saved Little Buff Boyz pool, used to fill our comp when starters change. */
   homeRoster?: PlayerScout[] | null;
+  /** Little Buff Boyz NGS team-average HP MMR. */
+  homeHpMmrAvg?: number | null;
   threats: TeamThreat[];
   draft: DraftInsights;
   adapt: AdaptPlan;

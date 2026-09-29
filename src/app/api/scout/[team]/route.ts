@@ -6,6 +6,7 @@ import {
   getHeroMatchupsMany,
 } from "@/lib/heroesprofile/client";
 import { mergeApiCounts, runWithApiUsage } from "@/lib/apiUsage";
+import { getTeam } from "@/lib/ngs/client";
 import { metaBanPriority } from "@/lib/scoring/adapt";
 import { buildDraftMetaTable } from "@/lib/scoring/draftMeta";
 import { buildDraftPlan } from "@/lib/scoring/draftPlan";
@@ -61,6 +62,10 @@ export async function GET(request: Request, context: RouteContext) {
         ? homePool
         : homePool.filter((p) => want.has(p.battletag.toLowerCase()));
     report.homeRoster = homeRoster;
+    report.homeHpMmrAvg =
+      homeReport?.hpMmrAvg ??
+      (await getTeam(leagueConfig.homeTeam).catch(() => null))?.hpMmrAvg ??
+      null;
 
     // Matchups + globals for draft meta — count real HP calls in "used".
     const { actual: metaActual } = await runWithApiUsage(async () => {
@@ -120,7 +125,17 @@ export async function GET(request: Request, context: RouteContext) {
           import("@/lib/heroesprofile/client").HeroMatchupBundle
         >,
       }));
-      const mapStats = await getGlobalHeroStatsByMap().catch(() => []);
+      let mapStats: Awaited<ReturnType<typeof getGlobalHeroStatsByMap>> = [];
+      try {
+        mapStats = await getGlobalHeroStatsByMap();
+      } catch (err) {
+        const message =
+          err instanceof Error ? err.message : "HeroesProfile map stats failed";
+        report.warnings = [
+          ...(report.warnings ?? []),
+          `Map fit data unavailable (${message}). Scores for map specialists are disabled.`,
+        ];
+      }
       const matchupsByKey: Record<
         string,
         import("@/lib/scoring/draftMeta").MatchupEnemyRow[]

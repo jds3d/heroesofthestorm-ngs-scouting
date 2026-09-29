@@ -10,6 +10,9 @@ import {
   getTeamMatches,
   teamMatchesCacheKey,
 } from "@/lib/ngs/client";
+import {
+  HeroesProfileError,
+} from "@/lib/heroesprofile/client";
 import type { PlayerScout, ScoutReport } from "@/lib/scoring/types";
 import { runWithApiUsage } from "@/lib/apiUsage";
 import { predictScoutCalls } from "@/lib/scout/estimateCalls";
@@ -110,6 +113,9 @@ async function buildScoutReport(
     );
     return report;
   } catch (err) {
+    if (err instanceof HeroesProfileError) {
+      throw err;
+    }
     if (!fallback) throw err;
     const message = err instanceof Error ? err.message : "Refresh failed";
     return {

@@ -76,6 +76,10 @@ export type ComputedHeroMeta = {
   counteredBy: MatchupEdge[];
   /** Teammates that raise/lower your WR by the numbers. */
   synergiesWith: SynergyEdge[];
+  /** Verified teammate samples, including neutral pairs excluded from generic synergy bonuses. */
+  allySamples: SynergyEdge[];
+  /** Every enemy matchup with enough games, not just hard counters. Absent on older cached tables. */
+  matchupSamples?: MatchupEdge[];
   /** Maps where your WR is meaningfully above baseline. */
   mapStrong: { map: string; winRate: number; games: number; deltaPp: number }[];
   note: string;
@@ -126,12 +130,28 @@ function hardCounters(
   return out.sort((a, b) => b.theirWinRate - a.theirWinRate || b.games - a.games);
 }
 
+function buildMatchupSamples(
+  baselineWr: number,
+  enemies: MatchupEnemyRow[] | undefined,
+): MatchupEdge[] {
+  if (!enemies?.length) return [];
+  const expectedEnemyWr = 100 - baselineWr;
+  return enemies
+    .filter((row) => row.games >= MIN_MATCHUP_GAMES)
+    .map((row) => ({
+      hero: row.hero,
+      theirWinRate: Math.round(row.enemyWinRate * 10) / 10,
+      games: row.games,
+      deltaPp: Math.round((row.enemyWinRate - expectedEnemyWr) * 10) / 10,
+    }));
+}
+
 /** Min games before an ally pair counts as synergy. */
 const MIN_ALLY_GAMES = 60;
 /** |delta| below this is noise vs solo baseline. */
 const MIN_SYNERGY_DELTA_PP = 2;
 
-function buildSynergies(
+function buildAllySamples(
   baselineWr: number,
   allies: MatchupAllyRow[] | undefined,
 ): SynergyEdge[] {
@@ -140,7 +160,6 @@ function buildSynergies(
   for (const row of allies) {
     if (row.games < MIN_ALLY_GAMES) continue;
     const deltaPp = row.allyWinRate - baselineWr;
-    if (Math.abs(deltaPp) < MIN_SYNERGY_DELTA_PP) continue;
     out.push({
       hero: row.hero,
       allyWinRate: Math.round(row.allyWinRate * 10) / 10,
@@ -150,6 +169,15 @@ function buildSynergies(
   }
   return out.sort(
     (a, b) => b.deltaPp - a.deltaPp || b.games - a.games,
+  );
+}
+
+function buildSynergies(
+  baselineWr: number,
+  allies: MatchupAllyRow[] | undefined,
+): SynergyEdge[] {
+  return buildAllySamples(baselineWr, allies).filter(
+    (edge) => Math.abs(edge.deltaPp) >= MIN_SYNERGY_DELTA_PP,
   );
 }
 
@@ -246,6 +274,7 @@ export function buildDraftMetaTable(args: {
     const enemies = lookup(args.matchups, key);
     const allies = lookup(alliesByKey, key);
     const counteredBy = hardCounters(key, wr, enemies, globalByKey);
+    const allySamples = buildAllySamples(wr, allies);
     const synergiesWith = buildSynergies(wr, allies);
     const influence = g?.influence ?? 0;
     const popularity = g?.popularity ?? 0;
@@ -260,6 +289,8 @@ export function buildDraftMetaTable(args: {
       timing: classifyTiming(wr, influence, popularity, counteredBy),
       counteredBy,
       synergiesWith,
+      allySamples,
+      matchupSamples: buildMatchupSamples(wr, enemies),
       mapStrong: mapEdges(key, wr, mapStats),
     };
     byHero[key] = { ...partial, note: buildNote(partial) };
@@ -290,6 +321,7 @@ export function heroDraftMeta(
     timing: "flex",
     counteredBy: [],
     synergiesWith: [],
+    allySamples: [],
     mapStrong: [],
     note: "No Storm League sample for this hero yet.",
   };
@@ -305,6 +337,142 @@ export function liveAllySynergies(
   const syn = heroDraftMeta(table, hero).synergiesWith;
   const want = new Set(lockedAllies.map((h) => heroKey(h)));
   return syn.filter((s) => want.has(heroKey(s.hero)));
+}
+
+/**
+ * A sampled two-hero result (teammates or opponents). HeroesProfile has no
+ * 3–5 hero data, so a team is judged as the sum of its duos.
+ */
+export type DuoEdge = {
+  /** The other hero in the duo. */
+  hero: string;
+  /** Pair WR together, or `hero`'s WR into this enemy. */
+  winRate: number;
+  games: number;
+  /** winRate − 50: good together / good into them, not better than solo. */
+  edgePp: number;
+};
+
+/** Both heroes' rows describe the same games; keep whichever stacked more patches. */
+function moreGames<T extends { games: number }>(a?: T, b?: T): T | undefined {
+  if (!a) return b;
+  if (!b) return a;
+  return b.games > a.games ? b : a;
+}
+
+function uniqueOthers(hero: string, others: readonly string[]): string[] {
+  const self = heroKey(hero);
+  const seen = new Set<string>();
+  return others.filter((h) => {
+    const k = heroKey(h);
+    if (k === self || seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+}
+
+function duoEdge(hero: string, winRate: number, games: number): DuoEdge {
+  const wr = Math.round(winRate * 10) / 10;
+  return { hero, winRate: wr, games, edgePp: Math.round((wr - 50) * 10) / 10 };
+}
+
+/** Every sampled ally duo between `hero` and `allies`, from either hero's row. */
+export function allyDuos(
+  table: DraftMetaTable | null | undefined,
+  hero: string,
+  allies: readonly string[],
+): DuoEdge[] {
+  const meta = heroDraftMeta(table, hero);
+  const out: DuoEdge[] = [];
+  for (const ally of uniqueOthers(hero, allies)) {
+    const allyMeta = heroDraftMeta(table, ally);
+    const find = (list: SynergyEdge[] | undefined, other: string) =>
+      list?.find((s) => heroKey(s.hero) === heroKey(other));
+    const sample =
+      moreGames(find(meta.allySamples, ally), find(allyMeta.allySamples, hero)) ??
+      moreGames(find(meta.synergiesWith, ally), find(allyMeta.synergiesWith, hero));
+    if (sample) out.push(duoEdge(ally, sample.allyWinRate, sample.games));
+  }
+  return out;
+}
+
+/** Every sampled matchup between `hero` and `enemies`, from either hero's row. */
+export function enemyDuos(
+  table: DraftMetaTable | null | undefined,
+  hero: string,
+  enemies: readonly string[],
+): DuoEdge[] {
+  const meta = heroDraftMeta(table, hero);
+  const out: DuoEdge[] = [];
+  for (const enemy of uniqueOthers(hero, enemies)) {
+    const enemyMeta = heroDraftMeta(table, enemy);
+    const find = (list: MatchupEdge[] | undefined, other: string) =>
+      list?.find((s) => heroKey(s.hero) === heroKey(other));
+    // Our row lists the enemy's WR into us; their row lists our WR into them.
+    const ours = find(meta.matchupSamples, enemy) ?? find(meta.counteredBy, enemy);
+    const theirs =
+      find(enemyMeta.matchupSamples, hero) ?? find(enemyMeta.counteredBy, hero);
+    const pick = moreGames(
+      ours && { winRate: 100 - ours.theirWinRate, games: ours.games },
+      theirs && { winRate: theirs.theirWinRate, games: theirs.games },
+    );
+    if (pick) out.push(duoEdge(enemy, pick.winRate, pick.games));
+  }
+  return out;
+}
+
+export type DuoWeights = { perPp: number; perDuoCap: number; totalCap: number };
+export const SYNERGY_DUO: DuoWeights = { perPp: 1.15, perDuoCap: 12, totalCap: 18 };
+export const MATCHUP_DUO: DuoWeights = { perPp: 0.55, perDuoCap: 14, totalCap: 24 };
+
+function signed(n: number): string {
+  const r = Math.round(n);
+  return r > 0 ? `+${r}` : `${r}`;
+}
+
+/**
+ * Sum of per-duo points. `lines` lists every hero in `others` — sampled duos
+ * best-first, then any with too few games to score — for the tooltip.
+ */
+export function scoreDuos(
+  duos: readonly DuoEdge[],
+  weights: DuoWeights,
+  verb: "together" | "into",
+  others: readonly string[] = [],
+): { points: number; summary: string; lines: string[]; math: string } {
+  const scored = duos
+    .map((d) => ({
+      duo: d,
+      pts: Math.max(-weights.perDuoCap, Math.min(weights.perDuoCap, d.edgePp * weights.perPp)),
+    }))
+    .sort((a, b) => b.pts - a.pts);
+  const sum = scored.reduce((s, x) => s + x.pts, 0);
+  const points = Math.max(-weights.totalCap, Math.min(weights.totalCap, sum));
+  const label = (hero: string) =>
+    verb === "together" ? `with ${hero}` : `into ${hero}`;
+  const lines = scored.map(
+    ({ duo, pts }) =>
+      `${label(duo.hero)}: ${duo.winRate}% ${verb === "together" ? "together" : "win rate"} (${duo.games.toLocaleString("en-US")}g) → ${signed(pts)}`,
+  );
+  const sampled = new Set(duos.map((d) => heroKey(d.hero)));
+  for (const hero of others) {
+    if (!sampled.has(heroKey(hero))) lines.push(`${label(hero)}: no sample with enough games → 0`);
+  }
+  const unsampled = lines.length - scored.length;
+  const summary = scored.length
+    ? `${scored.length} duo${scored.length === 1 ? "" : "s"}, net ${signed(points)}` +
+      (unsampled ? ` · ${unsampled} unsampled` : "") +
+      ` · best ${scored[0].duo.hero} ${scored[0].duo.winRate}%` +
+      (scored.length > 1
+        ? ` · worst ${scored[scored.length - 1].duo.hero} ${scored[scored.length - 1].duo.winRate}%`
+        : "")
+    : "";
+  return {
+    points,
+    summary,
+    lines,
+    math: `each duo ${weights.perPp} × (WR − 50) capped ±${weights.perDuoCap}; sum ${sum.toFixed(1)} capped ±${weights.totalCap} → ${Math.round(points)}`,
+  };
 }
 
 /** Cho + Gall are one roster lock — never count them as two answers. */
@@ -434,7 +602,9 @@ export function counterRoleFillNote(
   threats: MatchupEdge[],
   answeringTeamLocked: string[] = [],
   answeringTeamPool?: string[] | null,
+  answerer: "ours" | "theirs" = "theirs",
 ): string | null {
+  const who = answerer === "ours" ? "we" : "they";
   if (!answeringTeamLocked.length || !threats.length) return null;
   const collapsed = collapseCounterEdges(threats);
   const live = new Set(
@@ -453,10 +623,10 @@ export function counterRoleFillNote(
   if (!dropped.length) return null;
   const bits = dropped.slice(0, 3).map((t) => {
     const r = isChoGall(t.hero) ? "Tank" : heroRole(t.hero);
-    if (r === "Tank") return `${t.hero} (they already tanked)`;
+    if (r === "Tank") return `${t.hero} (${who} already tanked)`;
     if (r === "Healer" || r === "Support")
-      return `${t.hero} (they already healed)`;
-    if (heroIsOfflaner(t.hero)) return `${t.hero} (they already offlaned)`;
+      return `${t.hero} (${who} already healed)`;
+    if (heroIsOfflaner(t.hero)) return `${t.hero} (${who} already offlaned)`;
     return t.hero;
   });
   return `Not fearing ${bits.join(", ")} — that seat is filled; double-stack is free.`;
@@ -466,6 +636,7 @@ export function counterRoleFillNote(
 export function counterPoolNote(
   threats: MatchupEdge[],
   answeringTeamPool?: string[] | null,
+  answerer: "ours" | "theirs" = "theirs",
 ): string | null {
   if (answeringTeamPool == null || !threats.length) return null;
   const collapsed = collapseCounterEdges(threats);
@@ -474,7 +645,7 @@ export function counterPoolNote(
   );
   if (!notInPool.length) return null;
   const bits = notInPool.slice(0, 3).map((t) => t.hero);
-  return `Not fearing ${bits.join(", ")} — not in their played pool.`;
+  return `Not fearing ${bits.join(", ")} — not in ${answerer === "ours" ? "our" : "their"} played pool.`;
 }
 
 function normalizeMapName(value: string | null | undefined): string | null {
@@ -499,6 +670,14 @@ export function isMapSpecialist(
     return candidate !== null && candidate === target;
   });
   return hit ?? null;
+}
+
+export function mapSpecialistTooltip(
+  hit: { map: string; winRate: number; deltaPp: number; games: number } | null,
+): string {
+  if (!hit) return "No specialist edge on this map.";
+  const ci = Math.min(3, 3.5 + Math.max(0, 50 - hit.winRate) / 25);
+  return `${hit.map}: ${hit.winRate.toFixed(1)}% WR on this map (${hit.games}g), +${hit.deltaPp.toFixed(1)}pp vs baseline, 95% CI target ±${ci.toFixed(1)}pp.`;
 }
 
 /** Plan slot is the offlane / solo-lane seat — half the game if it loses. */

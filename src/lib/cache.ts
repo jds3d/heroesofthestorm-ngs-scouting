@@ -212,7 +212,15 @@ export async function cachedFetch<T>(
 ): Promise<T> {
   const effectiveTtl = isImmutableGameCacheKey(key) ? FOREVER : ttlMs;
   const hit = await getCached<T>(key, effectiveTtl);
-  if (hit !== null) return hit;
+  if (hit !== null) {
+    const hollow =
+      hit === null ||
+      hit === undefined ||
+      (opts?.isEmpty?.(hit) ?? isHollowCachePayload(hit));
+    if (!hollow) return hit;
+    memory.delete(key);
+    await fs.unlink(fileFor(key)).catch(() => undefined);
+  }
 
   const pending = inflight.get(key);
   if (pending) return pending as Promise<T>;

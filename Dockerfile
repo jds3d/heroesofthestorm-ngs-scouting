@@ -2,6 +2,8 @@
 
 FROM node:20-alpine AS deps
 WORKDIR /app
+# hots-parser depends on heroprotocol straight from GitHub.
+RUN apk add --no-cache git
 COPY package.json package-lock.json ./
 RUN npm ci
 

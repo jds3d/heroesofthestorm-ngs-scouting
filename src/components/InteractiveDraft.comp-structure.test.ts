@@ -1,47 +1,36 @@
 import { describe, expect, it } from "vitest";
-import { scoreProjectedCompStructure } from "./InteractiveDraft";
-import type { DraftCompPick } from "@/lib/scoring/types";
+import { withRolesFactor } from "./InteractiveDraft";
+import { checkRequiredRoles } from "@/lib/scoring/roles";
 
-describe("scoreProjectedCompStructure", () => {
-  it("punishes an all-melee five even when the proposed pick is otherwise strong", () => {
-    const livePicks: DraftCompPick[] = [
-      { hero: "Malthael", role: "Offlane", player: null, note: null },
-      { hero: "Tyrael", role: "Tank", player: null, note: null },
-      { hero: "Qhira", role: "4-man", player: null, note: null },
-    ];
-    const projected: DraftCompPick[] = [
-      ...livePicks,
-      { hero: "Thrall", role: "4-man", player: null, note: null },
-    ];
+const card = (hero: string) =>
+  ({ hero, total: 10, factors: [] }) as unknown as Parameters<typeof withRolesFactor>[0];
 
-    const score = scoreProjectedCompStructure({
-      hero: "Thrall",
-      livePicks,
-      projected,
-    });
-
-    expect(score.extra).toBeLessThan(0);
-    expect(score.structureBits.some((bit) => /ranged|all-melee/i.test(bit))).toBe(true);
+describe("Roles factor", () => {
+  it("does not penalize holding the offlaner for the last pick", () => {
+    const result = withRolesFactor(card("Falstad"), ["Johanna", "Anduin", "Qhira"]);
+    const roles = result.factors.find((factor) => factor.id === "roles")!;
+    expect(roles.points).toBe(0);
+    expect(roles.detail).toContain("Still need offlane · 1 pick left");
+    expect(result.total).toBe(10);
   });
 
-  it("favors the first ranged damage when the five is otherwise all melee", () => {
-    const livePicks: DraftCompPick[] = [
-      { hero: "Malthael", role: "Offlane", player: null, note: null },
-      { hero: "Tyrael", role: "Tank", player: null, note: null },
-      { hero: "Qhira", role: "4-man", player: null, note: null },
-      { hero: "Thrall", role: "4-man", player: null, note: null },
-    ];
+  it("penalizes a lock that makes the team impossible to complete", () => {
+    const result = withRolesFactor(card("Thrall"), ["Malthael", "Tyrael", "Qhira"]);
+    const roles = result.factors.find((factor) => factor.id === "roles")!;
+    // healer + ranged damage missing, one pick left.
+    expect(roles.points).toBe(-45);
+    expect(result.total).toBe(-35);
+  });
 
-    const score = scoreProjectedCompStructure({
-      hero: "Falstad",
-      livePicks,
-      projected: [
-        ...livePicks,
-        { hero: "Falstad", role: "Ranged Assassin", player: null, note: null },
-      ],
-    });
+  it("counts a dual-role hero for only one role", () => {
+    const check = checkRequiredRoles(["Blaze", "Whitemane", "Falstad", "Genji", "Valla"]);
+    expect(check.missing).toHaveLength(1);
+    expect(check.unfillable).toBe(1);
+  });
 
-    expect(score.extra).toBeGreaterThan(0);
-    expect(score.structureBits.some((bit) => /ranged/i.test(bit))).toBe(true);
+  it("weights every required role the same", () => {
+    const noOfflane = checkRequiredRoles(["Tyrael", "Anduin", "Genji", "Valla", "Jaina"]);
+    const noRanged = checkRequiredRoles(["Tyrael", "Anduin", "Dehaka", "Illidan", "Zeratul"]);
+    expect(noOfflane.points).toBe(noRanged.points);
   });
 });

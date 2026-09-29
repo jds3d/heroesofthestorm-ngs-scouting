@@ -168,7 +168,9 @@ export function buildPlayerComfort(args: {
   }
 
   scored.sort((a, b) => b.comfort - a.comfort);
-  const topHeroes = scored.filter((h) => h.comfort > 0).slice(0, 8);
+  // Draft suggestions may need a lower-ranked pocket for a specific open seat.
+  // Call sites that present a compact player summary already slice this list.
+  const topHeroes = scored.filter((h) => h.comfort > 0);
 
   const ngsGames = args.ngsWins + args.ngsLosses;
   const confidence: PlayerScout["confidence"] =

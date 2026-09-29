@@ -331,7 +331,7 @@ function fearBanAdvice(hero: string): string {
   const tags = heroTags(hero);
 
   if (role === "Bruiser" || tags.includes("solo")) {
-    return `${hero}: they are denying offlane sustain — lock a flexible tank/healer first, then take offlane after they declare the lane. If you open Leoric / Sonya / Dehaka early, it is as flex bait only: play them in the 4-man if they counter-pick the lane, and take the real offlaner later. Never first-pick your committed offlaner into open answers — offlane is ~half the game.`;
+    return `${hero}: they are denying offlane sustain — lock a flexible tank/healer first, then take offlane after they declare the lane. If you open Leoric / Sonya / Dehaka early, it is as flex bait only: play them in the 4-man if they counter-pick the lane, and take the real offlaner later. Never first-pick your committed offlaner into live hard counters — offlane is ~half the game.`;
   }
   if (
     (role === "Melee Assassin" || role === "Ranged Assassin") &&

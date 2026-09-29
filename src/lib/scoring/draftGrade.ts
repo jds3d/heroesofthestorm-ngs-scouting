@@ -1,15 +1,12 @@
 import {
-  heroHasWaveclear,
-  heroIsOfflaner,
-  heroIsRangedDamage,
-} from "@/lib/scoring/draftPlan";
-import {
+  allyDuos,
+  enemyDuos,
   heroDraftMeta,
-  liveAllySynergies,
   type DraftMetaTable,
 } from "@/lib/scoring/draftMeta";
-import { heroKey, heroRole } from "@/lib/scoring/heroMeta";
-import type { DraftCompPick, PlayerScout } from "@/lib/scoring/types";
+import { heroKey } from "@/lib/scoring/heroMeta";
+import { checkRequiredRoles } from "@/lib/scoring/roles";
+import type { PlayerScout } from "@/lib/scoring/types";
 
 export type LetterGrade =
   | "A+"
@@ -24,23 +21,45 @@ export type LetterGrade =
   | "D"
   | "F";
 
+/** One draft step (ban, pick, or double pick) as scored when it was locked. */
+export type DraftStepScore = {
+  side: "our" | "their";
+  kind: "ban" | "pick";
+  /** e.g. "Ban 2", "Pick 1", "Picks 2 + 3". */
+  label: string;
+  /** Hero(es) actually locked, e.g. "Azmodan + D.Va". */
+  locked: string;
+  /** Top-scored option at that step. */
+  bestLabel: string;
+  best: number;
+  achieved: number;
+};
+
 export type SideDraftGrade = {
   label: string;
   grade: LetterGrade;
-  /** Absolute quality of the locked five (0–100). */
+  /** Σ achieved over every ban and pick this side made. */
+  points: number;
+  /** Σ best available at each of those steps. */
+  bestPoints: number;
+  /** points / bestPoints as a percent — drives the letter grade. */
+  pct: number;
+  /** Strength of the locked five (0–100) — drives the draft win %. */
   quality: number;
-  /** Quality of the pre-draft optimal five (0–100). */
-  optimalQuality: number;
-  /** Closeness to optimal (0–100+) — drives the letter grade. */
-  fidelity: number;
   notes: string[];
+  steps: GradedStep[];
 };
+
+export type GradedStep = DraftStepScore & { pct: number; grade: LetterGrade };
 
 export type DraftReportCard = {
   ours: SideDraftGrade;
   theirs: SideDraftGrade;
-  /** Estimated P(we win) from this draft alone (0–100). */
-  winPct: number;
+  /** P(we win) from the two drafts alone (0–100). */
+  draftWinPct: number;
+  /** P(we win) from the drafts plus team MMR gap, when both MMRs are known. */
+  mmrWinPct: number | null;
+  mmrGap: number | null;
   headline: string;
   reasons: string[];
 };
@@ -49,6 +68,9 @@ type LockedSeat = {
   hero: string;
   player: string | null;
 };
+
+/** Quality points lost per required role the locked five can't cover. */
+const MISSING_ROLE_QUALITY = 12;
 
 function clamp(n: number, lo: number, hi: number): number {
   return Math.max(lo, Math.min(hi, n));
@@ -78,27 +100,6 @@ function comfortOf(
   return best;
 }
 
-/** Structure completeness: tank / heal / offlane / ranged / waveclear. */
-function structureScore(heroes: string[]): {
-  points: number;
-  holes: string[];
-} {
-  const roles = heroes.map((h) => heroRole(h));
-  const holes: string[] = [];
-  let points = 0;
-  if (roles.some((r) => r === "Tank")) points += 4;
-  else holes.push("no tank");
-  if (roles.some((r) => r === "Healer" || r === "Support")) points += 4;
-  else holes.push("no healer");
-  if (heroes.some((h) => heroIsOfflaner(h))) points += 4;
-  else holes.push("no offlane");
-  if (heroes.some((h) => heroIsRangedDamage(h))) points += 4;
-  else holes.push("no ranged");
-  if (heroes.some((h) => heroHasWaveclear(h))) points += 4;
-  else holes.push("no waveclear");
-  return { points, holes };
-}
-
 function comfortScore(
   seats: LockedSeat[],
   roster: PlayerScout[],
@@ -118,30 +119,20 @@ function synergyScore(
   table: DraftMetaTable | null | undefined,
 ): { points: number; best: string | null } {
   if (heroes.length < 2 || !table) return { points: 10, best: null }; // neutral if no data
+  // All 10 duos of the five, each once.
   let total = 0;
-  let pairs = 0;
-  let best: { label: string; wr: number } | null = null;
+  let best: { label: string; edge: number } | null = null;
   for (let i = 0; i < heroes.length; i++) {
-    const allies = heroes.filter((_, j) => j !== i);
-    const edges = liveAllySynergies(table, heroes[i], allies);
-    for (const e of edges) {
-      // Count each unordered pair once (i < j via hero key order).
-      if (heroKey(heroes[i]) > heroKey(e.hero)) continue;
-      total += e.allyWinRate - 50;
-      pairs += 1;
-      if (!best || e.allyWinRate > best.wr) {
-        best = {
-          label: `${heroes[i]} + ${e.hero} (${e.allyWinRate}%)`,
-          wr: e.allyWinRate,
-        };
+    for (const d of allyDuos(table, heroes[i], heroes.slice(i + 1))) {
+      total += d.edgePp;
+      if (!best || d.edgePp > best.edge) {
+        best = { label: `${heroes[i]} + ${d.hero} (${d.winRate}%)`, edge: d.edgePp };
       }
     }
   }
-  if (!pairs) return { points: 10, best: null };
-  const avg = total / pairs;
   return {
-    points: clamp(10 + avg * 1.2, 0, 20),
-    best: best?.label ?? null,
+    points: clamp(10 + total * 0.4, 0, 20),
+    best: best && best.edge > 0 ? best.label : null,
   };
 }
 
@@ -154,99 +145,39 @@ function matchupScore(
   if (!ours.length || !theirs.length || !table) {
     return { points: 12.5, edgePp: 0, detail: null };
   }
+  // All 25 cross-team duos.
   let edge = 0;
-  let hits = 0;
   let best: string | null = null;
   let bestAbs = 0;
   for (const hero of ours) {
-    const meta = heroDraftMeta(table, hero);
-    for (const enemy of theirs) {
-      const weBeat = heroDraftMeta(table, enemy).counteredBy.find(
-        (c) => heroKey(c.hero) === heroKey(hero),
-      );
-      const theyBeat = meta.counteredBy.find(
-        (c) => heroKey(c.hero) === heroKey(enemy),
-      );
-      if (weBeat) {
-        const d = weBeat.theirWinRate - 50;
-        edge += d;
-        hits += 1;
-        if (Math.abs(d) > bestAbs) {
-          bestAbs = Math.abs(d);
-          best = `${hero} ${weBeat.theirWinRate}% into ${enemy}`;
-        }
-      }
-      if (theyBeat) {
-        const d = theyBeat.theirWinRate - 50;
-        edge -= d;
-        hits += 1;
-        if (Math.abs(d) > bestAbs) {
-          bestAbs = Math.abs(d);
-          best = `${enemy} ${theyBeat.theirWinRate}% into ${hero}`;
-        }
+    for (const d of enemyDuos(table, hero, theirs)) {
+      edge += d.edgePp;
+      if (Math.abs(d.edgePp) > bestAbs) {
+        bestAbs = Math.abs(d.edgePp);
+        best = `${hero} ${d.winRate}% into ${d.hero}`;
       }
     }
   }
-  const avg = hits ? edge / Math.max(5, hits / 2) : 0;
   return {
-    points: clamp(12.5 + avg * 0.9, 0, 25),
-    edgePp: Math.round(avg * 10) / 10,
+    points: clamp(12.5 + edge * 0.3, 0, 25),
+    edgePp: Math.round(edge * 10) / 10,
     detail: best,
   };
 }
 
-/** How many seats land on the pre-draft optimal heroes / roles. */
-function planHitScore(
-  locked: LockedSeat[],
-  optimal: DraftCompPick[],
-): { points: number; exact: number; roleHits: number } {
-  if (!optimal.length) return { points: 5, exact: 0, roleHits: 0 };
-  const optHeroes = new Set(optimal.map((p) => heroKey(p.hero)));
-  const optRoles = optimal.map((p) => p.role.toLowerCase());
-  let exact = 0;
-  let roleHits = 0;
-  const usedRoles = new Set<number>();
-  for (const s of locked) {
-    if (optHeroes.has(heroKey(s.hero))) {
-      exact += 1;
-      continue;
-    }
-    const role = heroRole(s.hero).toLowerCase();
-    const idx = optRoles.findIndex(
-      (r, i) => !usedRoles.has(i) && (r === role || role.includes(r) || r.includes(role)),
-    );
-    if (idx >= 0) {
-      usedRoles.add(idx);
-      roleHits += 1;
-    }
-  }
-  // Exact hero = 2 pts, role-only = 1 pt, max 10.
-  const points = clamp(exact * 2 + roleHits, 0, 10);
-  return { points, exact, roleHits };
-}
-
-function scoreFive(args: {
+/** Strength of a locked five: comfort + synergy + matchup + map, minus missing roles. */
+export function scoreFive(args: {
   seats: LockedSeat[];
   enemyHeroes: string[];
   roster: PlayerScout[];
-  optimal: DraftCompPick[];
   table: DraftMetaTable | null | undefined;
   map: string | null;
-}): {
-  quality: number;
-  structure: ReturnType<typeof structureScore>;
-  comfort: ReturnType<typeof comfortScore>;
-  synergy: ReturnType<typeof synergyScore>;
-  matchup: ReturnType<typeof matchupScore>;
-  plan: ReturnType<typeof planHitScore>;
-  mapPts: number;
-} {
+}) {
   const heroes = args.seats.map((s) => s.hero);
-  const structure = structureScore(heroes);
+  const roles = checkRequiredRoles(heroes);
   const comfort = comfortScore(args.seats, args.roster);
   const synergy = synergyScore(heroes, args.table);
   const matchup = matchupScore(heroes, args.enemyHeroes, args.table);
-  const plan = planHitScore(args.seats, args.optimal);
 
   let mapPts = 0;
   if (args.map && args.table) {
@@ -259,246 +190,227 @@ function scoreFive(args: {
   }
   mapPts = clamp(mapPts, 0, 5);
 
-  // Soft-normalize to ~100 (structure 20 + comfort 25 + synergy 20 + matchup 25 + plan 10 + map 5 = 105).
-  const raw =
-    structure.points +
-    comfort.points +
-    synergy.points +
-    matchup.points +
-    plan.points +
-    mapPts;
-  const quality = clamp(Math.round((raw / 105) * 100), 0, 100);
-
-  return { quality, structure, comfort, synergy, matchup, plan, mapPts };
+  // comfort 25 + synergy 20 + matchup 25 + map 5 = 75.
+  const raw = comfort.points + synergy.points + matchup.points + mapPts;
+  const quality = clamp(
+    Math.round((raw / 75) * 100) - MISSING_ROLE_QUALITY * roles.missing.length,
+    0,
+    100,
+  );
+  return { quality, missingRoles: roles.missing, comfort, synergy, matchup, mapPts };
 }
 
-function fidelityToGrade(fidelity: number, quality: number, holes: string[]): LetterGrade {
-  // Critical holes cap the letter even if you "followed the plan."
-  let capped = fidelity;
-  if (holes.includes("no healer") || holes.includes("no tank")) {
-    capped = Math.min(capped, 72); // C+ max
-  } else if (holes.length >= 2) {
-    capped = Math.min(capped, 82); // B max
-  }
-  // Terrible absolute draft also caps (followed a bad plan ≠ A).
-  if (quality < 40) capped = Math.min(capped, 60);
-  else if (quality < 50) capped = Math.min(capped, 72);
-
-  if (capped >= 98) return "A+";
-  if (capped >= 94) return "A";
-  if (capped >= 90) return "A-";
-  if (capped >= 86) return "B+";
-  if (capped >= 82) return "B";
-  if (capped >= 78) return "B-";
-  if (capped >= 72) return "C+";
-  if (capped >= 66) return "C";
-  if (capped >= 60) return "C-";
-  if (capped >= 50) return "D";
+export function pctToGrade(pct: number): LetterGrade {
+  if (pct >= 97) return "A+";
+  if (pct >= 93) return "A";
+  if (pct >= 90) return "A-";
+  if (pct >= 87) return "B+";
+  if (pct >= 83) return "B";
+  if (pct >= 80) return "B-";
+  if (pct >= 77) return "C+";
+  if (pct >= 73) return "C";
+  if (pct >= 70) return "C-";
+  if (pct >= 60) return "D";
   return "F";
 }
 
-function sideNotes(args: {
-  scored: ReturnType<typeof scoreFive>;
-  optimalQuality: number;
-  fidelity: number;
-  label: string;
-}): string[] {
-  const notes: string[] = [];
-  const { scored, optimalQuality, fidelity } = args;
-  if (scored.structure.holes.length) {
-    notes.push(`Holes: ${scored.structure.holes.join(", ")}.`);
+/**
+ * Σ achieved / Σ best over a side's steps. A step's best is never below what
+ * was achieved (the locked option was scored too) and never below 0, so an
+ * all-bad board can't inflate the ratio; a negative lock still drags it down.
+ */
+export function sumStepPoints(steps: readonly DraftStepScore[]): {
+  points: number;
+  bestPoints: number;
+  pct: number;
+} {
+  let points = 0;
+  let bestPoints = 0;
+  for (const s of steps) {
+    points += s.achieved;
+    bestPoints += Math.max(0, s.best, s.achieved);
   }
-  if (scored.plan.exact > 0 || optimalQuality > 0) {
-    notes.push(
-      `${scored.plan.exact}/5 exact plan heroes` +
-        (scored.plan.roleHits
-          ? `, +${scored.plan.roleHits} role fills`
-          : "") +
-        ".",
-    );
-  }
-  if (scored.synergy.best) {
-    notes.push(`Best pair: ${scored.synergy.best}.`);
-  }
-  if (scored.matchup.detail) {
-    const sign = scored.matchup.edgePp >= 0 ? "+" : "";
-    notes.push(
-      `Matchup ${sign}${scored.matchup.edgePp}pp — ${scored.matchup.detail}.`,
-    );
-  }
-  if (optimalQuality > 0) {
-    const delta = scored.quality - optimalQuality;
-    if (Math.abs(delta) <= 2 && fidelity >= 94) {
-      notes.push("Locked essentially the optimal five.");
-    } else if (delta >= 4) {
-      notes.push(
-        `Beat the pre-draft plan (+${delta} quality) — live board upgrades landed.`,
-      );
-    } else if (delta <= -6) {
-      notes.push(
-        `Left ${Math.abs(delta)} quality on the table vs the pre-draft five.`,
-      );
+  const pct = bestPoints > 0 ? clamp(Math.round((points / bestPoints) * 100), 0, 100) : 100;
+  return { points: Math.round(points), bestPoints: Math.round(bestPoints), pct };
+}
+
+/** One step's achieved / best. When every option scored ≤ 0, taking the best is 100%. */
+export function stepPct(s: Pick<DraftStepScore, "best" | "achieved">): number {
+  const best = Math.max(0, s.best, s.achieved);
+  if (best <= 0) return s.achieved >= s.best ? 100 : 0;
+  return clamp(Math.round((s.achieved / best) * 100), 0, 100);
+}
+
+function biggestMiss(steps: readonly DraftStepScore[]): DraftStepScore | null {
+  let worst: DraftStepScore | null = null;
+  let worstGap = 0;
+  for (const s of steps) {
+    const gap = Math.max(0, s.best, s.achieved) - s.achieved;
+    if (gap > worstGap) {
+      worstGap = gap;
+      worst = s;
     }
   }
-  if (!notes.length) {
-    notes.push(`${args.label} draft quality ${scored.quality}/100.`);
-  }
-  return notes.slice(0, 4);
+  return worstGap >= 3 ? worst : null;
+}
+
+function fmt(n: number): string {
+  const r = Math.round(n);
+  return r > 0 ? `+${r}` : `${r}`;
 }
 
 function gradeSide(args: {
   label: string;
-  locked: LockedSeat[];
-  enemyHeroes: string[];
-  roster: PlayerScout[];
-  optimal: DraftCompPick[];
-  table: DraftMetaTable | null | undefined;
-  map: string | null;
+  steps: DraftStepScore[];
+  scored: ReturnType<typeof scoreFive>;
 }): SideDraftGrade {
-  const scored = scoreFive({
-    seats: args.locked,
-    enemyHeroes: args.enemyHeroes,
-    roster: args.roster,
-    optimal: args.optimal,
-    table: args.table,
-    map: args.map,
-  });
-
-  let optimalQuality = 0;
-  if (args.optimal.length >= 3) {
-    const optSeats: LockedSeat[] = args.optimal.map((p) => ({
-      hero: p.hero,
-      player: p.player,
-    }));
-    optimalQuality = scoreFive({
-      seats: optSeats,
-      enemyHeroes: args.enemyHeroes,
-      roster: args.roster,
-      optimal: args.optimal,
-      table: args.table,
-      map: args.map,
-    }).quality;
+  const { points, bestPoints, pct } = sumStepPoints(args.steps);
+  const notes: string[] = [];
+  const miss = biggestMiss(args.steps);
+  if (miss) {
+    const verb = miss.kind === "ban" ? "banned" : "picked";
+    notes.push(
+      `Biggest miss: ${verb} ${miss.locked} (${fmt(miss.achieved)}) over ${miss.bestLabel} (${fmt(Math.max(miss.best, miss.achieved))}).`,
+    );
+  } else if (args.steps.length) {
+    notes.push("Took the top option (or within 3 points) at every step.");
   }
-
-  // Fidelity: how close to optimal. Beating optimal can push over 100.
-  const fidelity =
-    optimalQuality > 0
-      ? clamp(Math.round((scored.quality / optimalQuality) * 100), 0, 110)
-      : scored.quality; // no plan → grade on absolute quality
-
-  const grade = fidelityToGrade(
-    fidelity,
-    scored.quality,
-    scored.structure.holes,
-  );
-
+  if (args.scored.missingRoles.length) {
+    notes.push(`Missing: ${args.scored.missingRoles.join(", ")}.`);
+  }
+  if (args.scored.synergy.best) {
+    notes.push(`Best pair: ${args.scored.synergy.best}.`);
+  }
   return {
     label: args.label,
-    grade,
-    quality: scored.quality,
-    optimalQuality,
-    fidelity,
-    notes: sideNotes({
-      scored,
-      optimalQuality,
-      fidelity,
-      label: args.label,
+    grade: pctToGrade(pct),
+    points,
+    bestPoints,
+    pct,
+    quality: args.scored.quality,
+    notes: notes.slice(0, 3),
+    steps: args.steps.map((s) => {
+      const p = stepPct(s);
+      return { ...s, pct: p, grade: pctToGrade(p) };
     }),
   };
 }
 
-function winPctFromQualities(ourQ: number, theirQ: number, matchupEdgePp: number): number {
-  // ~4 quality points ≈ 1% win; matchup pp adds a bit more.
-  const delta = ourQ - theirQ + matchupEdgePp * 0.6;
-  // Soft sigmoid-ish: tanh-style without importing math libs.
-  const x = delta / 28;
-  const sigmoid = x / (1 + Math.abs(x)); // ≈ tanh lite, range (-1,1)
+function draftWinPct(ourQ: number, theirQ: number): number {
+  // Soft sigmoid on the quality gap: 28 quality ≈ 69%.
+  const x = (ourQ - theirQ) / 28;
+  const sigmoid = x / (1 + Math.abs(x));
   return Math.round(clamp(50 + sigmoid * 38, 12, 88));
 }
 
-function headlineFor(winPct: number, ourGrade: LetterGrade, theirGrade: LetterGrade): string {
-  const lean =
-    winPct >= 62
-      ? "Favorable draft"
-      : winPct >= 54
-        ? "Slight edge"
-        : winPct >= 47
-          ? "Coin-flip draft"
-          : winPct >= 39
-            ? "Slight deficit"
-            : "Uphill draft";
-  return `${lean} — we grade ${ourGrade}, they grade ${theirGrade}.`;
+/**
+ * Folds a team MMR gap into the draft odds on the Elo scale (400 MMR = 10:1),
+ * treating Heroes Profile MMR as Elo-like.
+ */
+export function mmrAdjustedWinPct(
+  draftPct: number,
+  ourMmr: number,
+  theirMmr: number,
+): number {
+  const p = clamp(draftPct, 1, 99) / 100;
+  const logit = Math.log(p / (1 - p)) + ((ourMmr - theirMmr) * Math.LN10) / 400;
+  return Math.round(clamp(100 / (1 + Math.exp(-logit)), 1, 99));
+}
+
+/** "Tricky Gooses favoured, 59%" — always phrased from the favoured side. */
+export function favouredLabel(
+  ourWinPct: number,
+  ourLabel: string,
+  theirLabel: string,
+): string {
+  if (ourWinPct === 50) return "Even, 50%";
+  return ourWinPct > 50
+    ? `${ourLabel} favoured, ${ourWinPct}%`
+    : `${theirLabel} favoured, ${100 - ourWinPct}%`;
 }
 
 /**
- * End-of-draft report card: letter grades (fantasy-football style) for how
- * close each side landed to their optimal five, plus a win likelihood from
- * the locked comps.
+ * End-of-draft report card. Each side is graded on the points it took out of
+ * the best available at every ban and pick; win chance compares the two
+ * locked fives, optionally adjusted by the team MMR gap.
  */
 export function gradeFinishedDraft(args: {
   ourLocked: LockedSeat[];
   theirLocked: LockedSeat[];
-  ourOptimal: DraftCompPick[];
-  theirOptimal: DraftCompPick[];
+  steps: DraftStepScore[];
   homeRoster: PlayerScout[];
   theirRoster: PlayerScout[];
   table: DraftMetaTable | null | undefined;
   map: string | null;
   ourLabel?: string;
   theirLabel?: string;
+  ourMmr?: number | null;
+  theirMmr?: number | null;
 }): DraftReportCard {
+  const ourLabel = args.ourLabel ?? "Us";
+  const theirLabel = args.theirLabel ?? "Them";
   const ourHeroes = args.ourLocked.map((s) => s.hero);
   const theirHeroes = args.theirLocked.map((s) => s.hero);
 
-  const ours = gradeSide({
-    label: args.ourLabel ?? "Us",
-    locked: args.ourLocked,
+  const ourFive = scoreFive({
+    seats: args.ourLocked,
     enemyHeroes: theirHeroes,
     roster: args.homeRoster,
-    optimal: args.ourOptimal,
     table: args.table,
     map: args.map,
   });
-  const theirs = gradeSide({
-    label: args.theirLabel ?? "Them",
-    locked: args.theirLocked,
+  const theirFive = scoreFive({
+    seats: args.theirLocked,
     enemyHeroes: ourHeroes,
     roster: args.theirRoster,
-    optimal: args.theirOptimal,
     table: args.table,
     map: args.map,
   });
 
-  const matchup = matchupScore(ourHeroes, theirHeroes, args.table);
-  const winPct = winPctFromQualities(ours.quality, theirs.quality, matchup.edgePp);
+  const ours = gradeSide({
+    label: ourLabel,
+    steps: args.steps.filter((s) => s.side === "our"),
+    scored: ourFive,
+  });
+  const theirs = gradeSide({
+    label: theirLabel,
+    steps: args.steps.filter((s) => s.side === "their"),
+    scored: theirFive,
+  });
 
-  const reasons: string[] = [];
-  reasons.push(
-    `Draft quality ${ours.quality} vs ${theirs.quality}` +
-      (ours.optimalQuality || theirs.optimalQuality
-        ? ` (optimal ${ours.optimalQuality || "—"} / ${theirs.optimalQuality || "—"})`
-        : "") +
-      ".",
-  );
+  const winPct = draftWinPct(ourFive.quality, theirFive.quality);
+  const haveMmr =
+    typeof args.ourMmr === "number" && typeof args.theirMmr === "number";
+  const mmrGap = haveMmr ? Math.round(args.ourMmr! - args.theirMmr!) : null;
+  const mmrWinPct = haveMmr
+    ? mmrAdjustedWinPct(winPct, args.ourMmr!, args.theirMmr!)
+    : null;
+
+  const reasons: string[] = [
+    `Final fives: ${ourLabel} ${ourFive.quality} vs ${theirLabel} ${theirFive.quality} (comfort, synergy, matchups, map, roles).`,
+  ];
+  const matchup = ourFive.matchup;
   if (matchup.detail) {
-    const sign = matchup.edgePp >= 0 ? "+" : "";
     reasons.push(
-      `Live matchup ${sign}${matchup.edgePp}pp — ${matchup.detail}.`,
+      `Net matchup edge across all 25 duos ${fmt(matchup.edgePp)}pp for ${ourLabel} — biggest: ${matchup.detail}.`,
     );
   }
-  if (ours.notes[0]) reasons.push(`${args.ourLabel ?? "Us"}: ${ours.notes[0]}`);
-  if (theirs.notes[0]) reasons.push(`${args.theirLabel ?? "Them"}: ${theirs.notes[0]}`);
+  if (mmrGap !== null) {
+    const higher = mmrGap >= 0 ? ourLabel : theirLabel;
+    reasons.push(
+      mmrGap === 0
+        ? "Team MMR is even."
+        : `${higher} average ${Math.abs(mmrGap)} MMR higher (NGS team average).`,
+    );
+  }
 
   return {
     ours,
     theirs,
-    winPct,
-    headline: headlineFor(winPct, ours.grade, theirs.grade),
-    reasons: reasons.slice(0, 4),
+    draftWinPct: winPct,
+    mmrWinPct,
+    mmrGap,
+    headline: `${ours.label} ${ours.grade} (${ours.pct}%) · ${theirs.label} ${theirs.grade} (${theirs.pct}%) — ${favouredLabel(winPct, ourLabel, theirLabel)} on the draft.`,
+    reasons,
   };
-}
-
-/** UI label — not a calibrated P(win). */
-export function draftEdgeLabel(winPct: number): string {
-  return `~${winPct}% draft edge`;
 }

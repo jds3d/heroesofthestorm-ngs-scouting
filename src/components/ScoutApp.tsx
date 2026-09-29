@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { ScoutReport } from "@/lib/scoring/types";
+import type { ReviewGame, ReviewGameSummary } from "@/lib/review/replayDraft";
 import { ScoutReportView } from "@/components/ScoutReport";
 
 type LeagueTeam = {
@@ -112,6 +113,11 @@ export function ScoutApp() {
   const [ourFive, setOurFive] = useState<string[]>([]);
   const [theirFive, setTheirFive] = useState<string[]>([]);
   const [loadingRoster, setLoadingRoster] = useState(false);
+  const [loadingProgress, setLoadingProgress] = useState(12);
+  const [reviewOpen, setReviewOpen] = useState(false);
+  const [reviewGames, setReviewGames] = useState<ReviewGameSummary[] | null>(null);
+  const [loadingReviewGames, setLoadingReviewGames] = useState(false);
+  const [review, setReview] = useState<ReviewGame | null>(null);
 
   const homeName = meta?.homeTeam ?? "";
   const scoutingSelf = selected !== "" && selected === homeName;
@@ -119,6 +125,66 @@ export function ScoutApp() {
     ourFive.length === 5 && (scoutingSelf || theirFive.length === 5);
 
   const weekGroups = useMemo(() => opponentsByWeek(teams), [teams]);
+
+  const loadingStages = useMemo(() => {
+    const stages = [
+      { key: "ngs-schedule", label: "NGS schedule" },
+      { key: "ngs-team", label: "NGS roster" },
+      { key: "hp-storm-league", label: "Storm League" },
+      { key: "hp-ngs-player", label: "NGS player profiles" },
+      { key: "hp-team-matches", label: "Team match history" },
+      { key: "hp-global-heroes", label: "Global hero stats" },
+      { key: "hp-hero-matchups", label: "Hero matchups" },
+    ] as const;
+
+    return stages
+      .map((stage) => ({
+        ...stage,
+        count:
+          predictedCalls?.find((call) => call.kind === stage.key)?.count ?? 0,
+      }))
+      .filter((stage) => stage.count > 0);
+  }, [predictedCalls]);
+
+  useEffect(() => {
+    if (!loadingReport) {
+      setLoadingProgress(0);
+      return;
+    }
+
+    const startedAt = Date.now();
+    const timer = window.setInterval(() => {
+      const elapsed = Date.now() - startedAt;
+      const baseProgress = Math.min(85, (elapsed / 2400) * 100);
+      const boost = predictedCalls?.some((call) => call.count > 0) ? 8 : 3;
+      setLoadingProgress((previous) =>
+        Math.min(98, Math.max(previous, baseProgress + boost)),
+      );
+    }, 180);
+
+    const doneTimer = window.setTimeout(() => {
+      setLoadingProgress(100);
+    }, 4500);
+
+    return () => {
+      window.clearInterval(timer);
+      window.clearTimeout(doneTimer);
+    };
+  }, [loadingReport, predictedCalls]);
+
+  const currentProgress = Math.max(0, Math.min(100, loadingProgress));
+  const activeStage =
+    loadingStages.length > 0
+      ? loadingStages[
+          Math.min(
+            loadingStages.length - 1,
+            Math.max(
+              0,
+              Math.floor((currentProgress / 100) * loadingStages.length),
+            ),
+          )
+        ].label
+      : "Generating report";
 
   useEffect(() => {
     let cancelled = false;
@@ -184,15 +250,65 @@ export function ScoutApp() {
 
   async function generate() {
     if (!selected || !lineupsReady) return;
+    setReview(null);
+    setReviewOpen(false);
+    await runScout(selected, ourFive, scoutingSelf ? ourFive : theirFive);
+  }
+
+  async function openReview() {
+    setReviewOpen((v) => !v);
+    if (reviewGames || loadingReviewGames) return;
+    setLoadingReviewGames(true);
+    try {
+      const res = await scoutFetch("/api/review/games");
+      const data = (await res.json()) as { games?: ReviewGameSummary[]; error?: string };
+      if (!res.ok) throw new Error(data.error ?? "Couldn't load played games");
+      setReviewGames(data.games ?? []);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Couldn't load played games");
+    } finally {
+      setLoadingReviewGames(false);
+    }
+  }
+
+  async function reviewGame(id: string) {
+    setReviewOpen(false);
+    setReview(null);
+    setReport(null);
+    setError(null);
     setLoadingReport(true);
+    setLoadingProgress(12);
+    try {
+      const res = await scoutFetch(`/api/review/game?id=${encodeURIComponent(id)}`);
+      const game = (await res.json()) as ReviewGame & { error?: string };
+      if (!res.ok) throw new Error(game.error ?? "Couldn't read that replay");
+      // Ringers aren't on the NGS roster; fill from the season's most-played.
+      const ours = fillLineup(game.ourTags, ourRoster);
+      const theirs = fillLineup(game.theirTags, await loadRoster(game.opponent));
+      setSelected(game.opponent);
+      const ok = await runScout(game.opponent, ours, theirs);
+      if (ok) setReview(game);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Draft review failed");
+      setLoadingReport(false);
+    }
+  }
+
+  async function runScout(
+    team: string,
+    ours: string[],
+    theirs: string[],
+  ): Promise<boolean> {
+    setLoadingReport(true);
+    setLoadingProgress(12);
     setError(null);
     setReport(null);
     setPredictedCalls(null);
-    const teamPath = encodeURIComponent(selected.replace(/ /g, "_"));
+    const teamPath = encodeURIComponent(team.replace(/ /g, "_"));
     const params = new URLSearchParams();
     if (refreshPlayerData) params.set("fresh", "1");
-    params.set("ours", ourFive.join("|"));
-    params.set("theirs", (scoutingSelf ? ourFive : theirFive).join("|"));
+    params.set("ours", ours.join("|"));
+    params.set("theirs", theirs.join("|"));
     const fresh = `?${params.toString()}`;
     try {
       const estimateRes = await scoutFetch(
@@ -227,8 +343,10 @@ export function ScoutApp() {
         throw new Error(errMsg);
       }
       setReport(data as ScoutReport);
+      return true;
     } catch (e) {
       setError(e instanceof Error ? e.message : "Scout failed");
+      return false;
     } finally {
       setLoadingReport(false);
     }
@@ -273,6 +391,15 @@ export function ScoutApp() {
         >
           {loadingReport ? "Scouting…" : "Generate scout report"}
         </button>
+        <button
+          type="button"
+          onClick={openReview}
+          disabled={loadingReport || !homeName}
+          aria-expanded={reviewOpen}
+          className="h-12 rounded-md border border-[var(--accent)] px-6 text-sm font-semibold uppercase tracking-wide text-[var(--accent)] transition enabled:hover:bg-[var(--accent)]/10 disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          Draft review
+        </button>
         <label className="flex h-12 items-center gap-2 text-sm text-[var(--ink)]">
           <input
             type="checkbox"
@@ -283,6 +410,15 @@ export function ScoutApp() {
           Refresh hero &amp; player data
         </label>
       </section>
+
+      {reviewOpen && (
+        <ReviewGamePicker
+          games={reviewGames}
+          loading={loadingReviewGames}
+          activeId={review?.id ?? null}
+          onPick={reviewGame}
+        />
+      )}
 
       <LineupPicker
         title={`Our 5 — ${homeName || "Little Buff Boyz"} (${ourFive.length}/5)`}
@@ -316,29 +452,51 @@ export function ScoutApp() {
         </p>
       )}
       {loadingReport && (
-        <div className="space-y-2 text-sm text-[var(--muted)]">
-          <p>
-            {refreshPlayerData
-              ? "Rebuilding the report and re-pulling NGS profiles / Storm League. Past games stay cached."
-              : "Rebuilding the report from cached games and player data. Only missing pieces are fetched."}
-          </p>
+        <div className="space-y-3 rounded-xl border border-[var(--line)] bg-[var(--panel)] p-4 text-sm text-[var(--muted)] shadow-sm">
+          <div className="flex items-center justify-between gap-3">
+            <p className="font-medium text-[var(--ink)]">
+              {refreshPlayerData
+                ? "Refreshing source data and generating the scout report…"
+                : "Generating the scout report…"}
+            </p>
+            <span className="text-xs font-semibold uppercase tracking-[0.18em] text-[var(--accent)]">
+              {Math.round(currentProgress)}%
+            </span>
+          </div>
+          <div className="h-2 overflow-hidden rounded-full bg-[var(--line)]">
+            <div
+              className="h-full rounded-full bg-[var(--accent)] transition-[width] duration-300 ease-out"
+              style={{ width: `${currentProgress}%` }}
+            />
+          </div>
+          <div className="flex items-center justify-between gap-4 text-xs uppercase tracking-[0.14em] text-[var(--muted)]">
+            <span>Current step</span>
+            <span>{activeStage}</span>
+          </div>
           {predictedCalls && predictedCalls.some((c) => c.count > 0) ? (
-            <ul className="space-y-1">
-              {predictedCalls
-                .filter((c) => c.count > 0)
-                .map((c) => (
-                  <li key={c.kind}>
-                    Predicted {c.label}: {c.count}
-                  </li>
-                ))}
-            </ul>
+            <div className="space-y-2">
+              <p className="text-xs uppercase tracking-[0.14em] text-[var(--muted)]">
+                API queue
+              </p>
+              <ul className="grid gap-1 sm:grid-cols-2">
+                {predictedCalls
+                  .filter((c) => c.count > 0)
+                  .map((c) => (
+                    <li key={c.kind} className="rounded-md border border-[var(--line)] bg-[var(--bg)] px-2 py-1 text-xs text-[var(--ink)]">
+                      {c.label}: {c.count}
+                    </li>
+                  ))}
+              </ul>
+            </div>
           ) : predictedCalls ? (
-            <p>Predicted API calls: none — no new source pulls expected.</p>
+            <p>API queue: no new source pulls expected.</p>
           ) : null}
         </div>
       )}
 
-      {report && <ScoutReportView report={report} />}
+      {report && (
+        <ScoutReportView key={review?.id ?? "live"} report={report} review={review} />
+      )}
     </div>
   );
 }
@@ -603,6 +761,70 @@ function TeamRowInline({ team }: { team: LeagueTeam }) {
       ) : null}
     </span>
   );
+}
+
+function ReviewGamePicker({
+  games,
+  loading,
+  activeId,
+  onPick,
+}: {
+  games: ReviewGameSummary[] | null;
+  loading: boolean;
+  activeId: string | null;
+  onPick: (id: string) => void;
+}) {
+  return (
+    <section className="space-y-2 rounded-md border border-[var(--line)] bg-[var(--panel)] px-4 py-4">
+      <p className="text-sm font-medium text-[var(--ink)]">Games we&apos;ve played</p>
+      <p className="text-sm text-[var(--muted)]">
+        Pick a game to load its draft from the NGS replay and grade every ban and pick.
+      </p>
+      {loading ? (
+        <p className="text-sm text-[var(--muted)]">Loading NGS schedule…</p>
+      ) : !games?.length ? (
+        <p className="text-sm text-[var(--muted)]">No reported games with replays yet.</p>
+      ) : (
+        <ul className="grid gap-1 sm:grid-cols-2 lg:grid-cols-3">
+          {games.map((g) => (
+            <li key={g.id}>
+              <button
+                type="button"
+                onClick={() => onPick(g.id)}
+                className={`flex w-full items-baseline justify-between gap-3 rounded-md border px-3 py-2 text-left text-sm hover:bg-[var(--line)]/40 ${
+                  g.id === activeId
+                    ? "border-[var(--accent)] bg-[var(--accent)]/15"
+                    : "border-[var(--line)]"
+                }`}
+              >
+                <span className="min-w-0 truncate text-[var(--ink)]">
+                  <span className="font-semibold">Wk {g.round} G{g.game}</span> vs{" "}
+                  {g.opponent}
+                  <span className="text-[var(--muted)]"> · {g.map ?? "unknown map"}</span>
+                </span>
+                {g.won != null && (
+                  <span
+                    className={`shrink-0 text-xs font-bold ${g.won ? "text-emerald-600" : "text-red-600"}`}
+                  >
+                    {g.won ? "W" : "L"}
+                  </span>
+                )}
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+    </section>
+  );
+}
+
+function fillLineup(tags: string[], roster: RosterPlayer[]): string[] {
+  const out = [...tags];
+  for (const p of roster) {
+    if (out.length >= 5) break;
+    if (!out.includes(p.battletag)) out.push(p.battletag);
+  }
+  return out.slice(0, 5);
 }
 
 async function loadRoster(team: string): Promise<RosterPlayer[]> {

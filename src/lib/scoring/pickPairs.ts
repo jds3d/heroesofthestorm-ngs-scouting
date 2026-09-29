@@ -3,17 +3,14 @@
  * Score the two locks as a pair so tank+offlane (etc.) stay coherent.
  */
 import {
-  heroIsOfflaner,
-  planHasOfflane,
-  planHasRangedDamage,
-  planHasWaveclear,
-} from "@/lib/scoring/draftPlan";
-import {
+  allyDuos,
   heroDraftMeta,
-  liveAllySynergies,
+  scoreDuos,
+  SYNERGY_DUO,
   type DraftMetaTable,
 } from "@/lib/scoring/draftMeta";
-import { heroKey, heroRole } from "@/lib/scoring/heroMeta";
+import { heroKey } from "@/lib/scoring/heroMeta";
+import { checkRequiredRoles } from "@/lib/scoring/roles";
 import type { DraftCompPick } from "@/lib/scoring/types";
 
 /** True when this step starts a same-side pick-pick double. */
@@ -53,89 +50,60 @@ export type RankedPickPair = {
   /** Combined pair score (solo bases + duo + structure + order). */
   total: number;
   /** Factors unique to the pair layer (duo / structure / order). */
-  pairFactors: {
-    id: string;
-    label: string;
-    points: number;
-    detail: string;
-  }[];
+  pairFactors: PairScoreFactor[];
   /** Solo base totals used inside the pair (no single-pick structure). */
   firstSolo: number;
   secondSolo: number;
 };
 
-/** Structure of the five after both locks — no mid-pick "leaves seat empty" traps. */
-export function pairStructureDelta(
-  before: DraftCompPick[],
+export type PairScoreFactor = {
+  id: string;
+  label: string;
+  points: number;
+  detail: string;
+  /** Explanation for the portion credited to the hero locked first. */
+  firstDetail?: string;
+  /** Explanation for the portion credited to the hero locked second. */
+  secondDetail?: string;
+  /** Portion credited to the hero locked first. */
+  firstPoints: number;
+  /** Portion credited to the hero locked second. */
+  secondPoints: number;
+};
+
+/**
+ * Required roles after both locks. `after` must be this team's locked heroes
+ * plus the pair — not unlocked plan placeholders.
+ */
+export function pairRoleCheck(
   after: DraftCompPick[],
-): { points: number; bits: string[] } {
-  let points = 0;
-  const bits: string[] = [];
-  const hadClear = planHasWaveclear(before);
-  const hasClear = planHasWaveclear(after);
-  const hadOff = planHasOfflane(before);
-  const hasOff = planHasOfflane(after);
-  const hadRanged = planHasRangedDamage(before);
-  const hasRanged = planHasRangedDamage(after);
-
-  if (!hadRanged && hasRanged) {
-    points += 36;
-    bits.push("Pair fills ranged damage");
-  } else if (hadRanged && !hasRanged) {
-    points -= 42;
-    bits.push("Pair drops the only ranged damage");
-  } else if (!hasRanged) {
-    points -= 28;
-    bits.push("Five still all-melee after both locks");
-  }
-
-  if (!hadClear && hasClear) {
-    points += hasRanged ? 30 : 12;
-    bits.push(
-      hasRanged
-        ? "Pair fills waveclear"
-        : "Pair adds waveclear but ranged still missing",
-    );
-  } else if (hadClear && !hasClear) {
-    points -= 38;
-    bits.push("Pair drops the only waveclear");
-  } else if (!hasClear) {
-    points -= 16;
-    bits.push("Five still has no waveclear after both locks");
-  }
-
-  if (!hadOff && hasOff) {
-    points += 40;
-    bits.push("Pair fills offlane");
-  } else if (hadOff && !hasOff) {
-    points -= 32;
-    bits.push("Pair removes the offlaner");
-  } else if (!hasOff) {
-    points -= 22;
-    bits.push("Five still has no offlaner after both locks");
-  }
-
-  const afterRoles = after.map((p) => heroRole(p.hero));
-  const hasTank = afterRoles.some((r) => r === "Tank");
-  const hasHeal = afterRoles.some((r) => r === "Healer" || r === "Support");
-  const tankHero = after.find((p) => heroRole(p.hero) === "Tank")?.hero ?? null;
-  const healHero =
-    after.find((p) => {
-      const r = heroRole(p.hero);
-      return r === "Healer" || r === "Support";
-    })?.hero ?? null;
-  const offHero = after.find((p) => heroIsOfflaner(p.hero))?.hero ?? null;
-  if (hasTank && hasHeal && hasOff) {
-    points += 8;
-    bits.push(
-      `Core seats covered: ${tankHero ?? "tank"} (tank) / ${healHero ?? "heal"} (heal) / ${offHero ?? "offlane"} (offlane)`,
-    );
-  } else if (!hasTank) {
-    points -= 24;
-    bits.push("No tank after both locks");
-  }
-
-  return { points, bits };
+  first: string,
+  second: string,
+): {
+  points: number;
+  detail: string;
+  firstPoints: number;
+  secondPoints: number;
+  firstDetail: string;
+  secondDetail: string;
+} {
+  const heroes = after.map((pick) => pick.hero);
+  const check = checkRequiredRoles(heroes);
+  const [firstPoints, secondPoints] = splitBetweenPair(check.points);
+  const heroDetail = (hero: string, share: number) => {
+    const index = heroes.findIndex((h) => heroKey(h) === heroKey(hero));
+    const role = index >= 0 ? check.filledBy.get(index) : undefined;
+    const covers = role ? `Covers ${role}` : "Flex — no required role";
+    return share ? `${covers} · ${check.detail}: ${share}` : covers;
+  };
+  return {
+    points: check.points,
+    detail: check.detail,
+    firstPoints,
+    secondPoints,
+    firstDetail: heroDetail(first, firstPoints),
+    secondDetail: heroDetail(second, secondPoints),
+  };
 }
 
 /** Duo WR between the two locks (not yet on the board). */
@@ -144,36 +112,101 @@ export function pairDuoSynergy(
   a: string,
   b: string,
 ): { points: number; detail: string } {
-  const edges = [
-    ...liveAllySynergies(table, a, [b]).map((edge) => ({ ...edge, hero: a })),
-    ...liveAllySynergies(table, b, [a]).map((edge) => ({ ...edge, hero: b })),
-  ];
-  const edge = edges.sort((left, right) => right.games - left.games || Math.abs(right.deltaPp) - Math.abs(left.deltaPp))[0];
-  if (!edge) {
-    const raw =
-      heroDraftMeta(table, a).synergiesWith.find(
-        (s) => heroKey(s.hero) === heroKey(b),
-      ) ??
-      heroDraftMeta(table, b).synergiesWith.find(
-        (s) => heroKey(s.hero) === heroKey(a),
-      );
-    if (!raw) {
-      return { points: 0, detail: "No duo sample between these two yet" };
-    }
-    const vsCoin = raw.allyWinRate - 50;
-    const points = Math.max(-10, Math.min(12, vsCoin * 1.15));
-    const sign = raw.deltaPp >= 0 ? "+" : "";
+  const [duo] = allyDuos(table, a, [b]);
+  if (!duo) {
+    const aMeta = heroDraftMeta(table, a);
+    const bMeta = heroDraftMeta(table, b);
+    const hasAnyAllyData =
+      (aMeta.allySamples?.length ?? 0) > 0 ||
+      (bMeta.allySamples?.length ?? 0) > 0 ||
+      aMeta.synergiesWith.length > 0 ||
+      bMeta.synergiesWith.length > 0;
     return {
-      points,
-      detail: `${raw.allyWinRate}% together (${sign}${raw.deltaPp}pp vs solo, ${raw.games}g)`,
+      points: 0,
+      detail: hasAnyAllyData
+        ? `No duo sample between ${a} and ${b} with enough games to count.`
+        : `ally data unavailable for ${a} and ${b} right now; no verified sample to score.`,
     };
   }
-  const vsCoin = edge.allyWinRate - 50;
-  const points = Math.max(-10, Math.min(12, vsCoin * 1.15));
-  const sign = edge.deltaPp >= 0 ? "+" : "";
+  const points = Math.round(scoreDuos([duo], SYNERGY_DUO, "together").points);
   return {
     points,
-    detail: `${edge.allyWinRate}% together (${sign}${edge.deltaPp}pp vs solo, ${edge.games}g)`,
+    detail: `${duo.winRate}% together (${duo.games.toLocaleString("en-US")}g) — worth ${points > 0 ? "+" : ""}${points} pair points`,
+  };
+}
+
+function splitBetweenPair(points: number): [number, number] {
+  const rounded = Math.round(points);
+  const first = Math.trunc(rounded / 2);
+  return [first, rounded - first];
+}
+
+/** Split pair-only factors so the scorecard explains each hero's contribution. */
+export function pairScoreFactors(args: {
+  table: DraftMetaTable | null | undefined;
+  after: DraftCompPick[];
+  first: string;
+  second: string;
+}): PairScoreFactor[] {
+  const duo = pairDuoSynergy(args.table, args.first, args.second);
+  const [firstSynergy, secondSynergy] = splitBetweenPair(duo.points);
+  const roles = pairRoleCheck(args.after, args.first, args.second);
+  return [
+    {
+      id: "duo",
+      label: "Ally synergy",
+      points: Math.round(duo.points),
+      detail: duo.detail,
+      firstPoints: firstSynergy,
+      secondPoints: secondSynergy,
+    },
+    {
+      id: "roles",
+      label: "Roles",
+      points: roles.points,
+      detail: roles.detail,
+      firstDetail: roles.firstDetail,
+      secondDetail: roles.secondDetail,
+      firstPoints: roles.firstPoints,
+      secondPoints: roles.secondPoints,
+    },
+  ];
+}
+
+/** Score one specific lock order (first, then second). */
+export function scoreOrderedPair(args: {
+  first: PairSeatCand;
+  second: PairSeatCand;
+  soloScore: (hero: string) => number;
+  /** This team's locked heroes plus both new locks (no unlocked plan seats). */
+  projectBoth: (first: string, second: string) => DraftCompPick[];
+  table: DraftMetaTable | null | undefined;
+}): RankedPickPair {
+  const { first, second } = args;
+  const firstSolo = args.soloScore(first.hero);
+  const secondSolo = args.soloScore(second.hero);
+  const pairFactors = pairScoreFactors({
+    table: args.table,
+    after: args.projectBoth(first.hero, second.hero),
+    first: first.hero,
+    second: second.hero,
+  });
+  const total = Math.round(
+    firstSolo + secondSolo + pairFactors.reduce((sum, factor) => sum + factor.points, 0),
+  );
+  return {
+    first: first.hero,
+    second: second.hero,
+    firstPlayer: first.player ?? null,
+    secondPlayer: second.player ?? null,
+    firstRole: first.role,
+    secondRole: second.role,
+    firstFromAlt: first.fromAlt,
+    secondFromAlt: second.fromAlt,
+    total,
+    pairFactors,
+    firstSolo,
+    secondSolo,
   };
 }
 
@@ -187,8 +220,7 @@ export function rankDoublePickPairs(args: {
   soloScore: (hero: string) => number;
   /** True when they might take this hero (deny / comfort) — prefer locking first. */
   contested: (hero: string) => boolean;
-  beforePlan: DraftCompPick[];
-  /** Apply first then second onto the plan for structure. */
+  /** This team's locked heroes plus both new locks (no unlocked plan seats). */
   projectBoth: (first: string, second: string) => DraftCompPick[];
   table: DraftMetaTable | null | undefined;
   maxPerSeat?: number;
@@ -232,50 +264,10 @@ export function rankDoublePickPairs(args: {
       return;
     }
 
-    const evaluate = (first: PairSeatCand, second: PairSeatCand) => {
-      const firstSolo = args.soloScore(first.hero);
-      const secondSolo = args.soloScore(second.hero);
-      const duo = pairDuoSynergy(args.table, first.hero, second.hero);
-      const projected = args.projectBoth(first.hero, second.hero);
-      const structure = pairStructureDelta(args.beforePlan, projected);
-
-      const pairFactors = [
-        {
-          id: "duo",
-          label: "Pair synergy",
-          points: Math.round(duo.points),
-          detail: duo.detail,
-        },
-        {
-          id: "pair-structure",
-          label: "Pair structure",
-          points: Math.round(structure.points),
-          detail: structure.bits.length
-            ? structure.bits.join(" · ")
-            : "No structural change",
-        },
-      ];
-
-      const total = Math.round(
-        firstSolo + secondSolo + duo.points + structure.points,
-      );
-
-      return {
-        first: first.hero,
-        second: second.hero,
-        firstPlayer: first.player ?? null,
-        secondPlayer: second.player ?? null,
-        firstRole: first.role,
-        secondRole: second.role,
-        firstFromAlt: first.fromAlt,
-        secondFromAlt: second.fromAlt,
-        total,
-        pairFactors,
-        firstSolo,
-        secondSolo,
-        key: [heroKey(first.hero), heroKey(second.hero)].sort().join("|"),
-      } satisfies Raw;
-    };
+    const evaluate = (first: PairSeatCand, second: PairSeatCand): Raw => ({
+      ...scoreOrderedPair({ ...args, first, second }),
+      key: [heroKey(first.hero), heroKey(second.hero)].sort().join("|"),
+    });
 
     for (const ordered of [evaluate(a, b), evaluate(b, a)]) {
       const prev = bestByKey.get(ordered.key);

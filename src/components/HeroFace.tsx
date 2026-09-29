@@ -40,7 +40,7 @@ export function HeroFace({
           : "h-14 w-14";
 
   return (
-    <div className="flex flex-col items-center gap-1" title={title ?? hero}>
+    <div className="flex flex-col items-center gap-1" title={title}>
       <div
         className={`relative overflow-hidden bg-[#1a2430] ${dims} ${
           kind === "select" ? "rounded-full ring-2 ring-[#3d5163]" : "rounded-sm"

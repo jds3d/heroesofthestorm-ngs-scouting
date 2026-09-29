@@ -1,14 +1,12 @@
 import { describe, expect, it } from "vitest";
+import { cachedFetch, invalidateCached, setCached } from "@/lib/cache";
 import {
-  buildOpeningBanHoldNote,
   explainTheirArchetypeRead,
   explainTheirLikelyBan,
   expectTheirNext,
   findSeatForCandidate,
   isLockedPlanSeat,
-  isValidStructureHero,
   planPickLabel,
-  scoreProjectedCompStructure,
   showSuggestionOnPlan,
 } from "@/components/InteractiveDraft";
 import {
@@ -18,13 +16,35 @@ import {
 } from "@/config/divePlaybook";
 import { healDenyGuideFor } from "@/config/healDenyPlaybook";
 import { applyMapToDraftPlan } from "@/lib/scoring/applyMap";
-import { gradeFinishedDraft } from "@/lib/scoring/draftGrade";
+import {
+  favouredLabel,
+  gradeFinishedDraft,
+  mmrAdjustedWinPct,
+  pctToGrade,
+  stepPct,
+  sumStepPoints,
+  type DraftStepScore,
+} from "@/lib/scoring/draftGrade";
 import { heroKey } from "@/lib/scoring/heroMeta";
 import { solveSeatAssignments } from "@/lib/scoring/draftPlan";
-import { pairDuoSynergy, pairStructureDelta } from "@/lib/scoring/pickPairs";
+import { pairDuoSynergy, pairRoleCheck } from "@/lib/scoring/pickPairs";
 import {
+  HeroesProfileError,
+  heroesProfileRetryDelayMs,
+  matchupsNeedMoreGames,
+  parseHeroMapStats,
+  selectLatestGlobalPatch,
+  validateHeroMapStats,
+} from "@/lib/heroesprofile/client";
+import {
+  allyDuos,
   buildDraftMetaTable,
+  counterPoolNote,
+  enemyDuos,
+  scoreDuos,
+  SYNERGY_DUO,
   isMapSpecialist,
+  mapSpecialistTooltip,
   nakedOfflaneOpeningRisk,
   type DraftMetaTable,
 } from "@/lib/scoring/draftMeta";
@@ -95,46 +115,220 @@ describe("healDenyPlaybook currency", () => {
   });
 });
 
+describe("global patch selection", () => {
+  it("skips the newest patch when HeroesProfile does not yet have global stats for it", () => {
+    const latest = selectLatestGlobalPatch([
+      { game_version: "2.55.17.98025", valid_globals: false },
+      { game_version: "2.55.16.97145", valid_globals: true },
+      { game_version: "2.55.15.96000", valid_globals: true },
+    ]);
+
+    expect(latest).toBe("2.55.16.97145");
+  });
+});
+
+describe("HeroesProfile rate-limit backoff", () => {
+  it("honors an API Retry-After value while preserving a minimum request gap", () => {
+    expect(heroesProfileRetryDelayMs("12", 0)).toBe(12_000);
+    expect(heroesProfileRetryDelayMs("0", 0)).toBeGreaterThanOrEqual(1_250);
+  });
+
+  it("uses increasing backoff when the API omits Retry-After", () => {
+    expect(heroesProfileRetryDelayMs(null, 1)).toBeGreaterThan(
+      heroesProfileRetryDelayMs(null, 0),
+    );
+  });
+});
+
 describe("draftGrade", () => {
-  it("caps grade when missing healer", () => {
+  const ourLocked = [
+    { hero: "Anub'arak", player: null },
+    { hero: "Qhira", player: null },
+    { hero: "Genji", player: null },
+    { hero: "Malthael", player: null },
+    { hero: "Greymane", player: null },
+  ];
+  const theirLocked = [
+    { hero: "Varian", player: null },
+    { hero: "Rehgar", player: null },
+    { hero: "Valla", player: null },
+    { hero: "Sonya", player: null },
+    { hero: "Falstad", player: null },
+  ];
+  const step = (
+    side: "our" | "their",
+    best: number,
+    achieved: number,
+  ): DraftStepScore => ({
+    side,
+    kind: "pick",
+    label: `Pick ${best}`,
+    locked: "X",
+    bestLabel: "Y",
+    best,
+    achieved,
+  });
+  const base = {
+    ourLocked,
+    theirLocked,
+    homeRoster: [],
+    theirRoster: [],
+    table: null,
+    map: null,
+    ourLabel: "LBB",
+    theirLabel: "TG",
+  };
+
+  it("grades each side on points achieved out of the best available", () => {
     const card = gradeFinishedDraft({
-      ourLocked: [
-        { hero: "Anub'arak", player: null },
-        { hero: "Qhira", player: null },
-        { hero: "Genji", player: null },
-        { hero: "Malthael", player: null },
-        { hero: "Greymane", player: null },
-      ],
-      theirLocked: [
-        { hero: "Johanna", player: null },
-        { hero: "Rehgar", player: null },
-        { hero: "Valla", player: null },
-        { hero: "Sonya", player: null },
-        { hero: "Falstad", player: null },
-      ],
-      ourOptimal: [],
-      theirOptimal: [],
-      homeRoster: [],
-      theirRoster: [],
-      table: null,
-      map: null,
+      ...base,
+      steps: [step("our", 60, 45), step("our", 75, 40), step("their", 50, 50)],
     });
-    expect(["C+", "C", "C-", "D", "F"]).toContain(card.ours.grade);
+    expect(card.ours.points).toBe(85);
+    expect(card.ours.bestPoints).toBe(135);
+    expect(card.ours.pct).toBe(63);
+    expect(card.ours.grade).toBe("D");
+    expect(card.theirs.pct).toBe(100);
+    expect(card.theirs.grade).toBe("A+");
+    expect(card.ours.notes[0]).toContain("Biggest miss");
+  });
+
+  it("never lets a lock beat its step's best, and counts Varian as the tank", () => {
+    expect(sumStepPoints([step("our", 20, 30)]).pct).toBe(100);
+    expect(pctToGrade(88)).toBe("B+");
+    const card = gradeFinishedDraft({ ...base, steps: [] });
+    expect(card.theirs.notes.join(" ")).not.toContain("tank");
+    expect(card.ours.notes.join(" ")).toContain("Missing: healer");
+    expect(card.draftWinPct).toBeLessThan(50);
+  });
+
+  it("letter-grades every step on its own achieved / best", () => {
+    const card = gradeFinishedDraft({
+      ...base,
+      steps: [step("our", 60, 60), step("our", 75, 40), step("our", -5, -12)],
+    });
+    expect(card.ours.steps.map((s) => s.grade)).toEqual(["A+", "F", "F"]);
+    expect(stepPct({ best: -5, achieved: -5 })).toBe(100);
+  });
+
+  it("shifts win chance by the team MMR gap on the Elo scale", () => {
+    expect(mmrAdjustedWinPct(50, 2400, 2000)).toBe(91);
+    expect(mmrAdjustedWinPct(60, 2000, 2000)).toBe(60);
+    const card = gradeFinishedDraft({ ...base, steps: [], ourMmr: 2600, theirMmr: 2500 });
+    expect(card.mmrWinPct).toBeGreaterThan(card.draftWinPct);
+    expect(card.mmrGap).toBe(100);
+    expect(favouredLabel(41, "LBB", "TG")).toBe("TG favoured, 59%");
+  });
+});
+
+describe("duo scoring", () => {
+  const ally = (hero: string, allyWinRate: number, games: number) => ({
+    hero,
+    wins: 0,
+    losses: 0,
+    games,
+    allyWinRate,
+  });
+  const enemy = (hero: string, enemyWinRate: number, games: number) => ({
+    hero,
+    wins: 0,
+    losses: 0,
+    games,
+    enemyWinRate,
+  });
+  const g = (hero: string, winRate: number) => ({
+    hero,
+    winRate,
+    influence: 0,
+    popularity: 0,
+    banRate: 0,
+    pickRate: 0,
+    games: 5000,
+  });
+  const table = buildDraftMetaTable({
+    patch: "test",
+    global: [g("Tyrael", 54), g("Whitemane", 50), g("Falstad", 50), g("Valla", 50)],
+    matchups: {
+      Tyrael: [enemy("Valla", 44, 500)],
+      Falstad: [enemy("Tyrael", 48, 800)],
+    },
+    allies: {
+      Tyrael: [ally("Whitemane", 54, 1000), ally("Falstad", 57, 90)],
+    },
+  });
+
+  it("scores every locked teammate as its own duo on absolute WR together", () => {
+    const duos = allyDuos(table, "Tyrael", ["Whitemane", "Falstad", "Valla"]);
+    expect(duos.map((d) => [d.hero, d.edgePp])).toEqual([
+      ["Whitemane", 4],
+      // Small samples count in full — more data comes from stacking patches.
+      ["Falstad", 7],
+    ]);
+  });
+
+  it("includes mild matchups from either hero's row, not only hard counters", () => {
+    const duos = enemyDuos(table, "Tyrael", ["Valla", "Falstad"]);
+    expect(duos.find((d) => d.hero === "Valla")?.winRate).toBe(56);
+    // Falstad's row: Tyrael wins 48% into Falstad.
+    expect(duos.find((d) => d.hero === "Falstad")?.edgePp).toBe(-2);
+  });
+
+  it("lists every locked hero in the breakdown, including unsampled ones", () => {
+    const allies = ["Whitemane", "Falstad", "Valla"];
+    const result = scoreDuos(allyDuos(table, "Tyrael", allies), SYNERGY_DUO, "together", allies);
+    expect(result.lines).toEqual([
+      "with Falstad: 57% together (90g) → +8",
+      "with Whitemane: 54% together (1,000g) → +5",
+      "with Valla: no sample with enough games → 0",
+    ]);
+    expect(Math.round(result.points)).toBe(13);
+  });
+});
+
+describe("matchup data depth", () => {
+  it("pulls more patches while ally duos are still imprecise, not just enemies", () => {
+    const precise = { hero: "X", wins: 0, losses: 0, games: 5000, enemyWinRate: 50 };
+    expect(
+      matchupsNeedMoreGames({
+        enemies: [precise],
+        allies: [{ hero: "Y", wins: 0, losses: 0, games: 200, allyWinRate: 52 }],
+      }),
+    ).toBe(true);
+    expect(
+      matchupsNeedMoreGames({
+        enemies: [precise],
+        allies: [{ hero: "Y", wins: 0, losses: 0, games: 5000, allyWinRate: 52 }],
+      }),
+    ).toBe(false);
   });
 });
 
 describe("data-driven structure checks", () => {
-  it("names the actual hero filling each core seat in a covered pair", () => {
-    const result = pairStructureDelta([], [
-      { hero: "Tyrael", role: "Tank", player: null, note: "need" },
-      { hero: "Whitemane", role: "Healer", player: null, note: "need" },
-      { hero: "Leoric", role: "Offlane", player: null, note: "need" },
-    ] as DraftCompPick[]);
-
-    expect(result.points).toBeGreaterThan(0);
-    expect(result.bits).toContain(
-      "Core seats covered: Tyrael (tank) / Whitemane (heal) / Leoric (offlane)",
+  it("names the answering side in the pool note", () => {
+    const threats = [{ hero: "Hogger", theirWinRate: 55, games: 200, deltaPp: 4 }];
+    expect(counterPoolNote(threats, [], "ours")).toBe(
+      "Not fearing Hogger — not in our played pool.",
     );
+    expect(counterPoolNote(threats, [])).toBe(
+      "Not fearing Hogger — not in their played pool.",
+    );
+  });
+
+  it("names the role each hero covers in a pair", () => {
+    const result = pairRoleCheck(
+      [
+        { hero: "Tyrael", role: "Tank", player: null, note: "locked" },
+        { hero: "Whitemane", role: "Healer", player: null, note: "locked" },
+        { hero: "Leoric", role: "Offlane", player: null, note: "locked" },
+      ] as DraftCompPick[],
+      "Whitemane",
+      "Leoric",
+    );
+
+    expect(result.points).toBe(0);
+    expect(result.firstDetail).toBe("Covers healer");
+    expect(result.secondDetail).toBe("Covers offlane");
+    expect(result.detail).toBe("Still need ranged damage · 2 picks left");
   });
 
   it("uses the reverse-direction ally sample when the first hero row is empty", () => {
@@ -153,6 +347,7 @@ describe("data-driven structure checks", () => {
           timing: "flex",
           counteredBy: [],
           synergiesWith: [],
+          allySamples: [],
           mapStrong: [],
           note: "",
         },
@@ -174,6 +369,7 @@ describe("data-driven structure checks", () => {
               deltaPp: 6,
             },
           ],
+          allySamples: [],
           mapStrong: [],
           note: "",
         },
@@ -185,6 +381,50 @@ describe("data-driven structure checks", () => {
     expect(result.detail).toContain("56% together");
     expect(result.detail).not.toContain("No duo sample");
     expect(result.points).toBeGreaterThan(0);
+  });
+
+  it("labels missing ally data as unavailable instead of silently neutral", () => {
+    const table = {
+      patch: "test",
+      source: "heroesprofile-sl",
+      byHero: {
+        Whitemane: {
+          hero: "Whitemane",
+          winRate: 50,
+          influence: 0,
+          popularity: 0,
+          banRate: 0,
+          pickRate: 0,
+          games: 0,
+          timing: "flex",
+          counteredBy: [],
+          synergiesWith: [],
+          allySamples: [],
+          mapStrong: [],
+          note: "",
+        },
+        Tyrael: {
+          hero: "Tyrael",
+          winRate: 50,
+          influence: 0,
+          popularity: 0,
+          banRate: 0,
+          pickRate: 0,
+          games: 0,
+          timing: "flex",
+          counteredBy: [],
+          synergiesWith: [],
+          allySamples: [],
+          mapStrong: [],
+          note: "",
+        },
+      },
+    } as DraftMetaTable;
+
+    const result = pairDuoSynergy(table, "Whitemane", "Tyrael");
+
+    expect(result.detail).toContain("ally data unavailable");
+    expect(result.points).toBe(0);
   });
 
   it("uses HeroesProfile map rows as the source of truth, not a hardcoded map list", () => {
@@ -216,46 +456,106 @@ describe("data-driven structure checks", () => {
     });
     expect(isMapSpecialist(table, "Tyrael", "Tomb of the Spider Queen")).toBeNull();
     expect(isMapSpecialist(table, "Tyrael", "Infernal Shrines")?.map).not.toBe("Blackheart's Bay");
+    expect(mapSpecialistTooltip(isMapSpecialist(table, "Tyrael", "Infernal Shrines"))).toContain("57.0% WR");
+    expect(mapSpecialistTooltip(isMapSpecialist(table, "Tyrael", "Infernal Shrines"))).toContain("95% CI target");
   });
 
-  it("does not punish a valid Deathwing two-bruiser structure when the patch meta says it is viable", () => {
-    const table = {
-      patch: "test",
-      source: "heroesprofile-sl",
-      byHero: {
-        Deathwing: {
-          hero: "Deathwing",
-          winRate: 49,
-          influence: 25,
-          popularity: 14,
-          banRate: 0,
-          pickRate: 0,
-          games: 180,
-          timing: "flex",
-          counteredBy: [],
-          synergiesWith: [],
-          mapStrong: [],
-          note: "",
-        },
+  it("fails fast when the map-stat dataset is empty instead of silently treating it as zero", () => {
+    expect(() => validateHeroMapStats([])).toThrow(HeroesProfileError);
+    expect(() => validateHeroMapStats([])).toThrow(/empty.*map/i);
+  });
+
+  it("parses the map-keyed payload returned by HeroesProfile group_by_map", () => {
+    expect(
+      parseHeroMapStats({
+        "Infernal Shrines": [
+          { name: "Tyrael", win_rate: 57, games_played: 120 },
+        ],
+      }),
+    ).toEqual([
+      {
+        hero: "Tyrael",
+        map: "Infernal Shrines",
+        winRate: 57,
+        games: 120,
       },
-    } as any;
-
-    const result = scoreProjectedCompStructure({
-      hero: "Deathwing",
-      livePicks: [],
-      projected: [
-        { hero: "Deathwing", role: "Bruiser", player: null, note: "need" },
-        { hero: "Leoric", role: "Offlane", player: null, note: "need" },
-      ],
-      table,
-    });
-
-    expect(result.extra).toBe(0);
-    expect(result.structureBits).toEqual([]);
+    ]);
   });
+
+  it("parses a successful top-level payload when the response has no data wrapper", () => {
+    expect(
+      parseHeroMapStats([
+        {
+          name: "Tyrael",
+          map: "Infernal Shrines",
+          win_rate: 57,
+          games_played: 120,
+        },
+      ]),
+    ).toEqual([
+      {
+        hero: "Tyrael",
+        map: "Infernal Shrines",
+        winRate: 57,
+        games: 120,
+      },
+    ]);
+  });
+
+  it("parses a hero-keyed grouped map payload without inventing zero-valued parent rows", () => {
+    expect(
+      parseHeroMapStats({
+        Tyrael: {
+          "Infernal Shrines": { win_rate: 57, games_played: 120 },
+        },
+      }),
+    ).toEqual([
+      {
+        hero: "Tyrael",
+        map: "Infernal Shrines",
+        winRate: 57,
+        games: 120,
+      },
+    ]);
+  });
+
+  it("parses the real map-to-hero grouped response shape without a data wrapper", () => {
+    expect(
+      parseHeroMapStats({
+        "Infernal Shrines": {
+          Tyrael: { win_rate: 57, games_played: 120 },
+        },
+      }),
+    ).toEqual([
+      {
+        hero: "Tyrael",
+        map: "Infernal Shrines",
+        winRate: 57,
+        games: 120,
+      },
+    ]);
+  });
+
+  it("drops a stale empty cached payload before reusing it", async () => {
+    const key = "__test-empty-map-cache__";
+    await invalidateCached(key);
+    await setCached(key, [], 60_000);
+
+    const result = await cachedFetch(
+      key,
+      async () => [{ hero: "Tyrael", map: "Infernal Shrines", winRate: 57, games: 120 }],
+      60_000,
+      { isEmpty: (rows) => !Array.isArray(rows) || rows.length === 0 },
+    );
+
+    expect(result).toHaveLength(1);
+    expect(result[0].hero).toBe("Tyrael");
+    await invalidateCached(key);
+  });
+
 });
 
-describe("opening ban hold notes", () => {
+describe("opponent draft explanations", () => {
   it("explains why the enemy projects as dive from tags on their projected heroes", () => {
     expect(
       explainTheirArchetypeRead("Tricky Gooses", "dive", [
@@ -270,27 +570,6 @@ describe("opening ban hold notes", () => {
     expect(
       explainTheirLikelyBan("Tricky Gooses", "Tyrael", "Polarus", "dive"),
     ).toContain("Tyrael is an anti-dive counter, so Tricky Gooses should remove it");
-  });
-
-  it("suppresses hold-note leaks when the recommended ban is Auriel and Anduin is not the same mutual-ban call", () => {
-    expect(
-      buildOpeningBanHoldNote({
-        ourBanCount: 0,
-        hero: "Auriel",
-        mutualFactor: { points: 18 },
-      }),
-    ).toBeNull();
-  });
-
-  it("keeps the hold note only when the current suggested hero itself is the mutual-ban hold", () => {
-    expect(
-      buildOpeningBanHoldNote({
-        ourBanCount: 0,
-        hero: "Anduin",
-        mutualFactor: { points: -12 },
-      }),
-    ).toBe("If Anduin is still up, hold it for opening ban round 2 (our second of two opening bans — not a free 3rd)."
-    );
   });
 
   it("removes the future opposing-ban expectation while we are choosing our own ban", () => {
@@ -495,6 +774,7 @@ describe("naked offlane opening risk", () => {
           timing: "flex",
           counteredBy: [],
           synergiesWith: [],
+          allySamples: [],
           mapStrong: [],
           note: "",
         },
@@ -536,6 +816,7 @@ describe("naked offlane opening risk", () => {
           timing: "flex",
           counteredBy: [{ hero: "Johanna", theirWinRate: 58, games: 80, deltaPp: 5 }],
           synergiesWith: [],
+          allySamples: [],
           mapStrong: [],
           note: "",
         },
@@ -550,6 +831,7 @@ describe("naked offlane opening risk", () => {
           timing: "early",
           counteredBy: [],
           synergiesWith: [],
+          allySamples: [],
           mapStrong: [],
           note: "",
         },
