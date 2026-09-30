@@ -1,3 +1,7 @@
+import {
+  heroesProfilePlayerUrl,
+  ngsHeroesProfileUrl,
+} from "@/lib/heroesprofile/profileUrls";
 import type { ComfortHero, PlayerScout, SourceHeroStat } from "@/lib/scoring/types";
 
 function sourceLabel(
@@ -11,11 +15,10 @@ function sourceLabel(
 function heroSourceLine(h: ComfortHero): string {
   const parts = [
     sourceLabel("NGS", h.sources.ngsCurrent),
+    sourceLabel("NGS history", h.sources.ngsPrior),
     sourceLabel("SL", h.sources.stormLeague),
+    sourceLabel("QM", h.sources.quickMatch),
   ].filter(Boolean);
-  if (parts.length === 0 && h.sources.ngsPrior) {
-    parts.push(sourceLabel("NGS prior", h.sources.ngsPrior)!);
-  }
   return parts.length > 0 ? parts.join(" · ") : "no sample";
 }
 
@@ -33,7 +36,7 @@ export function PlayerCard({ player }: { player: PlayerScout }) {
         </div>
         <div className="flex gap-2 text-xs">
           <a
-            href={player.ngsProfileUrl}
+            href={ngsHeroesProfileUrl(player.battletag, player.blizzId)}
             target="_blank"
             rel="noreferrer"
             className="text-[var(--accent)] hover:underline"
@@ -41,7 +44,7 @@ export function PlayerCard({ player }: { player: PlayerScout }) {
             NGS HP
           </a>
           <a
-            href={player.heroesProfileUrl}
+            href={heroesProfilePlayerUrl(player.battletag, player.blizzId)}
             target="_blank"
             rel="noreferrer"
             className="text-[var(--accent)] hover:underline"

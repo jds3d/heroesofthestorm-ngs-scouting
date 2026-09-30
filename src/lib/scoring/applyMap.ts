@@ -154,6 +154,7 @@ export function applyMapToDraftPlan(
   const prevPivotId = plan.playbook?.recommended?.id ?? null;
   let nextSlots = plan.slots;
   let nextOurLikely = plan.ourLikely;
+  let pivotSides: DraftPlan["sides"] | null = null;
 
   const playbook = plan.playbook
     ? (() => {
@@ -171,7 +172,10 @@ export function applyMapToDraftPlan(
           );
           if (pivot) {
             nextSlots = pivotPlanSlots(pivot);
-            nextOurLikely = remapLikelyToSlots(plan.ourLikely, nextSlots);
+            pivotSides = plan.pivotSides?.[pivot.id] ?? null;
+            nextOurLikely = pivotSides
+              ? pivotSides.theyFirst.ourLikely
+              : remapLikelyToSlots(plan.ourLikely, nextSlots);
           }
         }
         return {
@@ -193,12 +197,28 @@ export function applyMapToDraftPlan(
   const draftStub: DraftInsights =
     draft ??
     ({
-      mapTendencies: [{ map: map.name, games: 0, wins: 0, winRate: 0 }],
+      mapTendencies: [
+        {
+          map: map.name,
+          games: 0,
+          wins: 0,
+          winRate: 0,
+          seasonGames: 0,
+          seasonWins: 0,
+        },
+      ],
     } as DraftInsights);
 
   const patchSide = (
     side: DraftPlan["sides"]["theyFirst"],
   ): DraftPlan["sides"]["theyFirst"] => {
+    // Precomputed pivot sides already carry a five and tree that agree.
+    if (pivotSides) {
+      return {
+        ...side,
+        ourBrief: patchBrief(side.ourBrief, side.ourLikely, map.name, draftStub),
+      };
+    }
     const ourLikely =
       nextOurLikely !== plan.ourLikely
         ? remapLikelyToSlots(side.ourLikely, nextSlots)
@@ -223,9 +243,11 @@ export function applyMapToDraftPlan(
     playbook,
     slots: nextSlots,
     ourLikely: nextOurLikely,
+    theirLikely: pivotSides?.theyFirst.theirLikely ?? plan.theirLikely,
+    tree: pivotSides?.theyFirst.tree ?? plan.tree,
     sides: {
-      theyFirst: patchSide(plan.sides.theyFirst),
-      weFirst: patchSide(plan.sides.weFirst),
+      theyFirst: patchSide((pivotSides ?? plan.sides).theyFirst),
+      weFirst: patchSide((pivotSides ?? plan.sides).weFirst),
     },
     ourBrief: patchBrief(plan.ourBrief, nextOurLikely, map.name, draftStub),
   };

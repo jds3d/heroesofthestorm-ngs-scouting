@@ -17,6 +17,7 @@ import {
   pairSeatCandidate,
   pairSeededPairOptions,
   pairStructureProjection,
+  pairSideBreakdown,
   pairSuggestionCautionLine,
   resolvePairPickSelection,
   stepHeading,
@@ -382,5 +383,32 @@ describe("ban deviation grading", () => {
 
     expect(result?.structuralReasons).toEqual([]);
     expect(result?.summary).toContain("Azmodan was not worth the ban slot");
+  });
+});
+
+describe("pairSideBreakdown", () => {
+  it("keeps the solo scorecard and that hero's share of the pair", () => {
+    const solo = [
+      { id: "patch", label: "Patch win rate", points: 10, detail: "50% WR" },
+    ];
+    const first = pairSideBreakdown(
+      solo,
+      [
+        {
+          id: "duo",
+          label: "Ally synergy",
+          points: 8,
+          detail: "54% together",
+          firstPoints: 5,
+          secondPoints: 3,
+        },
+      ],
+      "first",
+    );
+    expect(first.total).toBe(15);
+    expect(first.factors.map((factor) => [factor.label, factor.points])).toEqual([
+      ["Patch win rate", 10],
+      ["Pair synergy", 5],
+    ]);
   });
 });

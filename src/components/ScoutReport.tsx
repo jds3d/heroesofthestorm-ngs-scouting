@@ -98,8 +98,39 @@ export function ScoutReportView({
     else scrollToId("draft-plan");
   }
 
+  const missingPool = report.roster.filter((p) => p.topHeroes.length === 0);
+  const missingHomePool = (report.homeRoster ?? []).filter(
+    (p) => p.topHeroes.length === 0,
+  );
   return (
     <div className="flex flex-col gap-10">
+      {(missingPool.length > 0 || missingHomePool.length > 0) && (
+        <div
+          role="alert"
+          className="sticky top-0 z-30 space-y-2 rounded-md border-4 border-red-800 bg-red-600 px-5 py-4 text-white shadow-lg"
+        >
+          <p className="text-xl font-bold tracking-tight">
+            No hero pool found
+          </p>
+          {missingPool.length > 0 && (
+            <p className="text-base leading-snug">
+              <span className="font-semibold">{report.teamName}:</span>{" "}
+              {missingPool.map((p) => p.battletag.split("#")[0]).join(", ")}
+              . Storm League, older NGS seasons, and Quick Match all came back
+              empty. Comfort for{" "}
+              {missingPool.length === 1 ? "that player is" : "those players is"}{" "}
+              missing. Generate the report again.
+            </p>
+          )}
+          {missingHomePool.length > 0 && (
+            <p className="text-base leading-snug">
+              <span className="font-semibold">Little Buff Boyz:</span>{" "}
+              {missingHomePool.map((p) => p.battletag.split("#")[0]).join(", ")}
+              . Same failure on our side. Generate the home report again.
+            </p>
+          )}
+        </div>
+      )}
       <header className="space-y-3 border-t border-[var(--line)] pt-8">
         <div className="flex flex-wrap items-baseline justify-between gap-3">
           <h2 className="font-[family-name:var(--font-display)] text-3xl text-[var(--ink)]">
@@ -277,11 +308,9 @@ export function ScoutReportView({
             ))}
           </ul>
         )}
-        {shown.adapt.mapPlan &&
-          (shown.adapt.mapPlan.ban.length > 0 ||
-            shown.adapt.mapPlan.play.length > 0) && (
-            <MapPlanBlock plan={shown.adapt.mapPlan} />
-          )}
+        {shown.adapt.mapPlan && (
+          <MapPlanBlock plan={shown.adapt.mapPlan} season={report.season} />
+        )}
         {shown.threats.length > 0 && (
           <div className="space-y-2">
             <h4 className="text-sm font-semibold uppercase tracking-wide text-[var(--muted)]">
@@ -648,7 +677,7 @@ export function ScoutReportView({
   );
 }
 
-function MapPlanBlock({ plan }: { plan: MapPlan }) {
+function MapPlanBlock({ plan, season }: { plan: MapPlan; season: number }) {
   return (
     <div className="space-y-3 rounded-md border border-[var(--line)] bg-[var(--panel)] px-4 py-4">
       <h4
@@ -660,42 +689,110 @@ function MapPlanBlock({ plan }: { plan: MapPlan }) {
       {plan.note && (
         <p className="text-sm text-amber-900">{plan.note}</p>
       )}
-      <div className="grid gap-4 sm:grid-cols-2">
-        <div className="space-y-2">
-          <p className="text-xs font-semibold uppercase tracking-wide text-red-800/80">
-            We ban
-          </p>
-          {plan.ban.length === 0 ? (
-            <p className="text-sm text-[var(--muted)]">No clear ban yet</p>
-          ) : (
-            <ul className="space-y-2">
-              {plan.ban.map((m) => (
-                <li key={m.map} className="text-sm text-[var(--ink)]">
-                  <span className="font-semibold">{m.map}</span>
-                  <span className="text-[var(--muted)]"> — {m.reason}</span>
-                </li>
-              ))}
-            </ul>
-          )}
-        </div>
-        <div className="space-y-2">
-          <p className="text-xs font-semibold uppercase tracking-wide text-[var(--accent)]">
-            We want to play
-          </p>
-          {plan.play.length === 0 ? (
-            <p className="text-sm text-[var(--muted)]">No clear play yet</p>
-          ) : (
-            <ul className="space-y-2">
-              {plan.play.map((m) => (
-                <li key={m.map} className="text-sm text-[var(--ink)]">
-                  <span className="font-semibold">{m.map}</span>
-                  <span className="text-[var(--muted)]"> — {m.reason}</span>
-                </li>
-              ))}
-            </ul>
-          )}
-        </div>
+      <div className="overflow-x-auto">
+        <table className="w-full min-w-[36rem] border-collapse text-sm">
+          <thead>
+            <tr className="border-b border-[var(--line)] text-left text-xs font-semibold uppercase tracking-wide text-[var(--muted)]">
+              <th className="py-2 pr-3">Map</th>
+              <th className="px-3 py-2 text-center">Us (S{season})</th>
+              <th className="px-3 py-2 text-center">Them (S{season})</th>
+              <th className="px-3 py-2 text-center">Ban</th>
+              <th className="pl-3 py-2 text-center">Play</th>
+            </tr>
+          </thead>
+          <tbody>
+            {plan.grid.map((row) => {
+              const isBan = row.banRank != null;
+              const isPlay = row.playRank != null;
+              return (
+                <tr
+                  key={row.map}
+                  className={`border-b border-[var(--line)]/60 ${
+                    isBan
+                      ? "bg-red-50/60"
+                      : isPlay
+                        ? "bg-[var(--accent)]/5"
+                        : ""
+                  }`}
+                >
+                  <td className="py-2 pr-3 font-semibold text-[var(--ink)]">
+                    {row.map}
+                  </td>
+                  <td
+                    className={`px-3 py-2 text-center tabular-nums ${
+                      row.ourRecord === "0-0"
+                        ? "text-[var(--muted)]"
+                        : "text-[var(--ink)]"
+                    }`}
+                  >
+                    {row.ourRecord}
+                  </td>
+                  <td
+                    className={`px-3 py-2 text-center tabular-nums ${
+                      row.theirRecord === "0-0"
+                        ? "text-[var(--muted)]"
+                        : "text-[var(--ink)]"
+                    }`}
+                  >
+                    {row.theirRecord}
+                  </td>
+                  <td className="px-3 py-2 text-center">
+                    {isBan ? (
+                      <span className="inline-flex h-6 w-6 items-center justify-center rounded-full bg-red-100 text-xs font-bold text-red-800">
+                        {row.banRank}
+                      </span>
+                    ) : (
+                      <span className="text-[var(--muted)]">—</span>
+                    )}
+                  </td>
+                  <td className="pl-3 py-2 text-center">
+                    {isPlay ? (
+                      <span className="inline-flex h-6 w-6 items-center justify-center rounded-full bg-[var(--accent)]/15 text-xs font-bold text-[var(--accent)]">
+                        {row.playRank}
+                      </span>
+                    ) : (
+                      <span className="text-[var(--muted)]">—</span>
+                    )}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
       </div>
+      {(plan.ban.length > 0 || plan.play.length > 0) && (
+        <details className="text-sm text-[var(--muted)]">
+          <summary className="cursor-pointer font-semibold text-[var(--ink)]">
+            Why these picks
+          </summary>
+          <div className="mt-2 grid gap-4 sm:grid-cols-2">
+            {plan.ban.length > 0 && (
+              <ul className="space-y-1">
+                {plan.ban.map((m) => (
+                  <li key={m.map}>
+                    <span className="font-semibold text-red-800/80">
+                      Ban {m.map}:
+                    </span>{" "}
+                    {m.reason}
+                  </li>
+                ))}
+              </ul>
+            )}
+            {plan.play.length > 0 && (
+              <ul className="space-y-1">
+                {plan.play.map((m) => (
+                  <li key={m.map}>
+                    <span className="font-semibold text-[var(--accent)]">
+                      Play {m.map}:
+                    </span>{" "}
+                    {m.reason}
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+        </details>
+      )}
     </div>
   );
 }

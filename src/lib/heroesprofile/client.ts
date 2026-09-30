@@ -2,6 +2,13 @@ import { classifyHeroesProfile, noteApiCall } from "@/lib/apiUsage";
 import { leagueConfig, stormLeagueWindows } from "@/config/league";
 import { NGS_MAP_POOL } from "@/config/ngsMaps";
 import { FOREVER, cacheHas, cachedFetch, getCached, setCached } from "@/lib/cache";
+import {
+  heroesProfilePlayerUrl,
+  ngsHeroesProfileUrl,
+} from "@/lib/heroesprofile/profileUrls";
+
+export { heroesProfilePlayerUrl, ngsHeroesProfileUrl };
+import type { PlayerScout } from "@/lib/scoring/types";
 import type { GlobalHeroStat } from "@/lib/scoring/metaPressure";
 import type {
   HeroMapStat,
@@ -267,24 +274,86 @@ function parseHeroRows(
     .filter((h) => h.name);
 }
 
-/** Storm League / player hero stats — live window, short TTL. */
+/** Storm League / player hero stats. `startDate: null` loads the whole career. */
 export async function getPlayerHeroAll(
   battletag: string,
-  options?: { gameType?: string; startDate?: string; endDate?: string },
+  options?: {
+    gameType?: string;
+    /** `null` omits start_date and loads the career. Omitted uses the recent window. */
+    startDate?: string | null;
+    endDate?: string;
+  },
 ): Promise<PlayerHeroAllResponse> {
   const gameType = options?.gameType ?? "Storm League";
-  const startDate = options?.startDate ?? stormLeagueWindows().recentStart;
-  const key = `hp-v1-hero-all-${battletag}-${gameType}-${startDate}`;
-  return cachedFetch(key, async () => {
+  const career = options != null && "startDate" in options && options.startDate == null;
+  const startDate = career
+    ? null
+    : (options?.startDate ?? stormLeagueWindows().recentStart);
+  const key = `hp-v1-hero-all-${battletag}-${gameType}-${startDate ?? "career"}`;
+  return cachedFetch(
+    key,
+    async () => {
+      const rows = await hpGet<V1PlayerHeroRow[]>("players/heroes", {
+        battletag,
+        region: leagueConfig.regionName,
+        game_type: gameType,
+        start_date: startDate ?? undefined,
+        end_date: options?.endDate,
+      });
+      const list = Array.isArray(rows) ? rows : [];
+      const blizzId = list.find((row) => typeof row.blizz_id === "number")?.blizz_id;
+      if (blizzId) await setCached(blizzIdKey(battletag), blizzId, FOREVER);
+      return aggregatePlayerHeroRows(list, gameType);
+    },
+    leagueConfig.cacheTtlMs,
+    {
+      // Empty means the pull missed. Do not keep it for the week.
+      isEmpty: (data) =>
+        Object.values(data).every((heroes) => Object.keys(heroes).length === 0),
+    },
+  );
+}
+
+function blizzIdKey(battletag: string): string {
+  return `hp-v1-blizz-id-${battletag}`;
+}
+
+/** Blizzard account id for profile links. Cached forever once found. */
+export async function getPlayerBlizzId(battletag: string): Promise<number | null> {
+  const cached = await getCached<number>(blizzIdKey(battletag), FOREVER);
+  if (cached) return cached;
+  try {
     const rows = await hpGet<V1PlayerHeroRow[]>("players/heroes", {
       battletag,
       region: leagueConfig.regionName,
-      game_type: gameType,
-      start_date: startDate,
-      end_date: options?.endDate,
+      game_type: "Storm League",
     });
-    return aggregatePlayerHeroRows(Array.isArray(rows) ? rows : [], gameType);
-  });
+    const blizzId = (Array.isArray(rows) ? rows : []).find(
+      (row) => typeof row.blizz_id === "number",
+    )?.blizz_id;
+    if (!blizzId) return null;
+    await setCached(blizzIdKey(battletag), blizzId, FOREVER);
+    return blizzId;
+  } catch {
+    return null;
+  }
+}
+
+/** Rewrite SL and NGS profile links so saved reports pick up a working URL. */
+export async function withProfileLinks(
+  players: PlayerScout[],
+): Promise<PlayerScout[]> {
+  const out: PlayerScout[] = [];
+  for (const player of players) {
+    const blizzId = player.blizzId ?? (await getPlayerBlizzId(player.battletag));
+    out.push({
+      ...player,
+      blizzId,
+      heroesProfileUrl: heroesProfilePlayerUrl(player.battletag, blizzId),
+      ngsProfileUrl: ngsHeroesProfileUrl(player.battletag, blizzId),
+    });
+  }
+  return out;
 }
 
 /**
@@ -1395,15 +1464,6 @@ export async function getHeroAttributeNames(): Promise<Record<string, string>> {
     },
     7 * 24 * 60 * 60 * 1000,
   );
-}
-
-export function heroesProfilePlayerUrl(battletag: string): string {
-  const name = battletag.split("#")[0];
-  return `https://www.heroesprofile.com/Profile/?battletag=${encodeURIComponent(name)}&region=${leagueConfig.region}`;
-}
-
-export function ngsHeroesProfileUrl(battletag: string): string {
-  return `https://www.heroesprofile.com/Esports/NGS/Player/${encodeURIComponent(battletag)}`;
 }
 
 export function normalizeBattletag(tag: string): string {

@@ -127,7 +127,18 @@ const HERO_ALIASES: Record<string, string> = {
   "The Lost Vikings": "TheLostVikings",
 };
 
+const heroKeyCache = new Map<string, string>();
+
+/** Hot path in draft search — memoized because resolution scans every alias and hero. */
 export function heroKey(hero: string): string {
+  const hit = heroKeyCache.get(hero);
+  if (hit !== undefined) return hit;
+  const key = resolveHeroKey(hero);
+  heroKeyCache.set(hero, key);
+  return key;
+}
+
+function resolveHeroKey(hero: string): string {
   const trimmed = hero.trim();
   const aliased = HERO_ALIASES[trimmed] ?? trimmed;
   // Case-fold so "qhira" and "Qhira" collide; keep display names elsewhere.

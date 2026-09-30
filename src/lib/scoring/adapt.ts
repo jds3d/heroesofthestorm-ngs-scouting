@@ -1,3 +1,4 @@
+import { comfortMeetsSuggestBar } from "@/lib/scoring/comfort";
 import { buildMapPlan } from "@/lib/scoring/mapPlan";
 import { rosterWeakRole } from "@/lib/scoring/draft";
 import {
@@ -6,7 +7,7 @@ import {
   metaStrength,
   type GlobalHeroStat,
 } from "@/lib/scoring/metaPressure";
-import { heroRole, heroTags } from "@/lib/scoring/heroMeta";
+import { heroKey, heroRole, heroTags } from "@/lib/scoring/heroMeta";
 import type {
   AdaptPlan,
   AdaptRecommendation,
@@ -45,7 +46,7 @@ export function buildAdaptPlan(
     const second = p.topHeroes[1];
     if (
       top &&
-      top.comfort >= 0.1 &&
+      comfortMeetsSuggestBar(top.comfort) &&
       (!second || top.comfort > second.comfort * 2.2)
     ) {
       banPriority.push({
@@ -274,7 +275,9 @@ export function buildAdaptPlan(
   const uniqBans = dedupeHeroes([
     ...metaBans.map(({ hero, reason }) => ({ hero, reason })),
     ...banPriority,
-  ]).slice(0, 6);
+  ])
+    .filter((b) => heroOnRoster(players, b.hero))
+    .slice(0, 6);
   const uniqDenies = [...new Set(firstPickDenies)].slice(0, 5);
   recommendations.sort((a, b) => a.priority - b.priority);
 
@@ -298,7 +301,7 @@ export function metaBanPriority(
   return meta
     .map((stat) => {
       const who = heroComfort(players, stat.hero);
-      if (!who) return null;
+      if (!who || !comfortMeetsSuggestBar(who.comfort)) return null;
       const pressure = banPressure(metaStrength(stat), who.comfort);
       if (pressure < 0.2) return null;
       return {
@@ -311,11 +314,22 @@ export function metaBanPriority(
     .sort((a, b) => b.pressure - a.pressure);
 }
 
+function heroOnRoster(players: PlayerScout[], hero: string): boolean {
+  for (const p of players) {
+    for (const h of p.topHeroes) {
+      if (heroKey(h.hero) !== heroKey(hero)) continue;
+      if (comfortMeetsSuggestBar(h.comfort)) return true;
+    }
+  }
+  return false;
+}
+
 function findBestInRole(players: PlayerScout[], role: string): string | null {
   let best: { hero: string; comfort: number } | null = null;
   for (const p of players) {
     for (const h of p.topHeroes) {
       if (heroRole(h.hero) !== role) continue;
+      if (!comfortMeetsSuggestBar(h.comfort)) continue;
       if (!best || h.comfort > best.comfort) best = h;
     }
   }

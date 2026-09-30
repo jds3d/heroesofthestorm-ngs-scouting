@@ -5,10 +5,14 @@ export const leagueConfig = {
   season: 22,
   priorSeason: 21,
   /**
-   * Storm League comfort history. Games inside the recent window count fully;
-   * older games count at `stormLeagueOlderWeight`.
+   * Storm League comfort uses this many months. Games inside the recent window
+   * count fully; older games in the window count at `stormLeagueOlderWeight`.
+   * A player under `minGames.confidentPool` in that window is read from older
+   * NGS seasons, then Quick Match.
    */
   stormLeagueHistoryMonths: 24,
+  /** Older NGS seasons to try when Storm League is too thin. */
+  ngsSeasonLookback: 8,
   stormLeagueRecentMonths: 6,
   stormLeagueOlderWeight: 0.5,
   region: 1 as const,
@@ -21,6 +25,8 @@ export const leagueConfig = {
   minGames: {
     ngs: 2,
     stormLeague: 5,
+    /** Recent Storm League games before we trust that pool over NGS history. */
+    confidentPool: 30,
     /** Min NGS draft comps before we trust draft archetype / first-pick %. */
     draftSample: 4,
   },

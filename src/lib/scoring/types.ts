@@ -21,11 +21,14 @@ export type ComfortHero = {
     ngsCurrent?: SourceHeroStat;
     stormLeague?: SourceHeroStat;
     ngsPrior?: SourceHeroStat;
+    quickMatch?: SourceHeroStat;
   };
 };
 
 export type PlayerScout = {
   battletag: string;
+  /** Heroes Profile account id. Profile links do not resolve without it. */
+  blizzId?: number | null;
   preferredRole: string | null;
   topHeroes: ComfortHero[];
   ngsWins: number;
@@ -89,6 +92,9 @@ export type DraftInsights = {
     games: number;
     wins: number;
     winRate: number;
+    /** Current NGS season only (excludes prior-season weight). */
+    seasonGames: number;
+    seasonWins: number;
   }[];
   /** Weighting and counting asides, shown under the draft writeup. */
   notes: string[];
@@ -222,6 +228,11 @@ export type DraftPlan = {
   ourBrief: OurCompBrief;
   tree: DraftTreeNode;
   sides: { weFirst: DraftSide; theyFirst: DraftSide };
+  /**
+   * Sides rebuilt for each anti-dive pivot, so a map that changes the pivot
+   * swaps in a five and tree that agree instead of re-slotting heroes.
+   */
+  pivotSides?: Record<string, { weFirst: DraftSide; theyFirst: DraftSide }>;
   /** LBB primary: heavy dive decision tree + pivots. */
   playbook: DraftPlaybook;
 };
@@ -249,9 +260,20 @@ export type MapPlanPick = {
   edge: number;
 };
 
+export type MapPlanGridRow = {
+  map: string;
+  ourRecord: string;
+  theirRecord: string;
+  banRank: number | null;
+  playRank: number | null;
+  edge: number | null;
+};
+
 export type MapPlan = {
   ban: MapPlanPick[];
   play: MapPlanPick[];
+  /** Full NGS pool with season records and ban/play rank for side-by-side comparison. */
+  grid: MapPlanGridRow[];
   note: string | null;
 };
 

@@ -20,7 +20,7 @@ import {
   favouredLabel,
   gradeFinishedDraft,
   mmrAdjustedWinPct,
-  pctToGrade,
+  percentileToGrade,
   stepPct,
   sumStepPoints,
   type DraftStepScore,
@@ -41,6 +41,9 @@ import {
   buildDraftMetaTable,
   counterPoolNote,
   enemyDuos,
+  heroesMissingMatchupLoad,
+  mergeLoadedMatchupRows,
+  missingDuoLabel,
   scoreDuos,
   SYNERGY_DUO,
   isMapSpecialist,
@@ -159,6 +162,7 @@ describe("draftGrade", () => {
     side: "our" | "their",
     best: number,
     achieved: number,
+    percentile?: number,
   ): DraftStepScore => ({
     side,
     kind: "pick",
@@ -167,6 +171,7 @@ describe("draftGrade", () => {
     bestLabel: "Y",
     best,
     achieved,
+    percentile,
   });
   const base = {
     ourLocked,
@@ -179,38 +184,55 @@ describe("draftGrade", () => {
     theirLabel: "TG",
   };
 
-  it("grades each side on points achieved out of the best available", () => {
+  it("grades each side on the average percentile of its steps", () => {
     const card = gradeFinishedDraft({
       ...base,
-      steps: [step("our", 60, 45), step("our", 75, 40), step("their", 50, 50)],
+      steps: [
+        step("our", 60, 45, 90),
+        step("our", 75, 40, 76),
+        step("their", 50, 50, 100),
+      ],
     });
     expect(card.ours.points).toBe(85);
     expect(card.ours.bestPoints).toBe(135);
-    expect(card.ours.pct).toBe(63);
+    expect(card.ours.percentile).toBe(83);
     expect(card.ours.grade).toBe("B");
-    expect(card.theirs.pct).toBe(100);
     expect(card.theirs.grade).toBe("A+");
-    expect(card.ours.notes[0]).toContain("Biggest miss");
+    expect(card.ours.notes[0]).toBe("Every step ranked C or better against the options open.");
+  });
+
+  it("names the lowest-ranked step as the biggest miss", () => {
+    const card = gradeFinishedDraft({
+      ...base,
+      steps: [step("our", 60, 20, 65), step("our", 40, 30, 40)],
+    });
+    expect(card.ours.notes[0]).toContain("(+30) over Y (+40)");
   });
 
   it("never lets a lock beat its step's best, and counts Varian as the tank", () => {
     expect(sumStepPoints([step("our", 20, 30)]).pct).toBe(100);
-    expect(pctToGrade(88)).toBe("A");
-    expect(pctToGrade(53)).toBe("C+");
-    expect(pctToGrade(33)).toBe("D");
-    expect(pctToGrade(20)).toBe("F");
+    expect(percentileToGrade(97)).toBe("A+");
+    expect(percentileToGrade(90)).toBe("A-");
+    expect(percentileToGrade(85)).toBe("B");
+    expect(percentileToGrade(64)).toBe("D");
+    expect(percentileToGrade(59)).toBe("F");
     const card = gradeFinishedDraft({ ...base, steps: [] });
     expect(card.theirs.notes.join(" ")).not.toContain("tank");
     expect(card.ours.notes.join(" ")).toContain("Missing: healer");
     expect(card.draftWinPct).toBeLessThan(50);
   });
 
-  it("letter-grades every step on its own achieved / best", () => {
+  it("letter-grades every step on its percentile, not its raw score", () => {
     const card = gradeFinishedDraft({
       ...base,
-      steps: [step("our", 60, 60), step("our", 75, 40), step("our", -5, -12)],
+      steps: [
+        step("our", 60, 60, 100),
+        step("our", 36, 7, 88),
+        step("our", -5, -12, 72),
+      ],
     });
-    expect(card.ours.steps.map((s) => s.grade)).toEqual(["A+", "C+", "F"]);
+    // A 7/36 ban or a negative pick can still beat most of the field.
+    expect(card.ours.steps.map((s) => s.grade)).toEqual(["A+", "B+", "C-"]);
     expect(stepPct({ best: -5, achieved: -5 })).toBe(100);
   });
 
@@ -286,6 +308,77 @@ describe("duo scoring", () => {
       "with Valla: no sample with enough games → 0",
     ]);
     expect(Math.round(result.points)).toBe(13);
+    expect(missingDuoLabel(result.lines[2]!)).toBe("with Valla");
+  });
+
+  it("reads into Tyrael from Tyrael's row when our hero was never fetched", () => {
+    const bare = (hero: string) => ({
+      hero,
+      winRate: 50,
+      influence: 0,
+      popularity: 0,
+      banRate: 0,
+      pickRate: 0,
+      games: 0,
+      timing: "flex" as const,
+      counteredBy: [],
+      synergiesWith: [],
+      allySamples: [],
+      matchupSamples: [],
+      mapStrong: [],
+      note: "",
+    });
+    const base = {
+      patch: "test",
+      source: "heroesprofile-sl" as const,
+      byHero: {
+        Garrosh: bare("Garrosh"),
+        Tyrael: bare("Tyrael"),
+        Rehgar: bare("Rehgar"),
+      },
+    };
+    expect(enemyDuos(base, "Garrosh", ["Tyrael", "Rehgar"])).toEqual([]);
+    expect(heroesMissingMatchupLoad(base, ["Tyrael", "Rehgar", "Garrosh"])).toEqual([
+      "Tyrael",
+      "Rehgar",
+      "Garrosh",
+    ]);
+    expect(
+      heroesMissingMatchupLoad(base, ["Tyrael", "Flex", "Flex ban", ""]),
+    ).toEqual(["Tyrael"]);
+
+    const loaded = buildDraftMetaTable({
+      patch: "test",
+      global: [
+        {
+          hero: "Tyrael",
+          winRate: 52,
+          influence: 10,
+          popularity: 20,
+          banRate: 0,
+          pickRate: 0,
+          games: 4000,
+        },
+      ],
+      matchups: {
+        Tyrael: [
+          { hero: "Garrosh", wins: 60, losses: 40, games: 100, enemyWinRate: 40 },
+        ],
+      },
+    });
+    const merged = mergeLoadedMatchupRows(base, {
+      Tyrael: loaded.byHero.Tyrael,
+    });
+    const duos = enemyDuos(merged, "Garrosh", ["Tyrael", "Rehgar"]);
+    expect(duos.find((d) => d.hero === "Tyrael")?.winRate).toBe(40);
+    expect(duos.find((d) => d.hero === "Rehgar")).toBeUndefined();
+    expect(heroesMissingMatchupLoad(merged, ["Tyrael"])).toEqual([]);
+    expect(heroesMissingMatchupLoad(merged, ["Rehgar"])).toEqual(["Rehgar"]);
+    const lines = scoreDuos(duos, SYNERGY_DUO, "into", ["Tyrael", "Rehgar"]).lines;
+    expect(lines.some((line) => line.startsWith("into Tyrael:"))).toBe(true);
+    expect(missingDuoLabel(lines.find((line) => line.startsWith("into Rehgar"))!)).toBe(
+      "into Rehgar",
+    );
   });
 });
 

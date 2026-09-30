@@ -80,6 +80,11 @@ export type ComputedHeroMeta = {
   allySamples: SynergyEdge[];
   /** Every enemy matchup with enough games, not just hard counters. Absent on older cached tables. */
   matchupSamples?: MatchupEdge[];
+  /**
+   * True once this hero's Storm League matchup payload was fetched.
+   * Empty samples with this flag set are a real gap, not an unfetched hero.
+   */
+  matchupsLoaded?: boolean;
   /** Maps where your WR is meaningfully above baseline. */
   mapStrong: { map: string; winRate: number; games: number; deltaPp: number }[];
   note: string;
@@ -291,6 +296,7 @@ export function buildDraftMetaTable(args: {
       synergiesWith,
       allySamples,
       matchupSamples: buildMatchupSamples(wr, enemies),
+      matchupsLoaded: enemies !== undefined || allies !== undefined,
       mapStrong: mapEdges(key, wr, mapStats),
     };
     byHero[key] = { ...partial, note: buildNote(partial) };
@@ -322,9 +328,94 @@ export function heroDraftMeta(
     counteredBy: [],
     synergiesWith: [],
     allySamples: [],
+    matchupSamples: [],
+    matchupsLoaded: false,
     mapStrong: [],
     note: "No Storm League sample for this hero yet.",
   };
+}
+
+/**
+ * Storm League matchups were fetched for this hero.
+ * A globals-only row (no samples, flag unset) still needs a pull.
+ */
+export function heroMatchupsLoaded(
+  table: DraftMetaTable | null | undefined,
+  hero: string,
+): boolean {
+  const row = table?.byHero[heroKey(hero)];
+  if (!row) return false;
+  if (row.matchupsLoaded) return true;
+  return (row.matchupSamples?.length ?? 0) > 0 || row.allySamples.length > 0;
+}
+
+/** Display names whose matchup payload is not in the table yet. */
+export function heroesMissingMatchupLoad(
+  table: DraftMetaTable | null | undefined,
+  heroes: readonly string[],
+): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const hero of heroes) {
+    // Plan seats use "Flex" / "Flex ban" when no hero is chosen yet.
+    if (!hero || heroRole(hero) === "Unknown") continue;
+    const key = heroKey(hero);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    if (!heroMatchupsLoaded(table, hero)) out.push(hero);
+  }
+  return out;
+}
+
+/**
+ * Copy fetched matchup fields onto an existing table.
+ * Win rate, map edges, and other heroes' rows stay as they were.
+ * Either hero's row is enough for a duo — `enemyDuos` / `allyDuos` read both sides.
+ */
+export function mergeLoadedMatchupRows(
+  base: DraftMetaTable | null | undefined,
+  rows: Record<string, ComputedHeroMeta>,
+  patch = "",
+): DraftMetaTable {
+  const incoming: Record<string, ComputedHeroMeta> = {};
+  for (const [key, row] of Object.entries(rows)) {
+    incoming[heroKey(key)] = { ...row, matchupsLoaded: true };
+  }
+  if (!base) {
+    return {
+      patch: patch || "live",
+      source: "heroesprofile-sl",
+      byHero: incoming,
+    };
+  }
+  const byHero = { ...base.byHero };
+  for (const [key, row] of Object.entries(incoming)) {
+    const prev = byHero[key];
+    byHero[key] = prev
+      ? {
+          ...prev,
+          counteredBy: row.counteredBy,
+          synergiesWith: row.synergiesWith,
+          allySamples: row.allySamples,
+          matchupSamples: row.matchupSamples ?? [],
+          matchupsLoaded: true,
+          timing: row.timing,
+        }
+      : row;
+  }
+  return { ...base, byHero };
+}
+
+/** Short label for a duo line that has nothing to score, or null when the line has a sample. */
+export function missingDuoLabel(text: string): string | null {
+  if (!/no sample with enough games|ally data unavailable|no verified sample/i.test(text)) {
+    return null;
+  }
+  const head = text.split(":")[0]?.trim() ?? "";
+  if (/^(into|with)\s+/i.test(head)) return head;
+  const named = text.match(/ally data unavailable for (.+?) right now/i);
+  if (named) return named[1];
+  return "duo sample";
 }
 
 /** Ally synergy edges for heroes already locked on our side. */

@@ -4,6 +4,7 @@ import {
   getGlobalHeroStats,
   getGlobalHeroStatsByMap,
   getHeroMatchupsMany,
+  withProfileLinks,
 } from "@/lib/heroesprofile/client";
 import { mergeApiCounts, runWithApiUsage } from "@/lib/apiUsage";
 import { getTeam } from "@/lib/ngs/client";
@@ -48,10 +49,13 @@ export async function GET(request: Request, context: RouteContext) {
       refreshPlayerData,
       starters: theirs,
     });
+    // Our comfort comes from our own scout; build it if it was never saved,
+    // or every one of our picks scores zero comfort.
     const homeReport =
       teamName === leagueConfig.homeTeam
         ? report
-        : await loadSavedHomeReport(leagueConfig.homeTeam);
+        : ((await loadSavedHomeReport(leagueConfig.homeTeam)) ??
+          (await loadScoutReport(leagueConfig.homeTeam).catch(() => null)));
     const homePool =
       teamName === leagueConfig.homeTeam
         ? report.roster
@@ -66,6 +70,10 @@ export async function GET(request: Request, context: RouteContext) {
       homeReport?.hpMmrAvg ??
       (await getTeam(leagueConfig.homeTeam).catch(() => null))?.hpMmrAvg ??
       null;
+    report.roster = await withProfileLinks(report.roster);
+    if (report.homeRoster?.length) {
+      report.homeRoster = await withProfileLinks(report.homeRoster);
+    }
 
     // Matchups + globals for draft meta — count real HP calls in "used".
     const { actual: metaActual } = await runWithApiUsage(async () => {

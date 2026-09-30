@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { leagueConfig } from "@/config/league";
 import { getCached } from "@/lib/cache";
+import { getNgsPlayerProfile } from "@/lib/heroesprofile/client";
 import type { NgsPlayerProfile } from "@/lib/heroesprofile/types";
 import { getTeam } from "@/lib/ngs/client";
 
@@ -8,8 +9,9 @@ export const dynamic = "force-dynamic";
 
 /**
  * Roster for lineup pickers — NGS members only.
- * Games come from cached HP profiles when present; never live-fetches HP
- * (that waits until Generate scout).
+ * Games come from HP NGS profiles. Uncached members are fetched (one call each)
+ * — otherwise a never-scouted player reads 0 games, is left out of the default
+ * five, and so is never fetched by a scout either.
  */
 export async function GET(request: Request) {
   const teamName = new URL(request.url).searchParams.get("team")?.trim();
@@ -23,7 +25,13 @@ export async function GET(request: Request) {
     const players = await Promise.all(
       names.map(async (battletag) => {
         const key = `hp-v1-ngs-profile-${battletag}-s${leagueConfig.season}-${leagueConfig.division}`;
-        const profile = await getCached<NgsPlayerProfile>(key);
+        const profile =
+          (await getCached<NgsPlayerProfile>(key)) ??
+          (await getNgsPlayerProfile(
+            battletag,
+            leagueConfig.season,
+            leagueConfig.division,
+          ).catch(() => null));
         const games = profile
           ? (Number(profile.wins) || 0) + (Number(profile.losses) || 0)
           : 0;

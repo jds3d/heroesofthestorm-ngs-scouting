@@ -5,6 +5,7 @@ import {
   getGlobalHeroStats,
   getNgsPlayerProfile,
   getPlayerHeroAll,
+  getPlayerBlizzId,
   heroesProfilePlayerUrl,
   ngsHeroesProfileUrl,
   normalizeBattletag,
@@ -17,18 +18,21 @@ import {
   buildPlayerComfort,
   buildTeamThreats,
   heroStatsFromMap,
+  mergeSourceMaps,
+  sourceMapGames,
 } from "@/lib/scoring/comfort";
 import { buildDraftInsights, type DraftMatchInput } from "@/lib/scoring/draft";
 import type { ScoutReport, SourceHeroStat } from "@/lib/scoring/types";
 
-function stormLeagueMap(
+function heroAllMap(
   response: Record<string, Record<string, HeroStat>>,
+  gameType: string,
 ): Map<string, SourceHeroStat> {
-  const sl =
-    response["Storm League"] ||
-    response["storm league"] ||
+  const stats =
+    response[gameType] ||
+    response[gameType.toLowerCase()] ||
     Object.values(response)[0];
-  return heroStatsFromMap(sl);
+  return heroStatsFromMap(stats);
 }
 
 /** Full history totals, tagged with how much of it falls in the recent window. */
@@ -66,6 +70,41 @@ function heroRowsToSourceMap(rows: NgsHeroRow[]): Map<string, SourceHeroStat> {
   return out;
 }
 
+async function loadWindowedMode(
+  battletag: string,
+  gameType: string,
+): Promise<Map<string, SourceHeroStat>> {
+  const windows = stormLeagueWindows();
+  const history = heroAllMap(
+    await getPlayerHeroAll(battletag, {
+      gameType,
+      startDate: windows.historyStart,
+    }),
+    gameType,
+  );
+  const recent = heroAllMap(
+    await getPlayerHeroAll(battletag, {
+      gameType,
+      startDate: windows.recentStart,
+    }),
+    gameType,
+  );
+  return withRecent(history, recent);
+}
+
+async function ngsSeasonMap(
+  battletag: string,
+  season: number,
+): Promise<Map<string, SourceHeroStat> | null> {
+  const profile = await getNgsPlayerProfile(
+    battletag,
+    season,
+    leagueConfig.division,
+  );
+  const map = heroRowsToSourceMap(profile.heroes ?? []);
+  return map.size > 0 ? map : null;
+}
+
 export async function generateScoutReport(
   teamName: string,
   starters?: string[],
@@ -96,16 +135,7 @@ export async function generateScoutReport(
       let slMap = new Map<string, SourceHeroStat>();
       if (!hpAuthBroken) {
         try {
-          const windows = stormLeagueWindows();
-          const history = await getPlayerHeroAll(battletag, {
-            gameType: "Storm League",
-            startDate: windows.historyStart,
-          });
-          const recent = await getPlayerHeroAll(battletag, {
-            gameType: "Storm League",
-            startDate: windows.recentStart,
-          });
-          slMap = withRecent(stormLeagueMap(history), stormLeagueMap(recent));
+          slMap = await loadWindowedMode(battletag, "Storm League");
         } catch (err) {
           if (err instanceof HeroesProfileError) {
             warnings.push(err.message);
@@ -113,6 +143,9 @@ export async function generateScoutReport(
           }
         }
       }
+
+      const stormLeagueThin =
+        sourceMapGames(slMap) < leagueConfig.minGames.confidentPool;
 
       let preferredRole: string | null = null;
       let ngsWins = 0;
@@ -153,18 +186,13 @@ export async function generateScoutReport(
 
       if (!hpAuthBroken) {
         try {
-          const prior = await getNgsPlayerProfile(
-            battletag,
-            leagueConfig.priorSeason,
-            leagueConfig.division,
-          );
-          ngsPrior = heroRowsToSourceMap(prior.heroes ?? []);
-          if (ngsPrior.size > 0 || Number(prior.wins) > 0) {
+          const prior = await ngsSeasonMap(battletag, leagueConfig.priorSeason);
+          if (prior) {
+            ngsPrior = prior;
             includePrior = true;
             returningCount += 1;
           }
         } catch (err) {
-          // Prior season missing is fine for new players.
           if (
             err instanceof HeroesProfileError &&
             (err.status === 401 || err.status === 403)
@@ -175,6 +203,73 @@ export async function generateScoutReport(
         }
       }
 
+      if (stormLeagueThin && !hpAuthBroken) {
+        let emptyStreak = ngsPrior.size === 0 ? 1 : 0;
+        const floor = Math.max(
+          1,
+          leagueConfig.season - leagueConfig.ngsSeasonLookback,
+        );
+        for (
+          let season = leagueConfig.priorSeason - 1;
+          season >= floor && emptyStreak < 2;
+          season -= 1
+        ) {
+          const covered =
+            sourceMapGames(ngsCurrent) + sourceMapGames(ngsPrior);
+          if (covered >= leagueConfig.minGames.confidentPool) break;
+          try {
+            const older = await ngsSeasonMap(battletag, season);
+            if (!older) {
+              emptyStreak += 1;
+              continue;
+            }
+            emptyStreak = 0;
+            ngsPrior = mergeSourceMaps([ngsPrior, older]);
+            includePrior = true;
+          } catch (err) {
+            if (
+              err instanceof HeroesProfileError &&
+              (err.status === 401 || err.status === 403)
+            ) {
+              warnings.push(err.message);
+              hpAuthBroken = true;
+              break;
+            }
+            emptyStreak += 1;
+          }
+        }
+      }
+
+      let quickMatch = new Map<string, SourceHeroStat>();
+      const ngsPool =
+        sourceMapGames(ngsCurrent) +
+        (includePrior ? sourceMapGames(ngsPrior) : 0);
+      if (
+        stormLeagueThin &&
+        ngsPool < leagueConfig.minGames.confidentPool &&
+        !hpAuthBroken
+      ) {
+        try {
+          quickMatch = await loadWindowedMode(battletag, "Quick Match");
+        } catch (err) {
+          if (err instanceof HeroesProfileError) {
+            warnings.push(err.message);
+            if (err.status === 401 || err.status === 403) hpAuthBroken = true;
+          }
+        }
+      }
+
+      if (
+        stormLeagueThin &&
+        ngsPool + sourceMapGames(quickMatch) === 0 &&
+        sourceMapGames(slMap) === 0
+      ) {
+        warnings.push(
+          `${battletag}: no Storm League, NGS, or Quick Match hero pool.`,
+        );
+      }
+
+      const blizzId = hpAuthBroken ? null : await getPlayerBlizzId(battletag);
       return buildPlayerComfort({
         battletag,
         preferredRole,
@@ -182,10 +277,12 @@ export async function generateScoutReport(
         stormLeague: slMap,
         ngsPrior,
         includePrior,
+        quickMatch,
         ngsWins,
         ngsLosses,
-        heroesProfileUrl: heroesProfilePlayerUrl(battletag),
-        ngsProfileUrl: ngsHeroesProfileUrl(battletag),
+        blizzId,
+        heroesProfileUrl: heroesProfilePlayerUrl(battletag, blizzId),
+        ngsProfileUrl: ngsHeroesProfileUrl(battletag, blizzId),
       });
     }),
   );

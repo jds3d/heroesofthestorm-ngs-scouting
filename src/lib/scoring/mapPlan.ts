@@ -1,6 +1,8 @@
+import { NGS_MAP_POOL } from "@/config/ngsMaps";
 import type {
   DraftInsights,
   MapPlan,
+  MapPlanGridRow,
   MapPlanPick,
 } from "@/lib/scoring/types";
 
@@ -11,6 +13,18 @@ function recordLine(m: MapTendency | undefined): string | null {
   const wins = Math.round(m.wins);
   const losses = Math.max(0, Math.round(m.games - m.wins));
   return `${wins}-${losses}`;
+}
+
+/** Current NGS season W-L; unplayed maps show 0-0. */
+function seasonRecordLine(m: MapTendency | undefined): string {
+  if (!m) return "0-0";
+  if (m.seasonGames != null) {
+    if (m.seasonGames < 1) return "0-0";
+    const wins = Math.round(m.seasonWins);
+    const losses = Math.max(0, Math.round(m.seasonGames - m.seasonWins));
+    return `${wins}-${losses}`;
+  }
+  return recordLine(m) ?? "0-0";
 }
 
 /** Shrink win rate toward 50% when the sample is thin. winRate is 0–100. */
@@ -63,6 +77,7 @@ export function buildMapPlan(
     return {
       ban: [],
       play: [],
+      grid: buildGrid(theirBy, ourBy, new Map(), new Map(), new Map()),
       note: "No map sample yet for either side.",
     };
   }
@@ -140,13 +155,37 @@ export function buildMapPlan(
     play.push(toPick(s, "play", haveOurs));
   }
 
+  const banRank = new Map(ban.map((p, i) => [p.map, i + 1]));
+  const playRank = new Map(play.map((p, i) => [p.map, i + 1]));
+  const edgeByMap = new Map(
+    scored.map((s) => [s.map, Math.round(s.edge * 10) / 10]),
+  );
+
   return {
     ban,
     play,
+    grid: buildGrid(theirBy, ourBy, banRank, playRank, edgeByMap),
     note: haveOurs
       ? null
       : "Our map sample is missing — ranked from their record only. Scout Little Buff Boyz once to compare.",
   };
+}
+
+function buildGrid(
+  theirBy: Map<string, MapTendency>,
+  ourBy: Map<string, MapTendency>,
+  banRank: Map<string, number>,
+  playRank: Map<string, number>,
+  edgeByMap: Map<string, number>,
+): MapPlanGridRow[] {
+  return NGS_MAP_POOL.map(({ name }) => ({
+    map: name,
+    ourRecord: seasonRecordLine(ourBy.get(name)),
+    theirRecord: seasonRecordLine(theirBy.get(name)),
+    banRank: banRank.get(name) ?? null,
+    playRank: playRank.get(name) ?? null,
+    edge: edgeByMap.get(name) ?? null,
+  }));
 }
 
 function toPick(

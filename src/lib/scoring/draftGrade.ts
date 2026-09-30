@@ -1,4 +1,8 @@
 import {
+  COMFORT_GRADE_CAP,
+  COMFORT_GRADE_MULTIPLIER,
+} from "@/lib/scoring/comfort";
+import {
   allyDuos,
   enemyDuos,
   heroDraftMeta,
@@ -33,6 +37,10 @@ export type DraftStepScore = {
   bestLabel: string;
   best: number;
   achieved: number;
+  /** Share of comparable options this lock beat (0–100). */
+  percentile?: number;
+  /** How many options it was ranked against, itself included. */
+  fieldSize?: number;
 };
 
 export type SideDraftGrade = {
@@ -42,15 +50,21 @@ export type SideDraftGrade = {
   points: number;
   /** Σ best available at each of those steps. */
   bestPoints: number;
-  /** points / bestPoints as a percent — drives the letter grade. */
+  /** points / bestPoints as a percent. */
   pct: number;
+  /** Average step percentile — drives the letter grade. */
+  percentile: number;
   /** Strength of the locked five (0–100) — drives the draft win %. */
   quality: number;
   notes: string[];
   steps: GradedStep[];
 };
 
-export type GradedStep = DraftStepScore & { pct: number; grade: LetterGrade };
+export type GradedStep = DraftStepScore & {
+  pct: number;
+  percentile: number;
+  grade: LetterGrade;
+};
 
 export type DraftReportCard = {
   ours: SideDraftGrade;
@@ -110,8 +124,11 @@ function comfortScore(
     sum += comfortOf(roster, s.player, s.hero);
   }
   const avg = sum / seats.length;
-  // Comfort ~0.05–0.25 typical; map into 0–25.
-  return { points: clamp(avg * 100, 0, 25), avg };
+  // Comfort ~0.05–0.25 typical; map into 0–50.
+  return {
+    points: clamp(avg * COMFORT_GRADE_MULTIPLIER, 0, COMFORT_GRADE_CAP),
+    avg,
+  };
 }
 
 function synergyScore(
@@ -201,21 +218,26 @@ export function scoreFive(args: {
 }
 
 /**
- * Curved: "best" is the top suggestion at every step, which no real draft hits,
- * so half the available points is a C.
+ * Standard scale on the share of comparable options a lock beat: top 10% is
+ * an A, the next 10% a B, and anything that didn't beat 60% of options is an F.
  */
-export function pctToGrade(pct: number): LetterGrade {
-  if (pct >= 90) return "A+";
-  if (pct >= 82) return "A";
-  if (pct >= 75) return "A-";
-  if (pct >= 69) return "B+";
-  if (pct >= 63) return "B";
-  if (pct >= 57) return "B-";
-  if (pct >= 52) return "C+";
-  if (pct >= 46) return "C";
-  if (pct >= 40) return "C-";
-  if (pct >= 25) return "D";
+export function percentileToGrade(percentile: number): LetterGrade {
+  if (percentile >= 97) return "A+";
+  if (percentile >= 93) return "A";
+  if (percentile >= 90) return "A-";
+  if (percentile >= 87) return "B+";
+  if (percentile >= 83) return "B";
+  if (percentile >= 80) return "B-";
+  if (percentile >= 77) return "C+";
+  if (percentile >= 73) return "C";
+  if (percentile >= 70) return "C-";
+  if (percentile >= 60) return "D";
   return "F";
+}
+
+/** Steps scored before percentiles existed fall back to achieved / best. */
+export function stepPercentile(s: DraftStepScore): number {
+  return s.percentile ?? stepPct(s);
 }
 
 /**
@@ -245,17 +267,20 @@ export function stepPct(s: Pick<DraftStepScore, "best" | "achieved">): number {
   return clamp(Math.round((s.achieved / best) * 100), 0, 100);
 }
 
+/** Lowest-ranked step (ties: bigger point gap), if it fell short of a C. */
 function biggestMiss(steps: readonly DraftStepScore[]): DraftStepScore | null {
   let worst: DraftStepScore | null = null;
-  let worstGap = 0;
+  let worstKey: [number, number] | null = null;
   for (const s of steps) {
     const gap = Math.max(0, s.best, s.achieved) - s.achieved;
-    if (gap > worstGap) {
-      worstGap = gap;
+    if (gap < 3) continue;
+    const key: [number, number] = [stepPercentile(s), -gap];
+    if (!worstKey || key[0] < worstKey[0] || (key[0] === worstKey[0] && key[1] < worstKey[1])) {
+      worstKey = key;
       worst = s;
     }
   }
-  return worstGap >= 3 ? worst : null;
+  return worstKey && worstKey[0] < 70 ? worst : null;
 }
 
 function fmt(n: number): string {
@@ -277,7 +302,7 @@ function gradeSide(args: {
       `Biggest miss: ${verb} ${miss.locked} (${fmt(miss.achieved)}) over ${miss.bestLabel} (${fmt(Math.max(miss.best, miss.achieved))}).`,
     );
   } else if (args.steps.length) {
-    notes.push("Took the top option (or within 3 points) at every step.");
+    notes.push("Every step ranked C or better against the options open.");
   }
   if (args.scored.missingRoles.length) {
     notes.push(`Missing: ${args.scored.missingRoles.join(", ")}.`);
@@ -285,18 +310,23 @@ function gradeSide(args: {
   if (args.scored.synergy.best) {
     notes.push(`Best pair: ${args.scored.synergy.best}.`);
   }
+  const steps = args.steps.map((s) => {
+    const percentile = stepPercentile(s);
+    return { ...s, pct: stepPct(s), percentile, grade: percentileToGrade(percentile) };
+  });
+  const percentile = steps.length
+    ? Math.round(steps.reduce((sum, s) => sum + s.percentile, 0) / steps.length)
+    : 100;
   return {
     label: args.label,
-    grade: pctToGrade(pct),
+    grade: percentileToGrade(percentile),
     points,
     bestPoints,
     pct,
+    percentile,
     quality: args.scored.quality,
     notes: notes.slice(0, 3),
-    steps: args.steps.map((s) => {
-      const p = stepPct(s);
-      return { ...s, pct: p, grade: pctToGrade(p) };
-    }),
+    steps,
   };
 }
 

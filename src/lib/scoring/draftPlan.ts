@@ -7,6 +7,13 @@ import {
 } from "@/config/divePlaybook";
 import { heroKey, heroRole, heroSpellings, heroTags } from "@/lib/scoring/heroMeta";
 import {
+  COMFORT_OFFLANE_FILL,
+  COMFORT_PLAN_WEIGHT,
+  COMFORT_RANGED_FILL,
+  COMFORT_SUGGEST_MIN,
+  comfortMeetsSuggestBar,
+} from "@/lib/scoring/comfort";
+import {
   banPressure,
   heroComfort,
   metaStrength,
@@ -606,71 +613,39 @@ export function buildDraftPlan(
     undefined,
     allowDoubleHealer,
   );
-  const base = ourLikelyComp(home, planSlots, planKey, leaveDive, true);
-  const ourVsTheirHeroes = dropClaimedHeroes(
-    base.picks,
-    claimKeys(theirLikely.map((p) => p.hero)),
-    planSlots,
-    home,
-  );
-  const ours = finishOurComp(
-    ourVsTheirHeroes,
-    planSlots,
-    home,
-    draft,
-    base.note,
-  );
-  const ourIfWeTakePicks = wePlayContested
-    ? forceFirstPick(base.picks, contested, wePlayContested, home, planSlots)
-    : base.picks;
-  const ourClaim = claimKeys(ourIfWeTakePicks.map((p) => p.hero));
-  const ourIfWeTake = finishOurComp(
-    ourIfWeTakePicks,
-    planSlots,
-    home,
-    draft,
-    base.note,
-  );
-  // If contested is not in our pool we tell the coach to ban it — their
-  // "likely five" should be the post-ban read (full five), not Johanna + 3.
-  const banContestedAway = Boolean(contested && !wePlayContested);
-  const theirWeFirstGone = new Set(ourClaim);
-  if (banContestedAway && contested) {
-    theirWeFirstGone.add(heroKey(contested));
-  }
-  const theirIfWeTake = fillLikelyComp(
-    players,
-    predicted
-      .map((p) => p.hero)
-      .filter((h) => !theirWeFirstGone.has(heroKey(h))),
-    theirWeFirstGone,
-    allowDoubleHealer,
-  );
 
-  const theyFirst = makeSide({
-    label: "They pick first",
-    summary: sideSummary({
-      firstPick: "them",
-      contested,
-      wePlayContested,
-      theirLikely,
-      ourLikely: ours.picks,
-      baitBans,
-      predicted: predicted.map((p) => p.hero),
-    }),
-    counterNote: sideCounterNote({
-      theirLikely,
-      ourLikely: ours.picks,
-      ourBrief: ours.brief,
-      answerKey: key,
-      answerCounter: answer.counter,
-    }),
-    theirLikely,
-    ourLikely: ours.picks,
-    ourCompNote: ours.note,
-    ourBrief: ours.brief,
-    tree: buildTree({
-      firstPick: "them",
+  const buildSides = (
+    slots: DraftPlanSlot[],
+    slotKey: string,
+    pivoting: boolean,
+  ): { weFirst: DraftSide; theyFirst: DraftSide } => {
+    const base = ourLikelyComp(home, slots, slotKey, pivoting, true);
+    const ours = finishOurComp(
+      dropClaimedHeroes(
+        base.picks,
+        claimKeys(theirLikely.map((p) => p.hero)),
+        slots,
+        home,
+      ),
+      slots,
+      home,
+      draft,
+      base.note,
+    );
+    // Not ours to take means we ban it, so it cannot sit in our five either.
+    const ourIfWeTakePicks = wePlayContested
+      ? forceFirstPick(base.picks, contested, wePlayContested, home, slots)
+      : contested
+        ? dropClaimedHeroes(base.picks, claimKeys([contested]), slots, home)
+        : base.picks;
+    const ourIfWeTake = finishOurComp(
+      ourIfWeTakePicks,
+      slots,
+      home,
+      draft,
+      base.note,
+    );
+    const treeArgs = {
       contested,
       wePlayContested: Boolean(wePlayContested),
       players,
@@ -678,43 +653,65 @@ export function buildDraftPlan(
       theirBans: draft.theirBans.map((b) => b.hero),
       predicted: predicted.map((p) => p.hero),
       baitBans: baitBans.map((b) => b.hero),
-      ourPlan: ours.picks,
-    }),
-  });
-  const weFirst = makeSide({
-    label: "We pick first",
-    summary: sideSummary({
-      firstPick: "us",
-      contested,
-      wePlayContested,
-      theirLikely: theirIfWeTake,
-      ourLikely: ourIfWeTake.picks,
-      baitBans,
-      predicted: predicted.map((p) => p.hero),
-    }),
-    counterNote: sideCounterNote({
-      theirLikely: theirIfWeTake,
-      ourLikely: ourIfWeTake.picks,
-      ourBrief: ourIfWeTake.brief,
-      answerKey: key,
-      answerCounter: answer.counter,
-    }),
-    theirLikely: theirIfWeTake,
-    ourLikely: ourIfWeTake.picks,
-    ourCompNote: ourIfWeTake.note,
-    ourBrief: ourIfWeTake.brief,
-    tree: buildTree({
-      firstPick: "us",
-      contested,
-      wePlayContested: Boolean(wePlayContested),
-      players,
-      home,
-      theirBans: draft.theirBans.map((b) => b.hero),
-      predicted: predicted.map((p) => p.hero),
-      baitBans: baitBans.map((b) => b.hero),
-      ourPlan: ourIfWeTake.picks,
-    }),
-  });
+    };
+    const side = (
+      label: string,
+      firstPick: "us" | "them",
+      plan: { picks: DraftCompPick[]; note: string | null },
+    ): DraftSide => {
+      const tree = buildTree({ ...treeArgs, firstPick, ourPlan: plan.picks });
+      // The tree walks the actual draft order, so the five we name and the
+      // five they end on are whatever its expected path locks — one source.
+      const path = expectedPicks(tree);
+      const aligned = finishOurComp(
+        alignToTree(plan.picks, path.ours, slots),
+        slots,
+        home,
+        draft,
+        plan.note,
+        false,
+      );
+      const theirs = alignTheirsToTree(theirLikely, path.theirs);
+      return {
+        label,
+        summary: sideSummary({
+          firstPick,
+          contested,
+          wePlayContested,
+          theirLikely: theirs,
+          ourLikely: aligned.picks,
+          baitBans,
+          predicted: predicted.map((p) => p.hero),
+        }),
+        counterNote: sideCounterNote({
+          theirLikely: theirs,
+          ourLikely: aligned.picks,
+          ourBrief: aligned.brief,
+          answerKey: key,
+          answerCounter: answer.counter,
+        }),
+        theirLikely: theirs,
+        ourLikely: aligned.picks,
+        ourCompNote: aligned.note,
+        ourBrief: aligned.brief,
+        tree,
+      };
+    };
+    return {
+      theyFirst: side("They pick first", "them", ours),
+      weFirst: side("We pick first", "us", ourIfWeTake),
+    };
+  };
+
+  const sides = buildSides(planSlots, planKey, leaveDive);
+  // The chosen pivot is `sides` itself; a map only swaps when it picks another.
+  const pivotSides = antiDiveThreat
+    ? Object.fromEntries(
+        divePlaybook.pivots
+          .filter((p) => p.id !== chosen?.pivot.id)
+          .map((p) => [p.id, buildSides(pivotPlanSlots(p), `pivot:${p.id}`, true)]),
+      )
+    : undefined;
 
   return {
     summary,
@@ -727,18 +724,79 @@ export function buildDraftPlan(
     macro,
     slots: planSlots,
     steps,
-    theirLikely,
-    ourLikely: ours.picks,
-    ourCompNote: ours.note,
-    ourBrief: ours.brief,
-    tree: theyFirst.tree,
-    sides: { weFirst, theyFirst },
+    theirLikely: sides.theyFirst.theirLikely,
+    ourLikely: sides.theyFirst.ourLikely,
+    ourCompNote: sides.theyFirst.ourCompNote,
+    ourBrief: sides.theyFirst.ourBrief,
+    tree: sides.theyFirst.tree,
+    sides,
+    pivotSides,
     playbook,
   };
 }
 
-function makeSide(side: DraftSide): DraftSide {
-  return side;
+type TreePick = { hero: string; player: string | null };
+
+/** Picks along the tree's expected line — what the lobby looks like if our read holds. */
+export function expectedPicks(tree: DraftTreeNode): {
+  ours: TreePick[];
+  theirs: TreePick[];
+} {
+  const ours: TreePick[] = [];
+  const theirs: TreePick[] = [];
+  let node: DraftTreeNode | undefined = tree;
+  while (node) {
+    const a = node.action;
+    if (a?.kind === "pick") {
+      (a.side === "our" ? ours : theirs).push({ hero: a.hero, player: a.player });
+    }
+    node =
+      node.children?.find((c) => c.branch === "expected") ?? node.children?.[0];
+  }
+  return { ours, theirs };
+}
+
+/**
+ * Keep each planned seat whose hero the tree locks; seats the tree had to
+ * change take its replacement (same role first), with the tree's player.
+ */
+function alignToTree(
+  plan: DraftCompPick[],
+  treePicks: TreePick[],
+  slots: DraftPlanSlot[],
+): DraftCompPick[] {
+  if (treePicks.length < plan.length) return plan;
+  const planKeys = new Set(plan.map((p) => heroKey(p.hero)));
+  const spare = treePicks.filter((t) => !planKeys.has(heroKey(t.hero)));
+  return plan.map((pick, i) => {
+    const locked = treePicks.find((t) => heroKey(t.hero) === heroKey(pick.hero));
+    if (locked) return { ...pick, player: locked.player ?? pick.player };
+    const slot = slots[i] ?? { role: pick.role, heroes: [], why: "" };
+    const at = spare.findIndex((t) =>
+      slotFits(slot.role, heroRole(t.hero), t.hero, slot.heroes),
+    );
+    const swap = spare.splice(at >= 0 ? at : 0, 1)[0];
+    if (!swap) return pick;
+    return {
+      role: pick.role,
+      hero: swap.hero,
+      player: swap.player,
+      note: `${pick.hero} likely gone first`,
+    };
+  });
+}
+
+function alignTheirsToTree(
+  likely: DraftCompPick[],
+  treePicks: TreePick[],
+): DraftCompPick[] {
+  if (treePicks.length < 5) return likely;
+  return treePicks.map((t) => {
+    const known = likely.find((p) => heroKey(p.hero) === heroKey(t.hero));
+    return known
+      ? { ...known, player: t.player ?? known.player }
+      : { role: heroRole(t.hero), hero: t.hero, player: t.player, note: null };
+  });
 }
 
 function heroList(picks: DraftCompPick[]): string {
@@ -807,7 +865,7 @@ function sideSummary(args: {
 
   if (args.contested) {
     return [
-      `We pick first, but ${args.contested} is not in our pool — ban it or their first pick is ${args.contested}.`,
+      `We pick first, but nobody on our side is comfortable enough on ${args.contested} to take it — ban it or their first pick is ${args.contested}.`,
       leaveUp.length
         ? `If it is banned, expect ${theirHeroes}.`
         : "",
@@ -999,8 +1057,17 @@ function contestedHero(
   return predicted[0] ?? null;
 }
 
+/**
+ * Comfort (0–1) our best player needs before we first-pick their contested
+ * hero instead of banning it. Full pools give nearly every hero a sliver of
+ * comfort, and a deny pick on an 11-comfort hero costs us our real seat.
+ */
+const CONTEST_MIN_COMFORT = 0.15;
+
 function whoPlays(players: PlayerScout[], hero: string | null): string | null {
-  return hero ? heroComfort(players, hero)?.name ?? null : null;
+  if (!hero) return null;
+  const who = heroComfort(players, hero);
+  return who && who.comfort >= CONTEST_MIN_COMFORT ? who.name : null;
 }
 
 function claimKeys(heroes: string[]): Set<string> {
@@ -1377,8 +1444,11 @@ function comfortSlotScore(
     if (actual.includes("Ranged")) roleFit += 0.4;
     if (actual === "Bruiser" || actual.includes("Melee")) roleFit -= 0.35;
   }
-  return comfort + named + tagHit + coreHit + roleFit;
+  return comfort * COMFORT_PLAN_WEIGHT + named + tagHit + coreHit + roleFit;
 }
+
+/** Bound sums add in a different order than branch totals; don't prune on float noise. */
+const BOUND_EPS = 1e-9;
 
 export function solveSeatAssignments(args: {
   players: PlayerScout[];
@@ -1406,14 +1476,16 @@ export function solveSeatAssignments(args: {
   }
 
   const candidateMap = slots.map((slot) => {
-    const options: Array<{ player: string; hero: string; score: number }> = [];
+    const options: Array<{ player: string; hero: string; key: string; score: number }> = [];
     for (const p of players) {
       const player = playerName(p.battletag);
       for (const h of p.topHeroes) {
+        if (!comfortMeetsSuggestBar(h.comfort)) continue;
         if (!slotFits(slot.role, heroRole(h.hero), h.hero, slot.heroes)) continue;
         options.push({
           player,
           hero: h.hero,
+          key: heroKey(h.hero),
           score: comfortSlotScore(h.hero, h.comfort, slot, preferredTags),
         });
       }
@@ -1421,18 +1493,23 @@ export function solveSeatAssignments(args: {
     return options.sort((a, b) => b.score - a.score);
   });
 
+  // Best case for the slots from i onward, ignoring conflicts. Options are
+  // sorted, so a branch that can't beat the current best even with every later
+  // slot at its top option is skipped — same answer, far fewer branches.
+  const suffixBound = new Array<number>(slots.length + 1).fill(0);
+  for (let i = slots.length - 1; i >= 0; i--) {
+    suffixBound[i] = suffixBound[i + 1] + (candidateMap[i][0]?.score ?? 0);
+  }
+
   const best = {
     total: Number.NEGATIVE_INFINITY,
     picks: [] as Array<{ player: string | null; hero: string; role: string; score: number }>,
   };
+  const usedPlayers = new Set<string>();
+  const usedHeroes = new Set<string>();
+  const picks: Array<{ player: string | null; hero: string; role: string; score: number }> = [];
 
-  const dfs = (
-    slotIndex: number,
-    usedPlayers: Set<string>,
-    usedHeroes: Set<string>,
-    total: number,
-    picks: Array<{ player: string | null; hero: string; role: string; score: number }>,
-  ) => {
+  const dfs = (slotIndex: number, total: number) => {
     if (slotIndex === slots.length) {
       if (total > best.total) {
         best.total = total;
@@ -1440,6 +1517,7 @@ export function solveSeatAssignments(args: {
       }
       return;
     }
+    if (total + suffixBound[slotIndex] < best.total - BOUND_EPS) return;
 
     const slot = slots[slotIndex];
     const options = candidateMap[slotIndex];
@@ -1451,31 +1529,32 @@ export function solveSeatAssignments(args: {
         role: slot.role,
         score: 0,
       });
-      dfs(slotIndex + 1, usedPlayers, new Set(usedHeroes), total, picks);
+      dfs(slotIndex + 1, total);
       picks.pop();
       return;
     }
 
     for (const option of options) {
-      if (usedPlayers.has(option.player) || usedHeroes.has(heroKey(option.hero))) {
+      if (total + option.score + suffixBound[slotIndex + 1] < best.total - BOUND_EPS) break;
+      if (usedPlayers.has(option.player) || usedHeroes.has(option.key)) {
         continue;
       }
-      const nextPlayers = new Set(usedPlayers);
-      const nextHeroes = new Set(usedHeroes);
-      nextPlayers.add(option.player);
-      nextHeroes.add(heroKey(option.hero));
+      usedPlayers.add(option.player);
+      usedHeroes.add(option.key);
       picks.push({
         player: option.player,
         hero: option.hero,
         role: slot.role,
         score: option.score,
       });
-      dfs(slotIndex + 1, nextPlayers, nextHeroes, total + option.score, picks);
+      dfs(slotIndex + 1, total + option.score);
       picks.pop();
+      usedPlayers.delete(option.player);
+      usedHeroes.delete(option.key);
     }
   };
 
-  dfs(0, new Set<string>(), new Set<string>(), 0, []);
+  dfs(0, 0);
 
   if (!best.picks.length) {
     return slots.map((slot) => ({
@@ -1806,12 +1885,12 @@ function finishOurComp(
   home: PlayerScout[] | null,
   draft: DraftInsights,
   note: string | null,
+  /** Off for a five the draft tree already locked — patching holes swaps in heroes it had gone. */
+  patchHoles = true,
 ): { picks: DraftCompPick[]; note: string | null; brief: OurCompBrief } {
-  const laneds = fillPlanHoles(
-    normalizeBruiserLanes(picks),
-    home ?? [],
-    new Set(),
-  );
+  const laneds = patchHoles
+    ? fillPlanHoles(normalizeBruiserLanes(picks), home ?? [], new Set())
+    : normalizeBruiserLanes(picks);
   const withAlts = laneds.map((p, i) => ({
     ...p,
     alternatives: alternativesFor(
@@ -1980,12 +2059,16 @@ export function fillPlanHoles(
         "Xul",
         "Dehaka",
         "Hogger",
-      ].filter((h) => free(h) && heroIsOfflaner(h));
+      ]
+        .filter((h) => free(h) && heroIsOfflaner(h))
+        .filter(
+          (h) => comfortOn(home, seat.player, h) >= COMFORT_SUGGEST_MIN,
+        );
       let best: string | null = null;
       let bestScore = -1;
       for (const h of options) {
         const score =
-          offlaneFitness(h) + comfortOn(home, seat.player, h) * 20;
+          offlaneFitness(h) + comfortOn(home, seat.player, h) * COMFORT_OFFLANE_FILL;
         if (score > bestScore) {
           bestScore = score;
           best = h;
@@ -2017,13 +2100,17 @@ export function fillPlanHoles(
         "Sonya",
         "Blaze",
         "Xul",
-      ].filter(free);
+      ]
+        .filter(free)
+        .filter(
+          (h) => comfortOn(home, seat.player, h) >= COMFORT_SUGGEST_MIN,
+        );
       let best: string | null = null;
       let bestScore = -1;
       for (const h of options) {
         if (!tagsOf(h).includes("waveclear")) continue;
         const score =
-          offlaneFitness(h) + comfortOn(home, seat.player, h) * 20;
+          offlaneFitness(h) + comfortOn(home, seat.player, h) * COMFORT_OFFLANE_FILL;
         if (score > bestScore) {
           bestScore = score;
           best = h;
@@ -2069,7 +2156,8 @@ export function fillPlanHoles(
       const best: { current: Opt | null } = { current: null };
       const consider = (hero: string, player: string | null, base: number) => {
         if (!free(hero) || !heroRole(hero).includes("Ranged")) return;
-        const score = base + comfortOn(home, player, hero) * 30;
+        if (comfortOn(home, player, hero) < COMFORT_SUGGEST_MIN) return;
+        const score = base + comfortOn(home, player, hero) * COMFORT_RANGED_FILL;
         if (!best.current || score > best.current.score) {
           best.current = { hero, player, score };
         }
@@ -2216,6 +2304,7 @@ function alternativesFor(
       const owned = [...owner.topHeroes]
         .filter(
           (h) =>
+            comfortMeetsSuggestBar(h.comfort) &&
             !seen.has(heroKey(h.hero)) &&
             !usedElsewhere.has(heroKey(h.hero)) &&
             slotFits(slot.role, heroRole(h.hero), h.hero, slot.heroes),
@@ -2237,6 +2326,7 @@ function alternativesFor(
         continue;
       }
       for (const h of p.topHeroes) {
+        if (!comfortMeetsSuggestBar(h.comfort)) continue;
         if (seen.has(heroKey(h.hero)) || usedElsewhere.has(heroKey(h.hero))) continue;
         if (!slotFits(slot.role, heroRole(h.hero), h.hero, slot.heroes)) continue;
         cands.push({
@@ -2787,6 +2877,10 @@ function nextOurBan(s: Walk): Choice {
   }
   const opening = s.ourBans < 2;
   const wantThemOn = new Set(opening ? s.predicted : []);
+  const ourPlanned = new Set(s.ourPlan.map((p) => heroKey(p.hero)));
+  if (s.contested && s.weAreFp && s.fork === "our-first-pick") {
+    ourPlanned.add(heroKey(s.contested));
+  }
   const ordered = [
     ...(s.contested && !(s.weAreFp && s.fork === "our-first-pick")
       ? [s.contested]
@@ -2796,6 +2890,7 @@ function nextOurBan(s: Walk): Choice {
   ];
   for (const hero of ordered) {
     if (s.gone.has(hero)) continue;
+    if (ourPlanned.has(heroKey(hero))) continue;
     if (wantThemOn.has(hero) && hero !== s.contested) continue;
     if (s.ourPool.some((h) => h.hero === hero) && s.weAreFp && hero !== s.contested) {
       continue;
@@ -2959,6 +3054,7 @@ function poolFrom(players: PlayerScout[]): HeroOpt[] {
   const out: HeroOpt[] = [];
   for (const p of players) {
     for (const h of p.topHeroes) {
+      if (!comfortMeetsSuggestBar(h.comfort)) continue;
       out.push({
         hero: h.hero,
         player: playerName(p.battletag),

@@ -1,4 +1,8 @@
 import { heroKey } from "@/lib/scoring/heroMeta";
+import {
+  COMFORT_SUGGEST_MIN,
+  comfortMeetsSuggestBar,
+} from "@/lib/scoring/comfort";
 import type { PlayerScout } from "@/lib/scoring/types";
 
 export type LockedPick = {
@@ -210,14 +214,18 @@ export function bestFreeOwner(
   hero: string,
   lockedPlayers: Set<string>,
 ): string | null {
+  const gated = home.some((p) =>
+    comfortMeetsSuggestBar(comfortOf(home, displayName(p.battletag), hero)),
+  );
   let best: { name: string; comfort: number } | null = null;
   for (const p of home) {
     const name = displayName(p.battletag);
     if (lockedPlayers.has(playerId(name))) continue;
     const c = comfortOf(home, name, hero);
+    if (gated ? c < COMFORT_SUGGEST_MIN : c <= 0) continue;
     if (!best || c > best.comfort) best = { name, comfort: c };
   }
-  return best && best.comfort > 0 ? best.name : null;
+  return best?.name ?? null;
 }
 
 /**
@@ -262,7 +270,14 @@ export function assignUniqueOwners(args: {
         const name = displayName(p.battletag);
         const id = playerId(name);
         seenPlayers.add(id);
-        let score = comfortOf(roster, name, hero);
+        const raw = comfortOf(roster, name, hero);
+        const gated = roster.some((row) =>
+          comfortMeetsSuggestBar(
+            comfortOf(roster, displayName(row.battletag), hero),
+          ),
+        );
+        if (gated ? raw < COMFORT_SUGGEST_MIN : raw <= 0) continue;
+        let score = raw;
         if (hint && playerId(hint) === id) score += 0.05;
         if (prev && playerId(prev) === id) score += 0.005;
         if (score > 0) claims.push({ heroIdx: i, player: name, score });

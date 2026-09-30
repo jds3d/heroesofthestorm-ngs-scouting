@@ -88,6 +88,7 @@ export type V1PlayerHeroRow = {
   win_rate?: number;
   hero?: { name?: string; new_role?: string };
   name?: string;
+  blizz_id?: number;
   sl_mmr_data?: number | null;
 };
 

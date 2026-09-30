@@ -343,6 +343,8 @@ export function buildDraftInsights(
       games: Math.round(s.games * 10) / 10,
       wins: Math.round(s.wins * 10) / 10,
       winRate: s.games > 0 ? Math.round((s.wins / s.games) * 1000) / 10 : 0,
+      seasonGames: s.current,
+      seasonWins: s.currentWins,
     }))
     .sort((a, b) => b.games - a.games);
 

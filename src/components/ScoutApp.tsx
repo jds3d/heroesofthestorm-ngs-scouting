@@ -115,6 +115,7 @@ export function ScoutApp() {
   const [loadingRoster, setLoadingRoster] = useState(false);
   const [loadingProgress, setLoadingProgress] = useState(12);
   const [reviewOpen, setReviewOpen] = useState(false);
+  const [loadingReview, setLoadingReview] = useState(false);
   const [reviewGames, setReviewGames] = useState<ReviewGameSummary[] | null>(null);
   const [loadingReviewGames, setLoadingReviewGames] = useState(false);
   const [review, setReview] = useState<ReviewGame | null>(null);
@@ -277,6 +278,7 @@ export function ScoutApp() {
     setReport(null);
     setError(null);
     setLoadingReport(true);
+    setLoadingReview(true);
     setLoadingProgress(12);
     try {
       const res = await scoutFetch(`/api/review/game?id=${encodeURIComponent(id)}`);
@@ -291,6 +293,8 @@ export function ScoutApp() {
     } catch (e) {
       setError(e instanceof Error ? e.message : "Draft review failed");
       setLoadingReport(false);
+    } finally {
+      setLoadingReview(false);
     }
   }
 
@@ -371,77 +375,96 @@ export function ScoutApp() {
         </p>
       </header>
 
-      <section className="flex flex-col gap-4 border-t border-[var(--line)] pt-6 sm:flex-row sm:items-end">
-        <div className="flex min-w-0 flex-1 flex-col gap-2">
-          <span className="text-sm font-medium text-[var(--muted)]">Team</span>
-          <TeamPicker
-            homeTeam={meta?.homeTeam ?? null}
-            weekGroups={weekGroups}
-            selected={selected}
-            disabled={loadingTeams || loadingReport}
-            loading={loadingTeams}
-            onSelect={setSelected}
-          />
+      <section className="space-y-5 rounded-xl border border-[var(--line)] bg-[var(--panel)] p-4 shadow-sm sm:p-6">
+        <div className="space-y-1">
+          <h2 className="text-lg font-semibold text-[var(--ink)]">Scout an opponent</h2>
+          <p className="text-sm text-[var(--muted)]">
+            Choose a team and both lineups, then build a draft plan for the upcoming match.
+          </p>
         </div>
-        <button
-          type="button"
-          onClick={generate}
-          disabled={!selected || !lineupsReady || loadingReport || loadingRoster}
-          className="h-12 rounded-md bg-[var(--accent)] px-6 text-sm font-semibold uppercase tracking-wide text-[var(--accent-ink)] transition enabled:hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-50"
-        >
-          {loadingReport ? "Scouting…" : "Generate scout report"}
-        </button>
-        <button
-          type="button"
-          onClick={openReview}
-          disabled={loadingReport || !homeName}
-          aria-expanded={reviewOpen}
-          className="h-12 rounded-md border border-[var(--accent)] px-6 text-sm font-semibold uppercase tracking-wide text-[var(--accent)] transition enabled:hover:bg-[var(--accent)]/10 disabled:cursor-not-allowed disabled:opacity-50"
-        >
-          Draft review
-        </button>
-        <label className="flex h-12 items-center gap-2 text-sm text-[var(--ink)]">
-          <input
-            type="checkbox"
-            checked={refreshPlayerData}
-            disabled={loadingReport}
-            onChange={(e) => setRefreshPlayerData(e.target.checked)}
+        <div className="flex flex-col gap-4 sm:flex-row sm:items-end">
+          <div className="flex min-w-0 flex-1 flex-col gap-2">
+            <span className="text-sm font-medium text-[var(--muted)]">Team</span>
+            <TeamPicker
+              homeTeam={meta?.homeTeam ?? null}
+              weekGroups={weekGroups}
+              selected={selected}
+              disabled={loadingTeams || loadingReport}
+              loading={loadingTeams}
+              onSelect={setSelected}
+            />
+          </div>
+          <button
+            type="button"
+            onClick={generate}
+            disabled={!selected || !lineupsReady || loadingReport || loadingRoster}
+            className="h-12 rounded-md bg-[var(--accent)] px-6 text-sm font-semibold uppercase tracking-wide text-[var(--accent-ink)] transition enabled:hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {loadingReport && !loadingReview ? "Scouting…" : "Generate scout report"}
+          </button>
+        </div>
+        <LineupPicker
+          title={`Our 5 — ${homeName || "Little Buff Boyz"} (${ourFive.length}/5)`}
+          hint="Defaults to the five with the most NGS games this season."
+          players={ourRoster}
+          selected={ourFive}
+          disabled={loadingReport}
+          onChange={setOurFive}
+        />
+        {selected && !scoutingSelf && (
+          <LineupPicker
+            title={`Their 5 — ${selected} (${theirFive.length}/5)`}
+            hint={
+              loadingRoster
+                ? "Loading roster and season games…"
+                : "Defaults to the five with the most NGS games this season."
+            }
+            players={theirRoster}
+            selected={theirFive}
+            disabled={loadingReport || loadingRoster}
+            onChange={setTheirFive}
           />
-          Refresh hero &amp; player data
-        </label>
+        )}
       </section>
 
-      {reviewOpen && (
-        <ReviewGamePicker
-          games={reviewGames}
-          loading={loadingReviewGames}
-          activeId={review?.id ?? null}
-          onPick={reviewGame}
-        />
-      )}
+      <section className="space-y-4 rounded-xl border border-[var(--line)] bg-[var(--panel)] p-4 shadow-sm sm:p-6">
+        <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+          <div className="space-y-1">
+            <h2 className="text-lg font-semibold text-[var(--ink)]">Review a played game</h2>
+            <p className="text-sm text-[var(--muted)]">
+              Grades every ban and pick from an NGS replay. The opponent and both lineups
+              come from the replay — the team and lineups above aren&apos;t used.
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={openReview}
+            disabled={loadingReport || !homeName}
+            aria-expanded={reviewOpen}
+            className="h-12 shrink-0 rounded-md border border-[var(--accent)] px-6 text-sm font-semibold uppercase tracking-wide text-[var(--accent)] transition enabled:hover:bg-[var(--accent)]/10 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {loadingReview ? "Loading review…" : reviewOpen ? "Hide games" : "Choose a game"}
+          </button>
+        </div>
+        {reviewOpen && (
+          <ReviewGamePicker
+            games={reviewGames}
+            loading={loadingReviewGames}
+            activeId={review?.id ?? null}
+            onPick={reviewGame}
+          />
+        )}
+      </section>
 
-      <LineupPicker
-        title={`Our 5 — ${homeName || "Little Buff Boyz"} (${ourFive.length}/5)`}
-        hint="Defaults to the five with the most NGS games this season."
-        players={ourRoster}
-        selected={ourFive}
-        disabled={loadingReport}
-        onChange={setOurFive}
-      />
-      {selected && !scoutingSelf && (
-        <LineupPicker
-          title={`Their 5 — ${selected} (${theirFive.length}/5)`}
-          hint={
-            loadingRoster
-              ? "Loading roster and season games…"
-              : "Defaults to the five with the most NGS games this season."
-          }
-          players={theirRoster}
-          selected={theirFive}
-          disabled={loadingReport || loadingRoster}
-          onChange={setTheirFive}
+      <label className="flex items-center gap-2 text-sm text-[var(--ink)]">
+        <input
+          type="checkbox"
+          checked={refreshPlayerData}
+          disabled={loadingReport}
+          onChange={(e) => setRefreshPlayerData(e.target.checked)}
         />
-      )}
+        Refresh hero &amp; player data (applies to scout reports and draft reviews)
+      </label>
 
       {meta?.warning && (
         <p className="text-sm text-amber-700">{meta.warning}</p>
@@ -455,9 +478,13 @@ export function ScoutApp() {
         <div className="space-y-3 rounded-xl border border-[var(--line)] bg-[var(--panel)] p-4 text-sm text-[var(--muted)] shadow-sm">
           <div className="flex items-center justify-between gap-3">
             <p className="font-medium text-[var(--ink)]">
-              {refreshPlayerData
-                ? "Refreshing source data and generating the scout report…"
-                : "Generating the scout report…"}
+              {loadingReview
+                ? refreshPlayerData
+                  ? "Refreshing source data and loading the draft review…"
+                  : "Loading the draft review…"
+                : refreshPlayerData
+                  ? "Refreshing source data and generating the scout report…"
+                  : "Generating the scout report…"}
             </p>
             <span className="text-xs font-semibold uppercase tracking-[0.18em] text-[var(--accent)]">
               {Math.round(currentProgress)}%
@@ -775,11 +802,8 @@ function ReviewGamePicker({
   onPick: (id: string) => void;
 }) {
   return (
-    <section className="space-y-2 rounded-md border border-[var(--line)] bg-[var(--panel)] px-4 py-4">
+    <div className="space-y-2 border-t border-[var(--line)] pt-4">
       <p className="text-sm font-medium text-[var(--ink)]">Games we&apos;ve played</p>
-      <p className="text-sm text-[var(--muted)]">
-        Pick a game to load its draft from the NGS replay and grade every ban and pick.
-      </p>
       {loading ? (
         <p className="text-sm text-[var(--muted)]">Loading NGS schedule…</p>
       ) : !games?.length ? (
@@ -814,7 +838,7 @@ function ReviewGamePicker({
           ))}
         </ul>
       )}
-    </section>
+    </div>
   );
 }
 
