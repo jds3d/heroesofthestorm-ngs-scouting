@@ -6,6 +6,9 @@ export type SourceHeroStat = {
   losses: number;
   winRate: number;
   playPct: number;
+  /** Storm League only: the part of `games` / `wins` inside the recent window. */
+  recentGames?: number;
+  recentWins?: number;
 };
 
 export type ComfortHero = {

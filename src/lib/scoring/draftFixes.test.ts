@@ -187,7 +187,7 @@ describe("draftGrade", () => {
     expect(card.ours.points).toBe(85);
     expect(card.ours.bestPoints).toBe(135);
     expect(card.ours.pct).toBe(63);
-    expect(card.ours.grade).toBe("D");
+    expect(card.ours.grade).toBe("B");
     expect(card.theirs.pct).toBe(100);
     expect(card.theirs.grade).toBe("A+");
     expect(card.ours.notes[0]).toContain("Biggest miss");
@@ -195,7 +195,10 @@ describe("draftGrade", () => {
 
   it("never lets a lock beat its step's best, and counts Varian as the tank", () => {
     expect(sumStepPoints([step("our", 20, 30)]).pct).toBe(100);
-    expect(pctToGrade(88)).toBe("B+");
+    expect(pctToGrade(88)).toBe("A");
+    expect(pctToGrade(53)).toBe("C+");
+    expect(pctToGrade(33)).toBe("D");
+    expect(pctToGrade(20)).toBe("F");
     const card = gradeFinishedDraft({ ...base, steps: [] });
     expect(card.theirs.notes.join(" ")).not.toContain("tank");
     expect(card.ours.notes.join(" ")).toContain("Missing: healer");
@@ -207,12 +210,13 @@ describe("draftGrade", () => {
       ...base,
       steps: [step("our", 60, 60), step("our", 75, 40), step("our", -5, -12)],
     });
-    expect(card.ours.steps.map((s) => s.grade)).toEqual(["A+", "F", "F"]);
+    expect(card.ours.steps.map((s) => s.grade)).toEqual(["A+", "C+", "F"]);
     expect(stepPct({ best: -5, achieved: -5 })).toBe(100);
   });
 
-  it("shifts win chance by the team MMR gap on the Elo scale", () => {
-    expect(mmrAdjustedWinPct(50, 2400, 2000)).toBe(91);
+  it("shifts win chance by the team MMR gap at the NGS-fitted weight", () => {
+    expect(mmrAdjustedWinPct(50, 2075, 2000)).toBe(73);
+    expect(mmrAdjustedWinPct(39, 2000, 2075)).toBe(19);
     expect(mmrAdjustedWinPct(60, 2000, 2000)).toBe(60);
     const card = gradeFinishedDraft({ ...base, steps: [], ourMmr: 2600, theirMmr: 2500 });
     expect(card.mmrWinPct).toBeGreaterThan(card.draftWinPct);

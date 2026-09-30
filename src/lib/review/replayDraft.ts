@@ -19,6 +19,8 @@ export type ReplayAction = {
   side: "our" | "their";
   kind: "ban" | "pick";
   hero: string;
+  /** Battletag name (no #) of who played the pick. */
+  player?: string | null;
 };
 
 export type ReviewGameSummary = {
@@ -104,7 +106,12 @@ export function draftActionsFromReplay(
       );
       break;
     }
-    actions.push({ side, kind: step.kind, hero: canonicalDraftHero(hero) });
+    const action: ReplayAction = { side, kind: step.kind, hero: canonicalDraftHero(hero) };
+    if (step.kind === "pick") {
+      action.player =
+        draft.players.find((p) => p.team === team && p.hero === raw)?.name ?? null;
+    }
+    actions.push(action);
   }
 
   return { weFirst: fp === ourTeam, actions, problems };

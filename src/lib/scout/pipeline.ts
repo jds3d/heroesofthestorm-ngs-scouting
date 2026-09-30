@@ -1,4 +1,4 @@
-import { leagueConfig } from "@/config/league";
+import { leagueConfig, stormLeagueWindows } from "@/config/league";
 import {
   HeroesProfileError,
   getNgsMatch,
@@ -29,6 +29,23 @@ function stormLeagueMap(
     response["storm league"] ||
     Object.values(response)[0];
   return heroStatsFromMap(sl);
+}
+
+/** Full history totals, tagged with how much of it falls in the recent window. */
+function withRecent(
+  history: Map<string, SourceHeroStat>,
+  recent: Map<string, SourceHeroStat>,
+): Map<string, SourceHeroStat> {
+  const out = new Map<string, SourceHeroStat>();
+  for (const [hero, h] of history) {
+    const r = recent.get(hero);
+    out.set(hero, {
+      ...h,
+      recentGames: Math.min(r?.games ?? 0, h.games),
+      recentWins: Math.min(r?.wins ?? 0, h.wins),
+    });
+  }
+  return out;
 }
 
 /** Prefer ngs/player hero pool over per-game replay scraping. */
@@ -79,11 +96,16 @@ export async function generateScoutReport(
       let slMap = new Map<string, SourceHeroStat>();
       if (!hpAuthBroken) {
         try {
-          const sl = await getPlayerHeroAll(battletag, {
+          const windows = stormLeagueWindows();
+          const history = await getPlayerHeroAll(battletag, {
             gameType: "Storm League",
-            startDate: leagueConfig.stormLeagueStartDate,
+            startDate: windows.historyStart,
           });
-          slMap = stormLeagueMap(sl);
+          const recent = await getPlayerHeroAll(battletag, {
+            gameType: "Storm League",
+            startDate: windows.recentStart,
+          });
+          slMap = withRecent(stormLeagueMap(history), stormLeagueMap(recent));
         } catch (err) {
           if (err instanceof HeroesProfileError) {
             warnings.push(err.message);

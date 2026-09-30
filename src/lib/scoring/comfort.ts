@@ -29,6 +29,32 @@ function rawScore(source?: SourceHeroStat): number {
   return source.playPct * (0.4 + 0.6 * source.winRate);
 }
 
+/** Games until Storm League volume is ~63% of full credit. */
+const SL_VOLUME_GAMES = 30;
+/** Pseudo-games at 50% that a small SL sample is pulled toward. */
+const SL_WR_PRIOR_GAMES = 10;
+/** Keeps SL comfort on the same ~0–0.35 scale as the NGS play-share score. */
+const SL_SCALE = 0.3;
+
+/**
+ * Storm League comfort from volume and win rate, not share of games: a deep
+ * hero pool should not dilute a hero someone has 100+ games on.
+ */
+export function stormLeagueScore(source?: SourceHeroStat): number {
+  if (!source || source.games <= 0) return 0;
+  const recentGames = source.recentGames ?? source.games;
+  const recentWins = source.recentWins ?? source.wins;
+  const w = leagueConfig.stormLeagueOlderWeight;
+  const games = recentGames + w * (source.games - recentGames);
+  const wins = recentWins + w * (source.wins - recentWins);
+  if (games <= 0) return 0;
+  const winRate =
+    (wins + SL_WR_PRIOR_GAMES / 2) / (games + SL_WR_PRIOR_GAMES);
+  const volume = 1 - Math.exp(-games / SL_VOLUME_GAMES);
+  const quality = Math.max(0.25, Math.min(1.4, 1 + 3 * (winRate - 0.5)));
+  return SL_SCALE * volume * quality;
+}
+
 export function comfortFromSources(
   hero: string,
   ngsCurrent?: SourceHeroStat,
@@ -68,7 +94,7 @@ export function comfortFromSources(
   const weightSum = wNgs + wSl + wPrior || 1;
   const comfort =
     (wNgs * rawScore(ngsOk ? ngsCurrent : undefined) +
-      wSl * rawScore(slOk ? stormLeague : undefined) +
+      wSl * stormLeagueScore(slOk ? stormLeague : undefined) +
       wPrior * rawScore(priorOk ? ngsPrior : undefined)) /
     weightSum;
 

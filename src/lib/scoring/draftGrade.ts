@@ -200,17 +200,21 @@ export function scoreFive(args: {
   return { quality, missingRoles: roles.missing, comfort, synergy, matchup, mapPts };
 }
 
+/**
+ * Curved: "best" is the top suggestion at every step, which no real draft hits,
+ * so half the available points is a C.
+ */
 export function pctToGrade(pct: number): LetterGrade {
-  if (pct >= 97) return "A+";
-  if (pct >= 93) return "A";
-  if (pct >= 90) return "A-";
-  if (pct >= 87) return "B+";
-  if (pct >= 83) return "B";
-  if (pct >= 80) return "B-";
-  if (pct >= 77) return "C+";
-  if (pct >= 73) return "C";
-  if (pct >= 70) return "C-";
-  if (pct >= 60) return "D";
+  if (pct >= 90) return "A+";
+  if (pct >= 82) return "A";
+  if (pct >= 75) return "A-";
+  if (pct >= 69) return "B+";
+  if (pct >= 63) return "B";
+  if (pct >= 57) return "B-";
+  if (pct >= 52) return "C+";
+  if (pct >= 46) return "C";
+  if (pct >= 40) return "C-";
+  if (pct >= 25) return "D";
   return "F";
 }
 
@@ -304,16 +308,19 @@ function draftWinPct(ourQ: number, theirQ: number): number {
 }
 
 /**
- * Folds a team MMR gap into the draft odds on the Elo scale (400 MMR = 10:1),
- * treating Heroes Profile MMR as Elo-like.
+ * Log-odds per point of NGS team-average HP MMR gap, fit on 406 reported
+ * Season 22 games (scripts/calibrate-mmr.mjs): 75 MMR ≈ 73% on its own.
  */
+export const MMR_LOGIT_PER_POINT = 0.0133;
+
+/** Folds a team MMR gap into the draft odds in log-odds space. */
 export function mmrAdjustedWinPct(
   draftPct: number,
   ourMmr: number,
   theirMmr: number,
 ): number {
   const p = clamp(draftPct, 1, 99) / 100;
-  const logit = Math.log(p / (1 - p)) + ((ourMmr - theirMmr) * Math.LN10) / 400;
+  const logit = Math.log(p / (1 - p)) + (ourMmr - theirMmr) * MMR_LOGIT_PER_POINT;
   return Math.round(clamp(100 / (1 + Math.exp(-logit)), 1, 99));
 }
 
@@ -410,7 +417,7 @@ export function gradeFinishedDraft(args: {
     draftWinPct: winPct,
     mmrWinPct,
     mmrGap,
-    headline: `${ours.label} ${ours.grade} (${ours.pct}%) · ${theirs.label} ${theirs.grade} (${theirs.pct}%) — ${favouredLabel(winPct, ourLabel, theirLabel)} on the draft.`,
+    headline: `Draft decisions: ${ours.label} ${ours.grade}, ${theirs.label} ${theirs.grade}. Final five strength: ${ourLabel} ${ourFive.quality} vs ${theirLabel} ${theirFive.quality} — ${favouredLabel(winPct, ourLabel, theirLabel)}.`,
     reasons,
   };
 }

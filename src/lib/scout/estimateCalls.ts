@@ -1,4 +1,4 @@
-import { leagueConfig } from "@/config/league";
+import { leagueConfig, stormLeagueWindows } from "@/config/league";
 import { divePlaybook } from "@/config/divePlaybook";
 import {
   type ApiCallCount,
@@ -147,9 +147,12 @@ export async function predictScoutCalls(
   if (refreshPlayerData || !priorCached) add("ngs-schedule");
   // Do not fetch prior season here — generate owns that pull.
 
+  const slWindows = stormLeagueWindows();
   for (const tag of tags) {
-    const slKey = `hp-v1-hero-all-${tag}-Storm League-${leagueConfig.stormLeagueStartDate}`;
-    if (refreshPlayerData || !(await cacheHas(slKey))) add("hp-storm-league");
+    for (const start of [slWindows.historyStart, slWindows.recentStart]) {
+      const slKey = `hp-v1-hero-all-${tag}-Storm League-${start}`;
+      if (refreshPlayerData || !(await cacheHas(slKey))) add("hp-storm-league");
+    }
     // Current + prior season profiles (pipeline always asks for both).
     if (refreshPlayerData) {
       add("hp-ngs-player", 2);

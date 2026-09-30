@@ -10,6 +10,7 @@ import {
   type ReactNode,
 } from "react";
 import type { ReplayAction } from "@/lib/review/replayDraft";
+import { criticalTalentsFor } from "@/config/compCriticalTalents";
 import { divePlaybook, chooseDivePivot } from "@/config/divePlaybook";
 import {
   fallbackHealDenyGuide,
@@ -2633,9 +2634,19 @@ function restampSidePlayers(
   side: "our" | "their",
   roster: PlayerScout[],
   planHints: DraftCompPick[],
+  /** heroKey → player known for certain (e.g. from a replay); never re-guessed. */
+  pinned?: ReadonlyMap<string, string>,
 ): BoardAction[] {
   const sidePicks = history.filter((a) => a.side === side && a.kind === "pick");
   if (!sidePicks.length) return history;
+  if (pinned?.size) {
+    const guessed = restampSidePlayers(history, side, roster, planHints);
+    return guessed.map((a) =>
+      a.side === side && a.kind === "pick" && pinned.has(heroKey(a.hero))
+        ? { ...a, player: pinned.get(heroKey(a.hero))! }
+        : a,
+    );
+  }
 
   const assigned = assignUniqueOwners({
     locked: sidePicks.map((a) => ({ hero: a.hero })),
@@ -2741,6 +2752,13 @@ export function InteractiveDraft({
     null,
   );
   const allHeroes = useMemo(() => allDraftHeroes(), []);
+  const replaySeats = useMemo(() => {
+    const seats = new Map<string, string>();
+    for (const a of replay ?? []) {
+      if (a.kind === "pick" && a.player) seats.set(heroKey(a.hero), a.player);
+    }
+    return seats;
+  }, [replay]);
   const planned = useMemo(() => expectedPath(tree), [tree]);
   const planPicks = useMemo(() => {
     const raw = ourLikely.length
@@ -2818,10 +2836,10 @@ export function InteractiveDraft({
   // One player per hero — specialist locks can steal earlier flex seats.
   const stampedHistory = useMemo(() => {
     let h = history;
-    h = restampSidePlayers(h, "our", homeRoster, planPicks);
-    h = restampSidePlayers(h, "their", theirRoster, theirLikely);
+    h = restampSidePlayers(h, "our", homeRoster, planPicks, replaySeats);
+    h = restampSidePlayers(h, "their", theirRoster, theirLikely, replaySeats);
     return h;
-  }, [history, homeRoster, theirRoster, planPicks, theirLikely]);
+  }, [history, homeRoster, theirRoster, planPicks, theirLikely, replaySeats]);
 
   const leaveDiveLive = useMemo(() => {
     const locked = history
@@ -3780,6 +3798,21 @@ export function InteractiveDraft({
     };
   }, [done, history, history, theirLikely, banPriority]);
 
+  const compTalents = useMemo(() => {
+    if (!done) return [];
+    const ourPicks = stampedHistory.filter((a) => a.side === "our" && a.kind === "pick");
+    const ourFive = ourPicks.map((a) => a.hero);
+    const theirFive = stampedHistory
+      .filter((a) => a.side === "their" && a.kind === "pick")
+      .map((a) => a.hero);
+    return ourPicks.flatMap((a) =>
+      criticalTalentsFor(a.hero, ourFive, theirFive).map((t) => ({
+        ...t,
+        player: displayPlayer(a.player ?? null),
+      })),
+    );
+  }, [done, stampedHistory]);
+
   const remainingBans = banPriority.filter((b) => !isGone(b.hero, gone));
 
   const available = useMemo(() => {
@@ -3931,6 +3964,7 @@ export function InteractiveDraft({
             ours ? "our" : "their",
             ours ? homeRoster : theirRoster,
             ours ? planPicks : theirLikely,
+            replaySeats,
           );
         });
         setPairPick([]);
@@ -4133,6 +4167,7 @@ export function InteractiveDraft({
         ours ? "our" : "their",
         ours ? homeRoster : theirRoster,
         ours ? planPicks : theirLikely,
+        replaySeats,
       );
     });
     setFilter("");
@@ -4175,6 +4210,7 @@ export function InteractiveDraft({
         removed.side,
         removed.side === "our" ? homeRoster : theirRoster,
         removed.side === "our" ? planPicks : theirLikely,
+        replaySeats,
       );
     });
     setDeviationNote(null);
@@ -4339,6 +4375,32 @@ export function InteractiveDraft({
                 </ul>
               </div>
             )}
+            <div className="space-y-2 rounded-md border border-[#3d5163] bg-[#0f1821] px-3 py-3">
+              <p className="text-xs font-bold uppercase tracking-wide text-[#8aa0b2]">
+                Must-take talents
+              </p>
+              {compTalents.length ? (
+                <ul className="space-y-1.5">
+                  {compTalents.map((t) => (
+                    <li
+                      key={`${t.hero}-${t.talent}`}
+                      className="text-sm leading-snug text-[#c5d4e0]"
+                    >
+                      <span className="font-semibold text-[#e8eef2]">
+                        {t.player ? `${t.player} (${t.hero})` : t.hero}: {t.talent}{" "}
+                        at {t.level}
+                      </span>{" "}
+                      — {t.why}
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="text-sm text-[#c5d4e0]">
+                  No single talent makes or breaks this comp. Take your usual
+                  builds.
+                </p>
+              )}
+            </div>
             {healDenyEnd && (
               <div className="space-y-2 rounded-md border border-teal-500/40 bg-teal-950/30 px-3 py-3">
                 <p className="text-xs font-bold uppercase tracking-wide text-teal-200/90">
@@ -4349,37 +4411,6 @@ export function InteractiveDraft({
                 <p className="text-sm font-semibold text-[#e8eef2]">
                   {healDenyEnd.role}
                 </p>
-                <div className="space-y-1.5">
-                  <p className="text-[10px] font-bold uppercase tracking-wide text-[#8aa0b2]">
-                    Talent path
-                    {healDenyEnd.player
-                      ? ` — what ${healDenyEnd.player} takes`
-                      : " — what to take"}
-                  </p>
-                  <p className="text-xs leading-snug text-[#8aa0b2]">
-                    One pick per level. Alternates only when the note says so.
-                  </p>
-                  <ul className="space-y-2">
-                    {healDenyEnd.talents.map((t) => (
-                      <li
-                        key={`${t.tier}-${t.take}`}
-                        className="text-sm leading-snug text-[#c5d4e0]"
-                      >
-                        <p>
-                          <span className="font-semibold text-[#e8eef2]">
-                            Level {t.tier}: {t.take}
-                          </span>
-                          <span className="text-[#8aa0b2]"> — {t.why}</span>
-                        </p>
-                        {t.alt && t.altWhen ? (
-                          <p className="mt-0.5 text-xs text-[#9dceb0]">
-                            Or {t.alt} if {t.altWhen}.
-                          </p>
-                        ) : null}
-                      </li>
-                    ))}
-                  </ul>
-                </div>
                 <div className="space-y-1">
                   <p className="text-[10px] font-bold uppercase tracking-wide text-[#8aa0b2]">
                     Teamfight plan
@@ -4685,22 +4716,28 @@ function DraftReportCardView({ report }: { report: DraftReportCard }) {
           <p className="mt-1 text-sm font-semibold text-[#e8eef2]">
             {report.headline}
           </p>
+          <p className="mt-1 max-w-xl text-xs leading-snug text-[#8aa0b2]">
+            The letter grades score each ban and pick against the best option
+            open at that moment. Win chance only compares the two finished
+            fives. A team can draft loosely and still end up with the
+            stronger five.
+          </p>
         </div>
         <div className="flex gap-4 text-right">
           <WinChance
-            label="Win chance · draft"
+            label="Win chance · final fives"
             pct={report.draftWinPct}
             ours={report.ours.label}
             theirs={report.theirs.label}
-            title="Compares the two locked fives (comfort, synergy, matchups, map, roles). A heuristic, not a calibrated probability."
+            title="Compares the two finished fives (comfort, synergy, matchups, map, roles). Not affected by the letter grades."
           />
           {report.mmrWinPct !== null && (
             <WinChance
-              label="Win chance · draft + MMR"
+              label="Win chance · fives + MMR"
               pct={report.mmrWinPct}
               ours={report.ours.label}
               theirs={report.theirs.label}
-              title={`Draft odds shifted by the NGS team-average MMR gap (${report.mmrGap! >= 0 ? "+" : ""}${report.mmrGap}), Elo scale: 400 MMR = 10:1.`}
+              title={`Final-five odds shifted by the NGS team-average MMR gap (${report.mmrGap! >= 0 ? "+" : ""}${report.mmrGap}). MMR weight fit on 406 NGS Season 22 games: a 75 MMR edge alone wins about 73%.`}
             />
           )}
         </div>
@@ -4718,14 +4755,14 @@ function DraftReportCardView({ report }: { report: DraftReportCard }) {
               </p>
               <span
                 className={`inline-flex min-w-[2.5rem] items-center justify-center rounded border px-2 py-0.5 text-lg font-bold tabular-nums ${gradeTone(side.grade)}`}
-                title="Points taken out of the best available option at every ban and pick"
+                title="Draft decisions: points taken out of the best option open at every ban and pick (half the points ≈ C)"
               >
                 {side.grade}
               </span>
             </div>
             <p className="mt-1 text-xs tabular-nums text-[#8aa0b2]">
-              {side.points} / {side.bestPoints} points ({side.pct}%)
-              {" · "}final five {side.quality}/100
+              Decisions {side.points} / {side.bestPoints} points ({side.pct}%)
+              {" · "}final five strength {side.quality}/100
             </p>
             <ul className="mt-2 space-y-1">
               {side.notes.map((n) => (

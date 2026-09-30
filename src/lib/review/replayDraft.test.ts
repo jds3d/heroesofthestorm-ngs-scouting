@@ -67,7 +67,19 @@ describe("replay draft order", () => {
     const { weFirst, actions } = draftActionsFromReplay(game1, 1, name);
     expect(weFirst).toBe(false);
     expect(actions[0]).toEqual({ side: "their", kind: "ban", hero: "Johanna" });
-    expect(actions[5]).toEqual({ side: "our", kind: "pick", hero: "Dehaka" });
+    expect(actions[5]).toEqual({
+      side: "our",
+      kind: "pick",
+      hero: "Dehaka",
+      player: "Polarus",
+    });
+  });
+
+  it("carries who actually played each pick", () => {
+    const { actions } = draftActionsFromReplay(game1, 0, name);
+    expect(actions[4]).toMatchObject({ hero: "Qhira", player: "Beachyman" });
+    expect(actions[6]).toMatchObject({ hero: "Falstad", player: null });
+    expect(actions[0].player).toBeUndefined();
   });
 
   it("stops at a skipped ban instead of shifting later steps", () => {

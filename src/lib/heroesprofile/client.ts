@@ -1,5 +1,5 @@
 import { classifyHeroesProfile, noteApiCall } from "@/lib/apiUsage";
-import { leagueConfig } from "@/config/league";
+import { leagueConfig, stormLeagueWindows } from "@/config/league";
 import { NGS_MAP_POOL } from "@/config/ngsMaps";
 import { FOREVER, cacheHas, cachedFetch, getCached, setCached } from "@/lib/cache";
 import type { GlobalHeroStat } from "@/lib/scoring/metaPressure";
@@ -273,7 +273,7 @@ export async function getPlayerHeroAll(
   options?: { gameType?: string; startDate?: string; endDate?: string },
 ): Promise<PlayerHeroAllResponse> {
   const gameType = options?.gameType ?? "Storm League";
-  const startDate = options?.startDate ?? leagueConfig.stormLeagueStartDate;
+  const startDate = options?.startDate ?? stormLeagueWindows().recentStart;
   const key = `hp-v1-hero-all-${battletag}-${gameType}-${startDate}`;
   return cachedFetch(key, async () => {
     const rows = await hpGet<V1PlayerHeroRow[]>("players/heroes", {

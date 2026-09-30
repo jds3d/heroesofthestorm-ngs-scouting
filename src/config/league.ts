@@ -4,13 +4,19 @@ export const leagueConfig = {
   divisionConcat: "a",
   season: 22,
   priorSeason: 21,
-  /** Storm League window start (NGS S22 regular season start) */
-  stormLeagueStartDate: "2026-08-10",
+  /**
+   * Storm League comfort history. Games inside the recent window count fully;
+   * older games count at `stormLeagueOlderWeight`.
+   */
+  stormLeagueHistoryMonths: 24,
+  stormLeagueRecentMonths: 6,
+  stormLeagueOlderWeight: 0.5,
   region: 1 as const,
+  /** Storm League is the real comfort read; NGS shows what they bring to league night. */
   weights: {
-    ngsCurrent: 0.55,
-    stormLeague: 0.3,
-    ngsPrior: 0.15,
+    ngsCurrent: 0.35,
+    stormLeague: 0.55,
+    ngsPrior: 0.1,
   },
   minGames: {
     ngs: 2,
@@ -32,3 +38,19 @@ export const leagueConfig = {
 } as const;
 
 export type LeagueConfig = typeof leagueConfig;
+
+/** Month-aligned so cache keys stay stable for a whole month. */
+function monthsAgoStart(months: number, now: Date): string {
+  const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - months, 1));
+  return d.toISOString().slice(0, 10);
+}
+
+export function stormLeagueWindows(now: Date = new Date()): {
+  historyStart: string;
+  recentStart: string;
+} {
+  return {
+    historyStart: monthsAgoStart(leagueConfig.stormLeagueHistoryMonths, now),
+    recentStart: monthsAgoStart(leagueConfig.stormLeagueRecentMonths, now),
+  };
+}
