@@ -8,6 +8,13 @@ import type {
 
 export type MapTendency = DraftInsights["mapTendencies"][number];
 
+/** Ranked ban preferences — each side only bans 2, but keep backups if veto takes our targets. */
+export const MAP_BAN_LIMIT = 4;
+/** Maps we actually remove from the pool when we ban (per side). */
+export const MAP_BANS_PER_SIDE = 2;
+/** Ranked play maps — 11 pool minus our 2 bans = 9 maps we might play across a series. */
+export const MAP_PLAY_LIMIT = 9;
+
 function recordLine(m: MapTendency | undefined): string | null {
   if (!m || m.games < 1) return null;
   const wins = Math.round(m.wins);
@@ -53,27 +60,23 @@ export function buildMapPlan(
 ): MapPlan {
   const theirBy = new Map(theirMaps.map((m) => [m.map, m]));
   const ourBy = new Map((ourMaps ?? []).map((m) => [m.map, m]));
-  const names = new Set([...theirBy.keys(), ...ourBy.keys()]);
   const haveOurs = (ourMaps?.length ?? 0) > 0;
 
-  const scored: Scored[] = [];
-  for (const map of names) {
-    const their = theirBy.get(map);
-    const our = ourBy.get(map);
-    const theirGames = their?.games ?? 0;
-    const ourGames = our?.games ?? 0;
-    if (theirGames < 1 && ourGames < 1) continue;
-    scored.push({
-      map,
+  const scored: Scored[] = NGS_MAP_POOL.map(({ name }) => {
+    const their = theirBy.get(name);
+    const our = ourBy.get(name);
+    return {
+      map: name,
       edge: smoothedWr(our) - smoothedWr(their),
       their,
       our,
-      theirGames,
-      ourGames,
-    });
-  }
+      theirGames: their?.games ?? 0,
+      ourGames: our?.games ?? 0,
+    };
+  });
 
-  if (scored.length === 0) {
+  const hasSample = scored.some((s) => s.theirGames >= 1 || s.ourGames >= 1);
+  if (!hasSample) {
     return {
       ban: [],
       play: [],
@@ -121,7 +124,7 @@ export function buildMapPlan(
   const used = new Set<string>();
   const ban: MapPlanPick[] = [];
   for (const s of banPool) {
-    if (ban.length >= 2) break;
+    if (ban.length >= MAP_BAN_LIMIT) break;
     if (used.has(s.map)) continue;
     // Prefer maps where the edge is actually against us, or they are hot.
     if (haveOurs && s.edge > -3 && (s.their?.winRate ?? 0) < 55) continue;
@@ -131,27 +134,31 @@ export function buildMapPlan(
   }
   // If filters were too strict, take the worst edges anyway.
   for (const s of banPool) {
-    if (ban.length >= 2) break;
+    if (ban.length >= MAP_BAN_LIMIT) break;
     if (used.has(s.map)) continue;
     used.add(s.map);
     ban.push(toPick(s, "ban", haveOurs));
   }
 
+  const playBlocked = new Set(
+    ban.slice(0, MAP_BANS_PER_SIDE).map((pick) => pick.map),
+  );
+
   const play: MapPlanPick[] = [];
   for (const s of playPool) {
-    if (play.length >= 3) break;
-    if (used.has(s.map)) continue;
+    if (play.length >= MAP_PLAY_LIMIT) break;
+    if (playBlocked.has(s.map)) continue;
     if (haveOurs && s.edge < 3 && (s.their?.winRate ?? 100) > 45) continue;
     if (!haveOurs && (s.their?.winRate ?? 100) > 45 && s.theirGames < 3) {
       continue;
     }
-    used.add(s.map);
+    playBlocked.add(s.map);
     play.push(toPick(s, "play", haveOurs));
   }
   for (const s of playPool) {
-    if (play.length >= 3) break;
-    if (used.has(s.map)) continue;
-    used.add(s.map);
+    if (play.length >= MAP_PLAY_LIMIT) break;
+    if (playBlocked.has(s.map)) continue;
+    playBlocked.add(s.map);
     play.push(toPick(s, "play", haveOurs));
   }
 

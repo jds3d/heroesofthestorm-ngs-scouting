@@ -87,8 +87,12 @@ import {
   comfortPickPoints,
   filterBanList,
   heroMeetsSuggestBar,
+  heroUnplayedBy,
+  pairHasDistinctOwners,
   playersMeetingSuggestBar,
   anySuggestablePair,
+  suggestablePairOwners,
+  UNPLAYED_PICK_PENALTY,
 } from "@/lib/scoring/comfort";
 import { heroKey, heroRole, heroTags } from "@/lib/scoring/heroMeta";
 import { checkRequiredRoles, UNFILLABLE_ROLE_PENALTY } from "@/lib/scoring/roles";
@@ -860,6 +864,8 @@ export function buildPickScorecard(args: {
   answerPerspective?: "ours" | "theirs";
   /** Opponent roster — deny/contest only applies to heroes they actually play. */
   theirRoster?: PlayerScout[];
+  /** Nobody on the five that would play this hero has it on record. */
+  unplayed?: boolean;
 }): ScoredOption {
   const factors: ScoreFactor[] = [];
   const meta = heroDraftMeta(args.table, args.hero);
@@ -1022,6 +1028,17 @@ export function buildPickScorecard(args: {
       : "No strong comfort signal",
     `min(${COMFORT_PICK_CAP}, ${args.comfort.toFixed(2)} × ${COMFORT_PICK_MULTIPLIER}) = ${comfortPts.toFixed(2)} → rounded to ${Math.round(comfortPts)}`,
   );
+
+  if (args.kind === "pick" && args.unplayed) {
+    addFactor(
+      factors,
+      "unplayed",
+      "Unplayed",
+      UNPLAYED_PICK_PENALTY,
+      `Nobody on this five has ${args.hero} on record — the draft cannot field it.`,
+      `flat ${UNPLAYED_PICK_PENALTY} because no roster player has ever logged ${args.hero}`,
+    );
+  }
 
   const block = theyMightTake(
     args.hero,
@@ -3077,6 +3094,7 @@ export function InteractiveDraft({
             takeAndRebuild: false,
             kind,
             lastPick: isLastStep,
+            unplayed: kind === "pick" && heroUnplayedBy(theirRoster, h),
           }),
           player: kind === "ban" ? null : seatWho,
         };
@@ -3124,6 +3142,7 @@ export function InteractiveDraft({
         takeAndRebuild: shouldTakeAndRebuild(scoringMeta, h),
         kind,
         lastPick: isLastStep,
+        unplayed: kind === "pick" && heroUnplayedBy(homeRoster, h),
       });
       return {
         ...(kind === "pick" ? withRolesFactor(ourCard, ourLockedHeroes) : ourCard),
@@ -3147,21 +3166,22 @@ export function InteractiveDraft({
             ? { ...pick, note: "locked" }
             : pick,
         );
-    const scoreSolo = (hero: string): ScoredOption => {
+    const scoreSolo = (hero: string, forcedOwner?: string): ScoredOption => {
       if (ours) {
         const seat = findSeatForCandidate(beforePlan, hero);
         const preferred = displayPlayer(seat?.seat.player ?? null);
         const taken = lockedPlayerIds(locked);
         const qualified = playersMeetingSuggestBar(homeRoster, hero, taken);
-        const preferredHit = preferred
+        const wanted = forcedOwner ?? preferred;
+        const preferredHit = wanted
           ? qualified.find(
-              (o) => o.player.toLowerCase() === preferred.toLowerCase(),
+              (o) => o.player.toLowerCase() === wanted.toLowerCase(),
             )
           : undefined;
-        const owner = preferredHit ?? qualified[0] ?? null;
+        const owner = preferredHit ?? (forcedOwner ? null : qualified[0] ?? null);
         const sig = owner
           ? { comfort: owner.comfort, who: owner.player }
-          : comfortSignal(homeRoster, hero, preferred);
+          : comfortSignal(homeRoster, hero, wanted);
         return {
           ...buildPickScorecard({
             hero,
@@ -3185,6 +3205,7 @@ export function InteractiveDraft({
             takeAndRebuild: shouldTakeAndRebuild(scoringMeta, hero),
             kind: "pick",
             lastPick: false,
+            unplayed: heroUnplayedBy(homeRoster, hero),
           }),
           player: owner?.player ?? preferred,
         };
@@ -3214,24 +3235,65 @@ export function InteractiveDraft({
           takeAndRebuild: false,
           kind: "pick",
           lastPick: false,
+          unplayed: heroUnplayedBy(theirRoster, hero),
         }),
         player,
       };
     };
     const soloCache = new Map<string, ScoredOption>();
-    const solo = (hero: string) => {
-      const k = heroKey(hero);
+    const solo = (hero: string, forcedOwner?: string) => {
+      const k = forcedOwner
+        ? `${heroKey(hero)}@${forcedOwner.toLowerCase()}`
+        : heroKey(hero);
       const hit = soloCache.get(k);
       if (hit) return hit;
-      const card = scoreSolo(hero);
+      const card = scoreSolo(hero, forcedOwner);
       soloCache.set(k, card);
       return card;
     };
     const sideLocked = ours ? ourLockedHeroes : theirLockedHeroes;
-    const assemble = (a: string, b: string) =>
-      assemblePairScorecard({
-        first: solo(a),
-        second: solo(b),
+    const sideRoster = ours ? homeRoster : theirRoster;
+    const sideTaken = ours
+      ? lockedPlayerIds(locked)
+      : lockedPlayerIds(
+          history
+            .filter((a) => a.side === "their" && a.kind === "pick")
+            .map((a) => ({ hero: a.hero, player: displayPlayer(a.player) })),
+        );
+    /**
+     * Solo cards pick each hero's best owner on its own, so a duo can land on
+     * one player twice (HuckIt Tyrande + HuckIt Tyrael). Seat the pair on two
+     * different players and rescore comfort for whoever really plays it.
+     */
+    const seatPair = (a: string, b: string): [ScoredOption, ScoredOption] => {
+      const first = solo(a);
+      const second = solo(b);
+      const same =
+        first.player &&
+        second.player &&
+        first.player.toLowerCase() === second.player.toLowerCase();
+      if (!same || !sideRoster.length) return [first, second];
+      const owners = suggestablePairOwners(
+        sideRoster,
+        a,
+        b,
+        first.player,
+        second.player,
+        sideTaken,
+      );
+      if (!owners) return [first, second];
+      return [
+        ours ? solo(a, owners.first.player) : { ...first, player: owners.first.player },
+        ours
+          ? solo(b, owners.second.player)
+          : { ...second, player: owners.second.player },
+      ];
+    };
+    const assemble = (a: string, b: string) => {
+      const [first, second] = seatPair(a, b);
+      return assemblePairScorecard({
+        first,
+        second,
         table: scoringMeta,
         projectBoth: (x, y) =>
           pairStructureProjection(lockedHeroPicks(sideLocked), [], x, y),
@@ -3241,18 +3303,37 @@ export function InteractiveDraft({
             theyMightTake(hero, theirLikely, playableBanPriority, theirRoster),
           ),
       });
+    };
     return { solo, assemble, sideLocked };
   }
 
-  /** Heroes our side may be suggested. Under the comfort bar is dropped when any legal option remains. */
+  /** Roster and already-seated players for the side picking this step. */
+  function pickingSide(): { roster: PlayerScout[]; taken: Set<string> } {
+    if (ours) {
+      return {
+        roster: homeRoster,
+        taken: lockedPlayerIds(ourLockedPicks(history, planPicks, homeRoster)),
+      };
+    }
+    const theirLocked: LockedPick[] = history
+      .filter((a) => a.side === "their" && a.kind === "pick")
+      .map((a) => ({ hero: a.hero, player: displayPlayer(a.player) ?? null }));
+    return { roster: theirRoster, taken: lockedPlayerIds(theirLocked) };
+  }
+
+  /**
+   * Heroes this side may be suggested: someone still unseated must clear the
+   * comfort bar. Falls back to the open field only when nothing is legal.
+   */
   function comfortGatedField(heroes: string[], pair: boolean): string[] {
-    if (!ours || step?.kind !== "pick" || !homeRoster.length) return heroes;
-    const taken = lockedPlayerIds(ourLockedPicks(history, planPicks, homeRoster));
+    if (step?.kind !== "pick") return heroes;
+    const { roster, taken } = pickingSide();
+    if (!roster.length) return heroes;
     const legal = heroes.filter(
-      (h) => playersMeetingSuggestBar(homeRoster, h, taken).length > 0,
+      (h) => playersMeetingSuggestBar(roster, h, taken).length > 0,
     );
     if (!legal.length) return heroes;
-    if (pair && !anySuggestablePair(homeRoster, legal, taken)) return heroes;
+    if (pair && !anySuggestablePair(roster, legal, taken)) return heroes;
     return legal;
   }
 
@@ -3266,15 +3347,21 @@ export function InteractiveDraft({
 
     if (top.pairWith) {
       const scoring = pairScoring();
+      const { roster, taken } = pickingSide();
       const inField = (hero: string) =>
         field.some((h) => heroKey(h) === heroKey(hero));
+      // One player cannot lock both halves of a double pick.
+      const seatable = (a: string, b: string) =>
+        relaxed || !roster.length || pairHasDistinctOwners(roster, a, b, taken);
       let best: ScoredOption | null =
-        relaxed || (inField(top.hero) && inField(top.pairWith))
+        (relaxed || (inField(top.hero) && inField(top.pairWith))) &&
+        seatable(top.hero, top.pairWith)
           ? scoring.assemble(top.hero, top.pairWith)
           : null;
       const consider = (a: string, b: string) => {
         if (heroKey(a) === heroKey(b)) return;
         if (!inField(a) || !inField(b)) return;
+        if (!seatable(a, b)) return;
         for (const card of [scoring.assemble(a, b), scoring.assemble(b, a)]) {
           if (!best || card.total > best.total) best = card;
         }
@@ -3300,7 +3387,10 @@ export function InteractiveDraft({
       const seed = pairPick[0];
       if (seed) {
         const completions = field
-          .filter((h) => heroKey(h) !== heroKey(seed) && inField(h))
+          .filter(
+            (h) =>
+              heroKey(h) !== heroKey(seed) && inField(h) && seatable(seed, h),
+          )
           .map((h) => scoring.assemble(seed, h))
           .sort((a, b) => b.total - a.total);
         if (!completions.length) return { ...base, originalPair: chosen };
@@ -3320,6 +3410,7 @@ export function InteractiveDraft({
             o.pairWith &&
             inField(o.hero) &&
             inField(o.pairWith) &&
+            seatable(o.hero, o.pairWith) &&
             !(
               heroKey(o.hero) === heroKey(chosen.hero) &&
               heroKey(o.pairWith) === heroKey(chosen.pairWith ?? "")
@@ -3339,15 +3430,28 @@ export function InteractiveDraft({
     }
 
     const score = singleScorer(base);
-    const topLegal = field.some((h) => heroKey(h) === heroKey(top.hero));
+    // Pair window fell back to single cards: the held hero cannot be its own
+    // partner, and one player cannot own both halves.
+    const seed = pairWindow ? pairPick[0] : undefined;
+    const partnerOk = (h: string) => {
+      if (!seed) return true;
+      if (heroKey(h) === heroKey(seed)) return false;
+      const { roster, taken } = pickingSide();
+      return (
+        relaxed || !roster.length || pairHasDistinctOwners(roster, seed, h, taken)
+      );
+    };
+    const singleField = field.filter(partnerOk);
+    const topLegal = singleField.some((h) => heroKey(h) === heroKey(top.hero));
     let best = topLegal ? score(top.hero) : null;
-    for (const h of field) {
+    for (const h of singleField) {
       const card = score(h);
       if (!best || card.total > best.total) best = card;
     }
     if (!best) return base;
     const chosen = best;
     if (heroKey(chosen.hero) === heroKey(top.hero)) return base;
+    const seedHeld = seed && heroKey(top.hero) === heroKey(seed);
     return {
       ...base,
       hero: chosen.hero,
@@ -3356,10 +3460,12 @@ export function InteractiveDraft({
         ...base.options.filter(
           (o) =>
             heroKey(o.hero) !== heroKey(chosen.hero) &&
-            field.some((h) => heroKey(h) === heroKey(o.hero)),
+            singleField.some((h) => heroKey(h) === heroKey(o.hero)),
         ),
       ].slice(0, 3),
-      reason: `${chosen.hero} scores ${signedPoints(chosen.total)} on this board — more than the plan's ${top.hero} (${signedPoints(score(top.hero).total)}).`,
+      reason: seedHeld
+        ? `${seed} is held — ${chosen.hero} scores ${signedPoints(chosen.total)} as the second half of the pair.`
+        : `${chosen.hero} scores ${signedPoints(chosen.total)} on this board — more than the plan's ${top.hero} (${signedPoints(score(top.hero).total)}).`,
     };
   }
 
@@ -3700,6 +3806,7 @@ export function InteractiveDraft({
                 takeAndRebuild: false,
                 kind: "pick",
                 lastPick: false,
+                unplayed: heroUnplayedBy(theirRoster, hero),
               });
               soloCache.set(k, card);
               return card;
@@ -3837,6 +3944,7 @@ export function InteractiveDraft({
               takeAndRebuild: false,
               kind: step.kind,
               lastPick,
+              unplayed: step.kind === "pick" && heroUnplayedBy(theirRoster, h),
             }),
             player: seatWho,
           };
@@ -3940,6 +4048,7 @@ export function InteractiveDraft({
             takeAndRebuild: shouldTakeAndRebuild(scoringMeta, hero),
             kind: "pick",
             lastPick: false,
+            unplayed: heroUnplayedBy(homeRoster, hero),
           });
           soloCache.set(k, card);
           return card;
@@ -4096,6 +4205,7 @@ export function InteractiveDraft({
         takeAndRebuild: false,
         kind: "pick",
         lastPick,
+        unplayed: heroUnplayedBy(homeRoster, fallback),
       });
       return {
         hero: fallback,
@@ -4163,6 +4273,7 @@ export function InteractiveDraft({
           takeAndRebuild: shouldTakeAndRebuild(scoringMeta, hero),
           kind: "pick",
           lastPick,
+          unplayed: heroUnplayedBy(homeRoster, hero),
         }),
         ourLockedHeroes,
       );
@@ -4499,8 +4610,32 @@ export function InteractiveDraft({
       if (selected.action === "lock-pair") {
         const [firstHero, secondHero] = selected.pair ?? selected.picked;
         const pairOptions = suggestion?.options.filter((option) => option.pairWith) ?? [];
-        const bestPair = suggestion?.originalPair ?? pairOptions[0];
         const scoring = pairScoring();
+        let bestPair: ScoredOption | undefined =
+          suggestion?.originalPair ?? pairOptions[0];
+        if (!bestPair && suggestion) {
+          // The plan had no seat pairs left (e.g. its last seat was banned) so
+          // the cards fell back to singles — still grade the lock as a pair.
+          const { roster, taken } = pickingSide();
+          const ranked = comfortGatedField(gradeField(suggestion), true)
+            .map((h) => scoring.solo(h))
+            .sort((a, b) => b.total - a.total)
+            .slice(0, 12);
+          let top: ScoredOption | null = null;
+          for (let i = 0; i < ranked.length; i++) {
+            for (let j = i + 1; j < ranked.length; j++) {
+              const a = ranked[i].hero;
+              const b = ranked[j].hero;
+              if (roster.length && !pairHasDistinctOwners(roster, a, b, taken)) {
+                continue;
+              }
+              for (const card of [scoring.assemble(a, b), scoring.assemble(b, a)]) {
+                if (!top || card.total > top.total) top = card;
+              }
+            }
+          }
+          bestPair = top ?? undefined;
+        }
         const assembled = scoring.assemble(firstHero, secondHero);
         const firstBreakdown = pairSideBreakdown(
           assembled.firstSoloFactors ?? scoring.solo(firstHero).factors,
@@ -5345,7 +5480,11 @@ function DraftReportCardView({ report }: { report: DraftReportCard }) {
               {side.notes.map((n) => (
                 <li
                   key={n}
-                  className="text-sm leading-snug text-[#c5d4e0]"
+                  className={
+                    n.startsWith("Unplayed:")
+                      ? "rounded border-2 border-red-500 bg-red-950 px-2 py-1.5 text-sm font-bold leading-snug text-red-50"
+                      : "text-sm leading-snug text-[#c5d4e0]"
+                  }
                 >
                   {n}
                 </li>
@@ -6403,6 +6542,7 @@ function EmptyOrFace({
         </span>
       ) : (
         !banned &&
+        !held &&
         action.kind === "pick" && (
           <span
             className="mt-0.5 max-w-[3.75rem] truncate text-center text-[10px] font-semibold leading-tight text-[#8aa0b2]"

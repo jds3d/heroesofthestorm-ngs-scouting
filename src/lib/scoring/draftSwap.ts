@@ -292,17 +292,48 @@ export function assignUniqueOwners(args: {
 
   claims.sort((a, b) => b.score - a.score || a.heroIdx - b.heroIdx);
 
-  const ownerByIdx: (string | null)[] = locked.map(() => null);
-  const usedPlayers = new Set<string>();
-  for (const c of claims) {
-    if (ownerByIdx[c.heroIdx]) continue;
-    const id = playerId(c.player);
-    if (usedPlayers.has(id)) continue;
-    ownerByIdx[c.heroIdx] = c.player;
-    usedPlayers.add(id);
-  }
+  // Greedy by strongest claim leaves seats empty when the top owner of one
+  // hero is the only owner of another (HuckIt: Tyrande .34 / Tyrael .15, with
+  // Tyrande also playable by MrHustler). Five seats and a handful of players
+  // is small enough to search every assignment: most seats filled, then the
+  // highest comfort total.
+  const claimsByIdx: Claim[][] = locked.map(() => []);
+  for (const c of claims) claimsByIdx[c.heroIdx].push(c);
 
-  return locked.map((L, i) => ({ hero: L.hero, player: ownerByIdx[i] }));
+  let bestOwners: (string | null)[] = locked.map(() => null);
+  let bestFilled = -1;
+  let bestScore = -Infinity;
+  const current: (string | null)[] = locked.map(() => null);
+  const used = new Set<string>();
+
+  const search = (idx: number, filled: number, score: number) => {
+    if (idx === locked.length) {
+      if (
+        filled > bestFilled ||
+        (filled === bestFilled && score > bestScore)
+      ) {
+        bestFilled = filled;
+        bestScore = score;
+        bestOwners = [...current];
+      }
+      return;
+    }
+    // Every remaining seat filled could not beat the best found already.
+    if (filled + (locked.length - idx) < bestFilled) return;
+    for (const c of claimsByIdx[idx]) {
+      const id = playerId(c.player);
+      if (used.has(id)) continue;
+      used.add(id);
+      current[idx] = c.player;
+      search(idx + 1, filled + 1, score + c.score);
+      used.delete(id);
+      current[idx] = null;
+    }
+    search(idx + 1, filled, score);
+  };
+  search(0, 0, 0);
+
+  return locked.map((L, i) => ({ hero: L.hero, player: bestOwners[i] }));
 }
 
 export function lockedPlayerIds(locked: LockedPick[]): Set<string> {

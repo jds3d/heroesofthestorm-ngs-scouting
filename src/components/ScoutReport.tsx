@@ -689,6 +689,10 @@ function MapPlanBlock({ plan, season }: { plan: MapPlan; season: number }) {
       {plan.note && (
         <p className="text-sm text-amber-900">{plan.note}</p>
       )}
+      <p className="text-sm text-[var(--muted)]">
+        Ban #1–2 are your vetoes; #3–4 are backups if they ban those first. Play
+        #1–9 are leave-up order across a five-game series (after our 2 bans).
+      </p>
       <div className="overflow-x-auto">
         <table className="w-full min-w-[36rem] border-collapse text-sm">
           <thead>
@@ -768,10 +772,10 @@ function MapPlanBlock({ plan, season }: { plan: MapPlan; season: number }) {
           <div className="mt-2 grid gap-4 sm:grid-cols-2">
             {plan.ban.length > 0 && (
               <ul className="space-y-1">
-                {plan.ban.map((m) => (
+                {plan.ban.map((m, i) => (
                   <li key={m.map}>
                     <span className="font-semibold text-red-800/80">
-                      Ban {m.map}:
+                      Ban #{i + 1} · {m.map}:
                     </span>{" "}
                     {m.reason}
                   </li>
@@ -780,10 +784,10 @@ function MapPlanBlock({ plan, season }: { plan: MapPlan; season: number }) {
             )}
             {plan.play.length > 0 && (
               <ul className="space-y-1">
-                {plan.play.map((m) => (
+                {plan.play.map((m, i) => (
                   <li key={m.map}>
                     <span className="font-semibold text-[var(--accent)]">
-                      Play {m.map}:
+                      Play #{i + 1} · {m.map}:
                     </span>{" "}
                     {m.reason}
                   </li>

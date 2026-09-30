@@ -186,6 +186,31 @@ export function anySuggestablePair(
   return false;
 }
 
+/** Two specific heroes can go to two different free players who clear the bar. */
+export function pairHasDistinctOwners(
+  roster: PlayerScout[],
+  first: string,
+  second: string,
+  taken?: ReadonlySet<string>,
+): boolean {
+  return anySuggestablePair(roster, [first, second], taken);
+}
+
+/**
+ * Nobody on this roster has the hero on record at all. Different from being
+ * under the suggest bar — this five cannot play it.
+ */
+export function heroUnplayedBy(roster: PlayerScout[], hero: string): boolean {
+  if (!roster.length) return false;
+  const key = heroKey(hero);
+  return !roster.some((p) =>
+    p.topHeroes.some((h) => heroKey(h.hero) === key && h.comfort > 0),
+  );
+}
+
+/** Scorecard penalty for a pick nobody on the five plays. */
+export const UNPLAYED_PICK_PENALTY = -30;
+
 export function filterBanList(
   roster: PlayerScout[],
   bans: { hero: string; reason: string }[],

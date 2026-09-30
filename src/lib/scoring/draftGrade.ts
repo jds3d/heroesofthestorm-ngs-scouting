@@ -85,6 +85,13 @@ type LockedSeat = {
 
 /** Quality points lost per required role the locked five can't cover. */
 const MISSING_ROLE_QUALITY = 12;
+/** Quality points lost per locked hero nobody on the five has on record. */
+export const UNPLAYED_SEAT_QUALITY = 18;
+const SYNERGY_MAX = 20;
+const MATCHUP_MAX = 25;
+const MAP_MAX = 5;
+/** Every component at its cap. */
+const QUALITY_RAW_MAX = COMFORT_GRADE_CAP + SYNERGY_MAX + MATCHUP_MAX + MAP_MAX;
 
 function clamp(n: number, lo: number, hi: number): number {
   return Math.max(lo, Math.min(hi, n));
@@ -148,7 +155,7 @@ function synergyScore(
     }
   }
   return {
-    points: clamp(10 + total * 0.4, 0, 20),
+    points: clamp(10 + total * 0.4, 0, SYNERGY_MAX),
     best: best && best.edge > 0 ? best.label : null,
   };
 }
@@ -176,13 +183,27 @@ function matchupScore(
     }
   }
   return {
-    points: clamp(12.5 + edge * 0.3, 0, 25),
+    points: clamp(12.5 + edge * 0.3, 0, MATCHUP_MAX),
     edgePp: Math.round(edge * 10) / 10,
     detail: best,
   };
 }
 
-/** Strength of a locked five: comfort + synergy + matchup + map, minus missing roles. */
+/** Locked heroes nobody on the roster has on record. */
+export function unplayedSeats(
+  seats: LockedSeat[],
+  roster: PlayerScout[],
+): string[] {
+  if (!roster.length) return [];
+  return seats
+    .filter((s) => comfortOf(roster, null, s.hero) <= 0)
+    .map((s) => s.hero);
+}
+
+/**
+ * Strength of a locked five: comfort + synergy + matchup + map, minus missing
+ * roles and heroes the five cannot field.
+ */
 export function scoreFive(args: {
   seats: LockedSeat[];
   enemyHeroes: string[];
@@ -195,6 +216,7 @@ export function scoreFive(args: {
   const comfort = comfortScore(args.seats, args.roster);
   const synergy = synergyScore(heroes, args.table);
   const matchup = matchupScore(heroes, args.enemyHeroes, args.table);
+  const unplayed = unplayedSeats(args.seats, args.roster);
 
   let mapPts = 0;
   if (args.map && args.table) {
@@ -205,16 +227,25 @@ export function scoreFive(args: {
       if (hit && hit.deltaPp > 0) mapPts += Math.min(2, hit.deltaPp / 3);
     }
   }
-  mapPts = clamp(mapPts, 0, 5);
+  mapPts = clamp(mapPts, 0, MAP_MAX);
 
-  // comfort 25 + synergy 20 + matchup 25 + map 5 = 75.
   const raw = comfort.points + synergy.points + matchup.points + mapPts;
   const quality = clamp(
-    Math.round((raw / 75) * 100) - MISSING_ROLE_QUALITY * roles.missing.length,
+    Math.round((raw / QUALITY_RAW_MAX) * 100) -
+      MISSING_ROLE_QUALITY * roles.missing.length -
+      UNPLAYED_SEAT_QUALITY * unplayed.length,
     0,
     100,
   );
-  return { quality, missingRoles: roles.missing, comfort, synergy, matchup, mapPts };
+  return {
+    quality,
+    missingRoles: roles.missing,
+    unplayed,
+    comfort,
+    synergy,
+    matchup,
+    mapPts,
+  };
 }
 
 /**
@@ -304,6 +335,13 @@ function gradeSide(args: {
   } else if (args.steps.length) {
     notes.push("Every step ranked C or better against the options open.");
   }
+  if (args.scored.unplayed.length) {
+    notes.unshift(
+      `Unplayed: ${args.scored.unplayed.join(", ")} — nobody on this five has ${
+        args.scored.unplayed.length === 1 ? "it" : "them"
+      } on record. This draft cannot be fielded as locked.`,
+    );
+  }
   if (args.scored.missingRoles.length) {
     notes.push(`Missing: ${args.scored.missingRoles.join(", ")}.`);
   }
@@ -325,7 +363,7 @@ function gradeSide(args: {
     pct,
     percentile,
     quality: args.scored.quality,
-    notes: notes.slice(0, 3),
+    notes: notes.slice(0, 4),
     steps,
   };
 }
@@ -424,8 +462,20 @@ export function gradeFinishedDraft(args: {
     : null;
 
   const reasons: string[] = [
-    `Final fives: ${ourLabel} ${ourFive.quality} vs ${theirLabel} ${theirFive.quality} (comfort, synergy, matchups, map, roles).`,
+    `Final fives: ${ourLabel} ${ourFive.quality} vs ${theirLabel} ${theirFive.quality} (comfort, synergy, matchups, map, roles, unplayed heroes).`,
   ];
+  for (const [label, five] of [
+    [ourLabel, ourFive],
+    [theirLabel, theirFive],
+  ] as const) {
+    if (five.unplayed.length) {
+      reasons.push(
+        `${label} locked ${five.unplayed.join(", ")} with nobody on the five who has played ${
+          five.unplayed.length === 1 ? "it" : "them"
+        } — ${UNPLAYED_SEAT_QUALITY * five.unplayed.length} strength lost.`,
+      );
+    }
+  }
   const matchup = ourFive.matchup;
   if (matchup.detail) {
     reasons.push(

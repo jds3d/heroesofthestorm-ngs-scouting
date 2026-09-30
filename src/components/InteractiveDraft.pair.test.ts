@@ -7,7 +7,12 @@ import {
   scoreOrderedPair,
 } from "@/lib/scoring/pickPairs";
 import { buildDraftMetaTable } from "@/lib/scoring/draftMeta";
-import { buildPlayerComfort } from "@/lib/scoring/comfort";
+import {
+  buildPlayerComfort,
+  heroUnplayedBy,
+  pairHasDistinctOwners,
+  UNPLAYED_PICK_PENALTY,
+} from "@/lib/scoring/comfort";
 import {
   buildPickScorecard,
   formatScoreGapSentence,
@@ -383,6 +388,69 @@ describe("ban deviation grading", () => {
 
     expect(result?.structuralReasons).toEqual([]);
     expect(result?.summary).toContain("Azmodan was not worth the ban slot");
+  });
+});
+
+describe("unplayed picks", () => {
+  const args = {
+    table: null,
+    gone: new Set<string>(),
+    map: null,
+    ourPickCount: 0,
+    inPlan: false,
+    fromAlt: false,
+    planRole: null,
+    lockedAllies: [],
+    theirLocked: [],
+    theirLikely: [],
+    banPriority: [],
+    comfort: 0,
+    swapDelta: 0,
+    takeAndRebuild: false,
+  };
+
+  it("slams a pick nobody on the five plays, but not a ban", () => {
+    const pick = buildPickScorecard({
+      ...args,
+      hero: "Azmodan",
+      kind: "pick",
+      unplayed: true,
+    });
+    const played = buildPickScorecard({ ...args, hero: "Azmodan", kind: "pick" });
+    const ban = buildPickScorecard({
+      ...args,
+      hero: "Azmodan",
+      kind: "ban",
+      unplayed: true,
+    });
+    const factor = pick.factors.find((f) => f.id === "unplayed");
+    expect(factor?.points).toBe(UNPLAYED_PICK_PENALTY);
+    expect(factor?.detail).toContain("Nobody on this five has Azmodan");
+    expect(pick.total).toBe(played.total + UNPLAYED_PICK_PENALTY);
+    expect(ban.factors.some((f) => f.id === "unplayed")).toBe(false);
+  });
+
+  it("knows when a roster has never logged a hero", () => {
+    const roster = [
+      {
+        battletag: "Topgun#1",
+        preferredRole: null,
+        topHeroes: [
+          { hero: "Arthas", comfort: 0.24, playPct: 0, winRate: 0, games: 0, sources: {} },
+        ],
+        ngsWins: 0,
+        ngsLosses: 0,
+        confidence: "high" as const,
+        heroesProfileUrl: "",
+        ngsProfileUrl: "",
+        returningFromPrior: false,
+      },
+    ];
+    expect(heroUnplayedBy(roster, "Azmodan")).toBe(true);
+    expect(heroUnplayedBy(roster, "Arthas")).toBe(false);
+    expect(heroUnplayedBy([], "Azmodan")).toBe(false);
+    // Same player owns both — that is not a legal double pick.
+    expect(pairHasDistinctOwners(roster, "Arthas", "Arthas")).toBe(false);
   });
 });
 

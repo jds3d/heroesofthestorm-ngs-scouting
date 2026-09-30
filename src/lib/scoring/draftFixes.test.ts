@@ -27,6 +27,7 @@ import {
 } from "@/lib/scoring/draftGrade";
 import { heroKey } from "@/lib/scoring/heroMeta";
 import { solveSeatAssignments } from "@/lib/scoring/draftPlan";
+import { assignUniqueOwners } from "@/lib/scoring/draftSwap";
 import { pairDuoSynergy, pairRoleCheck } from "@/lib/scoring/pickPairs";
 import {
   HeroesProfileError,
@@ -207,6 +208,44 @@ describe("draftGrade", () => {
       steps: [step("our", 60, 20, 65), step("our", 40, 30, 40)],
     });
     expect(card.ours.notes[0]).toContain("(+30) over Y (+40)");
+  });
+
+  it("flags locked heroes nobody on the five has played and drops five strength", () => {
+    const player = (battletag: string, heroes: [string, number][]) => ({
+      battletag,
+      preferredRole: null,
+      topHeroes: heroes.map(([hero, comfort]) => ({
+        hero,
+        comfort,
+        playPct: 0,
+        winRate: 0,
+        games: 0,
+        sources: {},
+      })),
+      ngsWins: 0,
+      ngsLosses: 0,
+      confidence: "high" as const,
+      heroesProfileUrl: "",
+      ngsProfileUrl: "",
+      returningFromPrior: false,
+    });
+    const homeRoster = [
+      player("A#1", [["Anub'arak", 0.3], ["Qhira", 0.2]]),
+      player("B#1", [["Genji", 0.3], ["Malthael", 0.2]]),
+      player("C#1", [["Greymane", 0.25]]),
+    ];
+    const full = gradeFinishedDraft({ ...base, homeRoster, steps: [] });
+    expect(full.ours.notes.join(" ")).not.toContain("Unplayed");
+
+    const withAzmodan = gradeFinishedDraft({
+      ...base,
+      homeRoster,
+      ourLocked: [...ourLocked.slice(0, 4), { hero: "Azmodan", player: null }],
+      steps: [],
+    });
+    expect(withAzmodan.ours.notes[0]).toContain("Unplayed: Azmodan");
+    expect(withAzmodan.ours.quality).toBeLessThan(full.ours.quality - 15);
+    expect(withAzmodan.reasons.join(" ")).toContain("locked Azmodan");
   });
 
   it("never lets a lock beat its step's best, and counts Varian as the tank", () => {
@@ -754,6 +793,55 @@ describe("seat suggestion text stays aligned with the live plan", () => {
     const updated = showSuggestionOnPlan(picks, "Whitemane", "Beachman");
     expect(updated.filter((p) => p.hero === "Whitemane")).toHaveLength(1);
     expect(updated.find((p) => p.role === "Tank")?.hero).toBe("Stitches");
+  });
+});
+
+describe("assignUniqueOwners", () => {
+  const player = (battletag: string, heroes: [string, number][]) => ({
+    battletag,
+    preferredRole: null,
+    topHeroes: heroes.map(([hero, comfort]) => ({
+      hero,
+      comfort,
+      playPct: 0,
+      winRate: 0,
+      games: 0,
+      sources: {},
+    })),
+    ngsWins: 0,
+    ngsLosses: 0,
+    confidence: "high" as const,
+    heroesProfileUrl: "",
+    ngsProfileUrl: "",
+    returningFromPrior: false,
+  });
+
+  it("fills every seat instead of letting the strongest claim strand a hero", () => {
+    // Greedy: HuckIt takes Tyrande (.34), MoJoE takes Samuro, and Tyrael's only
+    // remaining owner (HuckIt .15) is gone — a playable board reads "unplayed".
+    const roster = [
+      player("MoJoE#1", [["Samuro", 0.28], ["Tyrael", 0.19]]),
+      player("MrHustler#1", [["Tyrande", 0.22]]),
+      player("HuckIt#1", [["Tyrande", 0.34], ["Tyrael", 0.15]]),
+    ];
+    const assigned = assignUniqueOwners({
+      locked: [{ hero: "Samuro" }, { hero: "Tyrande" }, { hero: "Tyrael" }],
+      roster,
+    });
+    expect(assigned.map((a) => a.player)).toEqual([
+      "MoJoE",
+      "MrHustler",
+      "HuckIt",
+    ]);
+  });
+
+  it("leaves a seat empty only when nobody can take it", () => {
+    const roster = [player("A#1", [["Genji", 0.4]])];
+    const assigned = assignUniqueOwners({
+      locked: [{ hero: "Genji" }, { hero: "Azmodan" }],
+      roster,
+    });
+    expect(assigned.map((a) => a.player)).toEqual(["A", null]);
   });
 });
 

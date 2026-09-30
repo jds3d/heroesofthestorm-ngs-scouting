@@ -187,10 +187,16 @@ export function buildAdaptPlan(
   // Map plan — what we ban / what we want to play
   if (mapPlan.ban.length || mapPlan.play.length) {
     const banBit = mapPlan.ban.length
-      ? `Ban ${mapPlan.ban.map((m) => m.map).join(" and ")}`
+      ? `Ban ${mapPlan.ban
+          .slice(0, 2)
+          .map((m) => m.map)
+          .join(" and ")}${mapPlan.ban.length > 2 ? " (+ ranked backups in map plan)" : ""}`
       : null;
     const playBit = mapPlan.play.length
-      ? `leave up ${mapPlan.play.map((m) => m.map).join(", ")}`
+      ? `leave up ${mapPlan.play
+          .slice(0, 3)
+          .map((m) => m.map)
+          .join(", ")}${mapPlan.play.length > 3 ? " (+ ranked backups in map plan)" : ""}`
       : null;
     recommendations.push({
       priority: 2,

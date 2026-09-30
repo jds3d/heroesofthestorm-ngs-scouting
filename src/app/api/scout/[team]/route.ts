@@ -109,10 +109,16 @@ export async function GET(request: Request, context: RouteContext) {
                   title: "Map plan",
                   detail: [
                     report.adapt.mapPlan.ban.length
-                      ? `Ban ${report.adapt.mapPlan.ban.map((m) => m.map).join(" and ")}`
+                      ? `Ban ${report.adapt.mapPlan.ban
+                          .slice(0, 2)
+                          .map((m) => m.map)
+                          .join(" and ")}${report.adapt.mapPlan.ban.length > 2 ? " (+ ranked backups in map plan)" : ""}`
                       : null,
                     report.adapt.mapPlan.play.length
-                      ? `leave up ${report.adapt.mapPlan.play.map((m) => m.map).join(", ")}`
+                      ? `leave up ${report.adapt.mapPlan.play
+                          .slice(0, 3)
+                          .map((m) => m.map)
+                          .join(", ")}${report.adapt.mapPlan.play.length > 3 ? " (+ ranked backups in map plan)" : ""}`
                       : null,
                   ]
                     .filter(Boolean)
