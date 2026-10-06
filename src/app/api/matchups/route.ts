@@ -3,7 +3,7 @@ import {
   getGlobalHeroStats,
   getHeroMatchupsMany,
 } from "@/lib/heroesprofile/client";
-import { buildDraftMetaTable } from "@/lib/scoring/draftMeta";
+import { buildDraftMetaTable, MATCHUP_FETCH_BATCH } from "@/lib/scoring/draftMeta";
 import { heroKey, heroRole } from "@/lib/scoring/heroMeta";
 
 export const dynamic = "force-dynamic";
@@ -21,7 +21,7 @@ export async function GET(request: Request) {
         .map((s) => s.trim())
         .filter((name) => name && heroRole(name) !== "Unknown"),
     ),
-  ].slice(0, 4);
+  ].slice(0, MATCHUP_FETCH_BATCH);
 
   if (!heroes.length) {
     return NextResponse.json({ patch: "", byHero: {} });

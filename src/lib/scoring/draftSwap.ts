@@ -1,8 +1,4 @@
 import { heroKey } from "@/lib/scoring/heroMeta";
-import {
-  COMFORT_SUGGEST_MIN,
-  comfortMeetsSuggestBar,
-} from "@/lib/scoring/comfort";
 import type { PlayerScout } from "@/lib/scoring/types";
 
 export type LockedPick = {
@@ -214,15 +210,13 @@ export function bestFreeOwner(
   hero: string,
   lockedPlayers: Set<string>,
 ): string | null {
-  const gated = home.some((p) =>
-    comfortMeetsSuggestBar(comfortOf(home, displayName(p.battletag), hero)),
-  );
+  // Everyone owns every hero — a free player always takes the seat, the
+  // highest comfort (even zero) first.
   let best: { name: string; comfort: number } | null = null;
   for (const p of home) {
     const name = displayName(p.battletag);
     if (lockedPlayers.has(playerId(name))) continue;
     const c = comfortOf(home, name, hero);
-    if (gated ? c < COMFORT_SUGGEST_MIN : c <= 0) continue;
     if (!best || c > best.comfort) best = { name, comfort: c };
   }
   return best?.name ?? null;
@@ -255,7 +249,7 @@ export function assignUniqueOwners(args: {
     if (who) prevByHero.set(heroKey(p.hero), who);
   }
 
-  type Claim = { heroIdx: number; player: string; score: number };
+  type Claim = { heroIdx: number; player: string; comfort: number; keep: number };
   const claims: Claim[] = [];
 
   for (let i = 0; i < locked.length; i++) {
@@ -266,54 +260,49 @@ export function assignUniqueOwners(args: {
     const seenPlayers = new Set<string>();
 
     if (roster.length) {
+      // Everyone owns every hero: a locked pick with no comfort on record
+      // still gets a seat. Comfort only decides who takes it.
       for (const p of roster) {
         const name = displayName(p.battletag);
         const id = playerId(name);
         seenPlayers.add(id);
-        const raw = comfortOf(roster, name, hero);
-        const gated = roster.some((row) =>
-          comfortMeetsSuggestBar(
-            comfortOf(roster, displayName(row.battletag), hero),
-          ),
-        );
-        if (gated ? raw < COMFORT_SUGGEST_MIN : raw <= 0) continue;
-        let score = raw;
-        if (hint && playerId(hint) === id) score += 0.05;
-        if (prev && playerId(prev) === id) score += 0.005;
-        if (score > 0) claims.push({ heroIdx: i, player: name, score });
+        const comfort = comfortOf(roster, name, hero);
+        // Kept seats and plan hints break ties. They never outweigh comfort.
+        const keep =
+          (prev && playerId(prev) === id ? 2 : 0) +
+          (hint && playerId(hint) === id ? 1 : 0);
+        claims.push({ heroIdx: i, player: name, comfort, keep });
       }
     }
 
     // Plan-only fallback when roster is empty or the hinted player has no pool row.
     if (hint && !seenPlayers.has(playerId(hint))) {
-      claims.push({ heroIdx: i, player: hint, score: 0.01 });
+      claims.push({ heroIdx: i, player: hint, comfort: 0, keep: 1 });
     }
   }
 
-  claims.sort((a, b) => b.score - a.score || a.heroIdx - b.heroIdx);
-
-  // Greedy by strongest claim leaves seats empty when the top owner of one
-  // hero is the only owner of another (HuckIt: Tyrande .34 / Tyrael .15, with
-  // Tyrande also playable by MrHustler). Five seats and a handful of players
-  // is small enough to search every assignment: most seats filled, then the
-  // highest comfort total.
+  // Five seats and a handful of players is small enough to search every
+  // assignment: most seats filled, then the highest comfort total.
   const claimsByIdx: Claim[][] = locked.map(() => []);
   for (const c of claims) claimsByIdx[c.heroIdx].push(c);
 
   let bestOwners: (string | null)[] = locked.map(() => null);
   let bestFilled = -1;
-  let bestScore = -Infinity;
+  let bestComfort = -Infinity;
+  let bestKeep = -1;
   const current: (string | null)[] = locked.map(() => null);
   const used = new Set<string>();
 
-  const search = (idx: number, filled: number, score: number) => {
+  const search = (idx: number, filled: number, comfort: number, keep: number) => {
     if (idx === locked.length) {
       if (
         filled > bestFilled ||
-        (filled === bestFilled && score > bestScore)
+        (filled === bestFilled && comfort > bestComfort) ||
+        (filled === bestFilled && comfort === bestComfort && keep > bestKeep)
       ) {
         bestFilled = filled;
-        bestScore = score;
+        bestComfort = comfort;
+        bestKeep = keep;
         bestOwners = [...current];
       }
       return;
@@ -325,15 +314,119 @@ export function assignUniqueOwners(args: {
       if (used.has(id)) continue;
       used.add(id);
       current[idx] = c.player;
-      search(idx + 1, filled + 1, score + c.score);
+      search(idx + 1, filled + 1, comfort + c.comfort, keep + c.keep);
       used.delete(id);
       current[idx] = null;
     }
-    search(idx + 1, filled, score);
+    search(idx + 1, filled, comfort, keep);
   };
-  search(0, 0, 0);
+  search(0, 0, 0, 0);
 
   return locked.map((L, i) => ({ hero: L.hero, player: bestOwners[i] }));
+}
+
+export type DisplacedSeat = {
+  hero: string;
+  from: string;
+  to: string;
+  fromComfort: number;
+  toComfort: number;
+};
+
+/**
+ * Comfort change on heroes already locked when `hero` is added and tournament
+ * mode reseats the five. The new hero's own comfort is not included — that
+ * stays on the player-comfort line for whoever receives it.
+ * Negative when the player who gets pushed onto an earlier hero is worse there.
+ */
+export function displacedComfort(args: {
+  roster: PlayerScout[];
+  locked: LockedPick[];
+  hero: string;
+  planHints?: { hero: string; player: string | null }[];
+}): { delta: number; moves: DisplacedSeat[]; detail: string } {
+  const locked = args.locked.filter(
+    (row) => heroKey(row.hero) !== heroKey(args.hero),
+  );
+  if (!args.roster.length || !locked.length) {
+    return { delta: 0, moves: [], detail: "" };
+  }
+
+  const after = assignUniqueOwners({
+    locked: [...locked.map((row) => ({ hero: row.hero })), { hero: args.hero }],
+    roster: args.roster,
+    planHints: args.planHints,
+    previous: locked.map((row) => ({ hero: row.hero, player: row.player })),
+  });
+
+  const moves: DisplacedSeat[] = [];
+  let delta = 0;
+  for (const before of locked) {
+    const next = after.find((row) => heroKey(row.hero) === heroKey(before.hero));
+    if (!before.player || !next?.player) continue;
+    if (playerId(before.player) === playerId(next.player)) continue;
+    const fromComfort = comfortOf(args.roster, before.player, before.hero);
+    const toComfort = comfortOf(args.roster, next.player, before.hero);
+    delta += toComfort - fromComfort;
+    moves.push({
+      hero: before.hero,
+      from: displayName(before.player),
+      to: displayName(next.player),
+      fromComfort,
+      toComfort,
+    });
+  }
+
+  const detail = moves
+    .map(
+      (move) =>
+        `${move.to} takes ${move.hero} from ${move.from} (seat comfort ${Math.round(move.fromComfort * 100)} → ${Math.round(move.toComfort * 100)})`,
+    )
+    .join("; ");
+  return { delta, moves, detail };
+}
+
+/**
+ * Live seats for a side. `draftedFor` is who the comfort-max assignment gave
+ * the hero when it was locked, and it stays. `player` is who plays it now:
+ * the same person until a later round's assignment has a higher comfort total.
+ */
+export function nextSeatLabels(args: {
+  picks: { hero: string; draftedFor?: string | null }[];
+  roster: PlayerScout[];
+  planHints?: { hero: string; player: string | null }[];
+  /** Tournament draft: swap seats whenever the comfort total rises. */
+  reshuffle: boolean;
+}): { hero: string; player: string | null; draftedFor: string | null }[] {
+  if (!args.reshuffle) {
+    const taken = new Set<string>();
+    return args.picks.map((p) => {
+      const noted = p.draftedFor ?? null;
+      const notedFree = Boolean(noted && !taken.has(playerId(noted)));
+      const player = notedFree
+        ? noted
+        : bestFreeOwner(args.roster, p.hero, taken);
+      const draftedFor = noted ?? player;
+      if (player) taken.add(playerId(player));
+      return { hero: p.hero, player, draftedFor };
+    });
+  }
+
+  const assigned = assignUniqueOwners({
+    locked: args.picks.map((p) => ({ hero: p.hero })),
+    roster: args.roster,
+    planHints: args.planHints,
+    // Equal comfort keeps the seats from when each hero was drafted.
+    previous: args.picks.map((p) => ({
+      hero: p.hero,
+      player: p.draftedFor ?? null,
+    })),
+  });
+  return args.picks.map((p, i) => {
+    const optimal = assigned[i]?.player ?? null;
+    const draftedFor = p.draftedFor ?? optimal;
+    return { hero: p.hero, player: optimal, draftedFor };
+  });
 }
 
 export function lockedPlayerIds(locked: LockedPick[]): Set<string> {

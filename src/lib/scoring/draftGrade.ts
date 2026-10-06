@@ -197,7 +197,7 @@ export function unplayedSeats(
   if (!roster.length) return [];
   return seats
     .filter((s) => comfortOf(roster, null, s.hero) <= 0)
-    .map((s) => s.hero);
+    .map((s) => (s.player ? `${s.hero} (${s.player}, blind)` : s.hero));
 }
 
 /**
@@ -339,7 +339,11 @@ function gradeSide(args: {
     notes.unshift(
       `Unplayed: ${args.scored.unplayed.join(", ")} — nobody on this five has ${
         args.scored.unplayed.length === 1 ? "it" : "them"
-      } on record. This draft cannot be fielded as locked.`,
+      } on record, so ${
+        args.scored.unplayed.length === 1 ? "it goes" : "they go"
+      } to whoever is left over. Expect a blind game on ${
+        args.scored.unplayed.length === 1 ? "that seat" : "those seats"
+      }.`,
     );
   }
   if (args.scored.missingRoles.length) {

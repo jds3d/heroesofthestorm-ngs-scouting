@@ -14,15 +14,16 @@ import type { HeroStat, NgsHeroRow } from "@/lib/heroesprofile/types";
 import { getTeam, getTeamMatches, teamProfileUrl } from "@/lib/ngs/client";
 import type { NgsMatch } from "@/lib/ngs/types";
 import { buildAdaptPlan } from "@/lib/scoring/adapt";
+import { buildDraftInsights, type DraftMatchInput } from "@/lib/scoring/draft";
 import {
   buildPlayerComfort,
   buildTeamThreats,
   heroStatsFromMap,
   mergeSourceMaps,
+  playerFromStormLeague,
   sourceMapGames,
 } from "@/lib/scoring/comfort";
-import { buildDraftInsights, type DraftMatchInput } from "@/lib/scoring/draft";
-import type { ScoutReport, SourceHeroStat } from "@/lib/scoring/types";
+import type { PlayerScout, ScoutReport, SourceHeroStat } from "@/lib/scoring/types";
 
 function heroAllMap(
   response: Record<string, Record<string, HeroStat>>,
@@ -367,4 +368,33 @@ export async function generateScoutReport(
       .map((m) => m.matchId),
     warnings: [...new Set(warnings)],
   };
+}
+
+/** Storm League hero pools for battletags or display names. Skips players the API cannot resolve. */
+export async function loadStormLeaguePlayers(
+  tags: string[],
+): Promise<PlayerScout[]> {
+  const players: PlayerScout[] = [];
+  const seen = new Set<string>();
+  for (const raw of tags) {
+    const tag = raw.trim();
+    const name = tag.split("#")[0]?.trim().toLowerCase() ?? "";
+    if (!name || seen.has(name)) continue;
+    seen.add(name);
+    try {
+      const storm = await loadWindowedMode(tag, "Storm League");
+      if (sourceMapGames(storm) <= 0) continue;
+      const player = playerFromStormLeague(tag, storm);
+      player.heroesProfileUrl = heroesProfilePlayerUrl(tag);
+      players.push(player);
+    } catch (err) {
+      if (
+        err instanceof HeroesProfileError &&
+        (err.status === 401 || err.status === 403)
+      ) {
+        throw err;
+      }
+    }
+  }
+  return players;
 }

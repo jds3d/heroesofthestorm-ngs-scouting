@@ -8,10 +8,17 @@ import {
 
 /** Min games before a matchup edge counts. */
 const MIN_MATCHUP_GAMES = 40;
-/** Enemy win% into you at or above this is a draft-relevant counter. */
-const HARD_COUNTER_ENEMY_WR = 55;
-/** Must be at least this many pp worse than your baseline loss rate. */
+/** Heroes pulled per live-draft matchup request (chained until the queue is empty). */
+export const MATCHUP_FETCH_BATCH = 4;
+/**
+ * Must beat this hero's normal loss rate by at least this many points.
+ * Below that is noise, not a counter. There is no 55% win-rate cliff —
+ * a 54% answer on a big sample still counts, and a 60% answer on 40 games
+ * counts less.
+ */
 const MIN_DELTA_PP = 3.5;
+/** Games where a matchup edge is mostly trusted. Thin samples shrink toward 0. */
+const COUNTER_CONFIDENCE_GAMES = 800;
 /** Counter hero must not be a dumpster-tier pick themselves. */
 const COUNTER_FLOOR_WR = 46;
 const COUNTER_FLOOR_INFLUENCE = -80;
@@ -80,6 +87,10 @@ export type ComputedHeroMeta = {
   allySamples: SynergyEdge[];
   /** Every enemy matchup with enough games, not just hard counters. Absent on older cached tables. */
   matchupSamples?: MatchupEdge[];
+  /** Raw SL game counts per enemy — includes pairings below the scoring threshold. */
+  matchupGameCounts?: Record<string, number>;
+  /** Raw SL game counts per ally — set only once this hero's ally payload was fetched. */
+  allyGameCounts?: Record<string, number>;
   /**
    * True once this hero's Storm League matchup payload was fetched.
    * Empty samples with this flag set are a real gap, not an unfetched hero.
@@ -110,6 +121,22 @@ function counterIsViable(
   return g.winRate >= COUNTER_FLOOR_WR || g.influence >= COUNTER_FLOOR_INFLUENCE;
 }
 
+/**
+ * How hard this matchup is as a counter. Scales with the edge over the
+ * hero's normal loss rate, and a thin sample counts for less.
+ * About half-trusted at 550 games, nearly full by 2,500.
+ */
+export function counterSeverity(edge: MatchupEdge): number {
+  if (edge.deltaPp <= 0 || edge.games <= 0) return 0;
+  const confidence = 1 - Math.exp(-edge.games / COUNTER_CONFIDENCE_GAMES);
+  return edge.deltaPp * confidence;
+}
+
+/** Scorecard points one live counter is worth, from 0 down to -8. */
+export function counterPenalty(edge: MatchupEdge): number {
+  return Math.min(8, counterSeverity(edge) * 0.8);
+}
+
 function hardCounters(
   hero: string,
   baselineWr: number,
@@ -121,7 +148,6 @@ function hardCounters(
   const out: MatchupEdge[] = [];
   for (const row of enemies) {
     if (row.games < MIN_MATCHUP_GAMES) continue;
-    if (row.enemyWinRate < HARD_COUNTER_ENEMY_WR) continue;
     const deltaPp = row.enemyWinRate - expectedEnemyWr;
     if (deltaPp < MIN_DELTA_PP) continue;
     if (!counterIsViable(row.hero, globalByKey)) continue;
@@ -132,7 +158,19 @@ function hardCounters(
       deltaPp: Math.round(deltaPp * 10) / 10,
     });
   }
-  return out.sort((a, b) => b.theirWinRate - a.theirWinRate || b.games - a.games);
+  return out.sort(
+    (a, b) => counterSeverity(b) - counterSeverity(a) || b.games - a.games,
+  );
+}
+
+function buildPairGameCounts(
+  rows: { hero: string; games: number }[] | undefined,
+): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const row of rows ?? []) {
+    out[heroKey(row.hero)] = row.games;
+  }
+  return out;
 }
 
 function buildMatchupSamples(
@@ -215,10 +253,12 @@ function classifyTiming(
 ): "early" | "flex" | "late" {
   const weak = wr < 46.5 && influence < 0;
   const strong = wr >= 51 || influence >= 80 || (popularity >= 50 && wr >= 48);
-  if (weak || counters.length >= 3) return "late";
-  if (counters.length >= 2 && wr < 50) return "late";
-  if (counters.length === 0 && (strong || wr >= 49)) return "early";
-  if (counters.length <= 1 && strong) return "early";
+  // A real answer, not a 3.5pp nudge on a huge sample.
+  const serious = counters.filter((c) => counterSeverity(c) >= 5).length;
+  if (weak || serious >= 3) return "late";
+  if (serious >= 2 && wr < 50) return "late";
+  if (serious === 0 && (strong || wr >= 49)) return "early";
+  if (serious <= 1 && strong) return "early";
   return "flex";
 }
 
@@ -296,6 +336,9 @@ export function buildDraftMetaTable(args: {
       synergiesWith,
       allySamples,
       matchupSamples: buildMatchupSamples(wr, enemies),
+      matchupGameCounts:
+        enemies !== undefined ? buildPairGameCounts(enemies) : undefined,
+      allyGameCounts: allies !== undefined ? buildPairGameCounts(allies) : undefined,
       matchupsLoaded: enemies !== undefined || allies !== undefined,
       mapStrong: mapEdges(key, wr, mapStats),
     };
@@ -349,22 +392,75 @@ export function heroMatchupsLoaded(
   return (row.matchupSamples?.length ?? 0) > 0 || row.allySamples.length > 0;
 }
 
+/** True once this hero's ally payload was fetched, even if every pair is below the scoring line. */
+export function heroAlliesLoaded(
+  table: DraftMetaTable | null | undefined,
+  hero: string,
+): boolean {
+  const row = table?.byHero[heroKey(hero)];
+  if (!row) return false;
+  if (row.allyGameCounts) return true;
+  return row.allySamples.length > 0 || row.synergiesWith.length > 0;
+}
+
 /** Display names whose matchup payload is not in the table yet. */
 export function heroesMissingMatchupLoad(
   table: DraftMetaTable | null | undefined,
   heroes: readonly string[],
 ): string[] {
+  return matchupFetchQueue(table, heroes);
+}
+
+/**
+ * Heroes still needing a Storm League pull, with `priority` names first
+ * (e.g. their likely five while scoring pick suggestions).
+ */
+export function matchupFetchQueue(
+  table: DraftMetaTable | null | undefined,
+  heroes: readonly string[],
+  priority: readonly string[] = [],
+): string[] {
   const seen = new Set<string>();
   const out: string[] = [];
-  for (const hero of heroes) {
+  const push = (hero: string) => {
     // Plan seats use "Flex" / "Flex ban" when no hero is chosen yet.
-    if (!hero || heroRole(hero) === "Unknown") continue;
+    if (!hero || heroRole(hero) === "Unknown") return;
     const key = heroKey(hero);
-    if (seen.has(key)) continue;
+    if (seen.has(key)) return;
     seen.add(key);
-    if (!heroMatchupsLoaded(table, hero)) out.push(hero);
-  }
+    if (!heroMatchupsLoaded(table, hero) || !heroAlliesLoaded(table, hero)) {
+      out.push(hero);
+    }
+  };
+  for (const hero of priority) push(hero);
+  for (const hero of heroes) push(hero);
   return out;
+}
+
+/** Best SL sample size for a pairing once both heroes' rows are loaded. */
+export function pairingGameCount(
+  table: DraftMetaTable | null | undefined,
+  a: string,
+  b: string,
+): number | undefined {
+  if (!heroMatchupsLoaded(table, a) || !heroMatchupsLoaded(table, b)) {
+    return undefined;
+  }
+  const bk = heroKey(b);
+  const ak = heroKey(a);
+  let best = 0;
+  const aMeta = heroDraftMeta(table, a);
+  const bMeta = heroDraftMeta(table, b);
+  const ga = aMeta.matchupGameCounts?.[bk];
+  const gb = bMeta.matchupGameCounts?.[ak];
+  if (ga != null) best = Math.max(best, ga);
+  if (gb != null) best = Math.max(best, gb);
+  if (ga == null && gb == null) {
+    const fromSample = (list: MatchupEdge[] | undefined, other: string) =>
+      list?.find((s) => heroKey(s.hero) === heroKey(other))?.games ?? 0;
+    best = Math.max(fromSample(aMeta.matchupSamples, b), fromSample(bMeta.matchupSamples, a));
+  }
+  return best;
 }
 
 /**
@@ -398,6 +494,14 @@ export function mergeLoadedMatchupRows(
           synergiesWith: row.synergiesWith,
           allySamples: row.allySamples,
           matchupSamples: row.matchupSamples ?? [],
+          matchupGameCounts: mergeMatchupGameCounts(
+            prev.matchupGameCounts,
+            row.matchupGameCounts,
+          ),
+          allyGameCounts: mergeMatchupGameCounts(
+            prev.allyGameCounts,
+            row.allyGameCounts,
+          ),
           matchupsLoaded: true,
           timing: row.timing,
         }
@@ -406,16 +510,79 @@ export function mergeLoadedMatchupRows(
   return { ...base, byHero };
 }
 
+function mergeMatchupGameCounts(
+  prev: Record<string, number> | undefined,
+  next: Record<string, number> | undefined,
+): Record<string, number> {
+  const out = { ...prev };
+  for (const [key, games] of Object.entries(next ?? {})) {
+    out[key] = Math.max(out[key] ?? 0, games);
+  }
+  return out;
+}
+
+/** Why a duo line scored 0 — only after both heroes' rows are in the table. */
+export function duoMissingLine(
+  table: DraftMetaTable | null | undefined,
+  subject: string,
+  other: string,
+  verb: "together" | "into",
+  pending?: ReadonlySet<string>,
+): string | null {
+  // Both teams cannot lock the same hero. A likely-five mirror is not a gap.
+  if (heroKey(subject) === heroKey(other)) return null;
+  const label = verb === "into" ? `into ${other}` : `with ${other}`;
+  const pendingKey = (name: string) =>
+    pending?.has(name) || pending?.has(heroKey(name)) || false;
+  if (pendingKey(subject) || pendingKey(other)) {
+    return `${label}: fetching Storm League… → 0`;
+  }
+  if (!heroMatchupsLoaded(table, subject)) {
+    return `${label}: ${subject} matchups not loaded — fetching… → 0`;
+  }
+  if (!heroMatchupsLoaded(table, other)) {
+    return `${label}: ${other} matchups not loaded — fetching… → 0`;
+  }
+  const games = pairingGameCount(table, subject, other);
+  if (games === undefined) {
+    return `${label}: fetching Storm League… → 0`;
+  }
+  if (games > 0 && games < MIN_MATCHUP_GAMES) {
+    return `${label}: only ${games.toLocaleString("en-US")} SL games (need ${MIN_MATCHUP_GAMES}) → 0`;
+  }
+  return `${label}: no Storm League pairing on record → 0`;
+}
+
 /** Short label for a duo line that has nothing to score, or null when the line has a sample. */
 export function missingDuoLabel(text: string): string | null {
-  if (!/no sample with enough games|ally data unavailable|no verified sample/i.test(text)) {
+  if (
+    !/no sample with enough games|ally data unavailable|no verified sample|fetching Storm League|matchups not loaded|ally matchups not loaded|only \d|no Storm League pairing on record|no Storm League games together/i.test(
+      text,
+    )
+  ) {
     return null;
   }
   const head = text.split(":")[0]?.trim() ?? "";
   if (/^(into|with)\s+/i.test(head)) return head;
+  if (/ and /i.test(head)) return head;
   const named = text.match(/ally data unavailable for (.+?) right now/i);
   if (named) return named[1];
   return "duo sample";
+}
+
+/** Human-readable reason from a missing-duo score line (after the hero label). */
+export function missingDuoReason(text: string): string | null {
+  const label = missingDuoLabel(text);
+  if (!label) return null;
+  const body = text.slice(text.indexOf(":") + 1).replace(/\s*→\s*0\s*$/, "").trim();
+  if (/fetching/i.test(body)) return body;
+  if (/only .* SL games/i.test(body)) return body;
+  if (/not loaded/i.test(body)) return body;
+  if (/no Storm League pairing/i.test(body)) return body;
+  if (/no sample with enough games/i.test(body)) {
+    return "Storm League sample not loaded yet";
+  }
+  return body || null;
 }
 
 /** Ally synergy edges for heroes already locked on our side. */
@@ -515,6 +682,8 @@ export function enemyDuos(
 export type DuoWeights = { perPp: number; perDuoCap: number; totalCap: number };
 export const SYNERGY_DUO: DuoWeights = { perPp: 1.15, perDuoCap: 12, totalCap: 18 };
 export const MATCHUP_DUO: DuoWeights = { perPp: 0.55, perDuoCap: 14, totalCap: 24 };
+/** Expected picks are not locked, so this span is half of MATCHUP_DUO. */
+export const LIKELY_MATCHUP_DUO: DuoWeights = { perPp: 0.275, perDuoCap: 7, totalCap: 12 };
 
 function signed(n: number): string {
   const r = Math.round(n);
@@ -530,6 +699,7 @@ export function scoreDuos(
   weights: DuoWeights,
   verb: "together" | "into",
   others: readonly string[] = [],
+  missingLine?: (other: string) => string | null,
 ): { points: number; summary: string; lines: string[]; math: string } {
   const scored = duos
     .map((d) => ({
@@ -547,7 +717,11 @@ export function scoreDuos(
   );
   const sampled = new Set(duos.map((d) => heroKey(d.hero)));
   for (const hero of others) {
-    if (!sampled.has(heroKey(hero))) lines.push(`${label(hero)}: no sample with enough games → 0`);
+    if (sampled.has(heroKey(hero))) continue;
+    const line = missingLine
+      ? missingLine(hero)
+      : `${label(hero)}: no sample with enough games → 0`;
+    if (line) lines.push(line);
   }
   const unsampled = lines.length - scored.length;
   const summary = scored.length
@@ -572,6 +746,38 @@ export function isChoGall(hero: string): boolean {
   return k === "cho" || k === "gall" || k === "chogall";
 }
 
+function counterStillViable(
+  table: DraftMetaTable | null | undefined,
+  name: string,
+): boolean {
+  const g = table?.byHero[heroKey(name)];
+  if (!g || g.games < 1) return true;
+  if (g.games < 200) return g.winRate >= COUNTER_FLOOR_WR;
+  return g.winRate >= COUNTER_FLOOR_WR || g.influence >= COUNTER_FLOOR_INFLUENCE;
+}
+
+/**
+ * Counters from the full matchup sample, so a stored report picks up a
+ * changed cutoff without another HeroesProfile pull. Falls back to the
+ * list baked in at report time when samples were not saved.
+ */
+function countersOnRecord(
+  table: DraftMetaTable | null | undefined,
+  hero: string,
+): MatchupEdge[] {
+  const meta = heroDraftMeta(table, hero);
+  const samples = meta.matchupSamples ?? [];
+  if (!samples.length) return meta.counteredBy;
+  return samples
+    .filter(
+      (s) =>
+        s.games >= MIN_MATCHUP_GAMES &&
+        s.deltaPp >= MIN_DELTA_PP &&
+        counterStillViable(table, s.hero),
+    )
+    .sort((a, b) => counterSeverity(b) - counterSeverity(a) || b.games - a.games);
+}
+
 /** Hard counters still available on the live board. */
 export function liveCountersUp(
   table: DraftMetaTable | null | undefined,
@@ -579,7 +785,7 @@ export function liveCountersUp(
   gone: Set<string>,
 ): MatchupEdge[] {
   const choGallGone = [...gone].some((h) => isChoGall(h));
-  return heroDraftMeta(table, hero).counteredBy.filter((c) => {
+  return countersOnRecord(table, hero).filter((c) => {
     if (isChoGall(c.hero) && choGallGone) return false;
     return !goneHas(gone, c.hero);
   });

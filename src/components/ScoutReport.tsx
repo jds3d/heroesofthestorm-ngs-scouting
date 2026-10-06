@@ -25,14 +25,29 @@ import { PlayerCard } from "@/components/PlayerCard";
 import { HeroFace } from "@/components/HeroFace";
 import { InteractiveDraft } from "@/components/InteractiveDraft";
 import { MapPicker } from "@/components/MapPicker";
+import {
+  actionsFromObserved,
+  type LiveDraft,
+} from "@/lib/lobby/screenLobby";
 
 export function ScoutReportView({
   report,
   review = null,
+  liveDraft = null,
+  screenOnly = false,
+  tournamentMode,
+  onTournamentModeChange,
 }: {
   report: ScoutReport;
   /** Played game to replay into the interactive draft. */
   review?: ReviewGame | null;
+  /** Bans and picks read off the shared screen. */
+  liveDraft?: LiveDraft | null;
+  /** Hide the scout report and leave only the interactive draft. */
+  screenOnly?: boolean;
+  /** Watch board: on uses this NGS report. Off is Storm League only. */
+  tournamentMode?: boolean;
+  onTournamentModeChange?: (on: boolean) => void;
 }) {
   const [pickSide, setPickSide] = useState<"theyFirst" | "weFirst" | null>(
     review ? (review.weFirst ? "weFirst" : "theyFirst") : null,
@@ -40,6 +55,13 @@ export function ScoutReportView({
   const [selectedMap, setSelectedMap] = useState<string | null>(
     review?.map ?? null,
   );
+  useEffect(() => {
+    if (review || !liveDraft) return;
+    if (!selectedMap && liveDraft.map) setSelectedMap(liveDraft.map);
+    if (!pickSide && liveDraft.firstPick) {
+      setPickSide(liveDraft.firstPick === "us" ? "weFirst" : "theyFirst");
+    }
+  }, [review, liveDraft, selectedMap, pickSide]);
   useEffect(() => {
     if (!review) return;
     const t = window.setTimeout(() => {
@@ -70,6 +92,21 @@ export function ScoutReportView({
   }, [side?.ourLikely, plan?.ourLikely]);
   const ourBrief = side?.ourBrief ?? plan?.ourBrief ?? null;
   const setupReady = Boolean(selectedMap && pickSide);
+  const screenActions = useMemo(() => {
+    if (review || !liveDraft) return null;
+    const side =
+      pickSide ??
+      (screenOnly
+        ? liveDraft.firstPick === "us"
+          ? "weFirst"
+          : "theyFirst"
+        : null);
+    if (!side) return null;
+    return actionsFromObserved({
+      ...liveDraft,
+      weFirst: side === "weFirst",
+    });
+  }, [review, liveDraft, pickSide, screenOnly]);
   const toc = [
     { id: "know-them", label: `1. ${report.teamName} Team` },
     { id: "preferred-heroes", label: `2. ${report.teamName} - Individual` },
@@ -96,6 +133,53 @@ export function ScoutReportView({
     if (!map) return;
     if (!pickSide) scrollToId("draft-first-pick");
     else scrollToId("draft-plan");
+  }
+
+  if (screenOnly) {
+    if (!plan) return null;
+    const weFirst =
+      (pickSide ?? (liveDraft?.firstPick === "us" ? "weFirst" : "theyFirst")) ===
+      "weFirst";
+    return (
+      <div id="interactive-draft">
+        <InteractiveDraft
+          key={`${review?.id ?? "live"}-${pickSide}-${selectedMap ?? "any"}-screen`}
+          screen={screenActions}
+          observedPicks={liveDraft}
+          tree={side?.tree ?? plan.tree}
+          weFirst={weFirst}
+          banPriority={shown.adapt.banPriority}
+          theirCommonBans={report.draft.theirBans}
+          ourLikely={ourPicks}
+          theirLikely={theirPicks}
+          ourBrief={ourBrief}
+          theirArchetype={report.draft.archetype}
+          archetypeCounter={plan.counter}
+          leaveDive={Boolean(plan.playbook?.antiDiveThreat)}
+          leaveDivePivot={plan.playbook?.recommended?.name ?? null}
+          map={selectedMap}
+          draftMeta={shown.adapt.draftMeta}
+          homeRoster={
+            report.homeRoster?.length
+              ? report.homeRoster
+              : report.teamName === "Little Buff Boyz"
+                ? report.roster
+                : []
+          }
+          theirRoster={
+            report.teamName === "Little Buff Boyz" ? [] : report.roster
+          }
+          ourLabel="Us"
+          theirLabel={report.teamName}
+          ourMmr={report.homeHpMmrAvg ?? null}
+          theirMmr={report.hpMmrAvg}
+          allowSeatReshuffle={false}
+          watchOnly
+          tournamentMode={tournamentMode}
+          onTournamentModeChange={onTournamentModeChange}
+        />
+      </div>
+    );
   }
 
   const missingPool = report.roster.filter((p) => p.topHeroes.length === 0);
@@ -488,7 +572,7 @@ export function ScoutReportView({
             <p className="max-w-3xl text-sm text-[var(--muted)]">
               {review
                 ? "Filled in from the replay and graded step by step. Undo to try a different line from any point."
-                : "Step through the lobby like HotS draft. Use the suggestion, search for a hero, or tap any face. Undo if you mis-click."}
+                : "Step through the lobby like HotS draft, or leave the main screen shared and each lock fills in here. The suggestion is for the step that is still open. Undo if a read is wrong."}
             </p>
             <InteractiveDraft
               key={`${review?.id ?? "live"}-${pickSide}-${selectedMap ?? "any"}`}
@@ -499,6 +583,7 @@ export function ScoutReportView({
                   ? review.actions
                   : null
               }
+              screen={screenActions}
               tree={side?.tree ?? plan.tree}
               weFirst={pickSide === "weFirst"}
               banPriority={shown.adapt.banPriority}

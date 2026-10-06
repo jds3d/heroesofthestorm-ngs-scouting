@@ -8,8 +8,11 @@ import {
   heroMeetsSuggestBar,
   mergeSourceMaps,
   anySuggestablePair,
+  overlayStormLeague,
   playerComfortOn,
+  playerFromStormLeague,
   playersMeetingSuggestBar,
+  slHeroSuggestions,
   sourceMapGames,
   stormLeagueGames,
   stormLeagueScore,
@@ -243,5 +246,89 @@ describe("stormLeagueGames", () => {
     expect(stormLeagueGames(player)).toBe(0);
     player.topHeroes[0].sources.stormLeague = sl(2, 2);
     expect(stormLeagueGames(player)).toBe(4);
+  });
+});
+
+function scout(battletag: string, heroes: [string, SourceHeroStat][]): PlayerScout {
+  const storm = new Map(heroes);
+  return playerFromStormLeague(battletag, storm);
+}
+
+describe("slHeroSuggestions", () => {
+  it("lists one Storm League hero per player and keeps roster order", () => {
+    const home = [
+      scout("HuckIt#1", [
+        ["Whitemane", sl(40, 10)],
+        ["Anduin", sl(8, 4)],
+      ]),
+      scout("MoJoE#2", [
+        ["Maiev", sl(30, 12)],
+        ["Zeratul", sl(6, 4)],
+      ]),
+    ];
+    const picks = slHeroSuggestions({ roster: home, gone: new Set() });
+    expect(picks.map((pick) => [pick.player, pick.hero])).toEqual([
+      ["HuckIt", "Whitemane"],
+      ["MoJoE", "Maiev"],
+    ]);
+    expect(picks[0].games).toBe(50);
+  });
+
+  it("gives the next Storm League hero when the best one is already taken", () => {
+    const home = [
+      scout("HuckIt#1", [
+        ["Illidan", sl(50, 10)],
+        ["Whitemane", sl(20, 8)],
+      ]),
+      scout("MoJoE#2", [
+        ["Illidan", sl(12, 4)],
+        ["Maiev", sl(10, 6)],
+      ]),
+    ];
+    const picks = slHeroSuggestions({
+      roster: home,
+      gone: new Set(["whitemane"]),
+    });
+    expect(picks.map((pick) => [pick.player, pick.hero])).toEqual([
+      ["HuckIt", "Illidan"],
+      ["MoJoE", "Maiev"],
+    ]);
+  });
+
+  it("skips a player who already locked", () => {
+    const home = [
+      scout("HuckIt#1", [["Whitemane", sl(20, 8)]]),
+      scout("MoJoE#2", [["Maiev", sl(20, 8)]]),
+    ];
+    const picks = slHeroSuggestions({
+      roster: home,
+      gone: new Set(["whitemane"]),
+      takenPlayers: new Set(["huckit"]),
+    });
+    expect(picks.map((pick) => pick.player)).toEqual(["MoJoE"]);
+  });
+
+  it("keeps a short Storm League history that the blended pool would drop", () => {
+    const player = playerFromStormLeague(
+      "Topgun707#3",
+      new Map([["Li-Ming", sl(2, 1)]]),
+    );
+    expect(player.topHeroes.map((hero) => hero.hero)).toEqual(["Li-Ming"]);
+    expect(slHeroSuggestions({ roster: [player], gone: new Set() })).toHaveLength(1);
+  });
+});
+
+describe("overlayStormLeague", () => {
+  it("adds Storm League sources onto a roster and appends unknown players", () => {
+    const base = scout("HuckIt#1", [["Anduin", sl(4, 2)]]);
+    base.topHeroes[0].sources.stormLeague = undefined;
+    const storm = [
+      scout("HuckIt", [["Whitemane", sl(30, 10)]]),
+      scout("Enemy#9", [["Genji", sl(22, 8)]]),
+    ];
+    const merged = overlayStormLeague([base], storm);
+    expect(merged.map((player) => player.battletag)).toEqual(["HuckIt#1", "Enemy#9"]);
+    const huck = merged[0].topHeroes.find((hero) => hero.hero === "Whitemane");
+    expect(huck?.sources.stormLeague?.games).toBe(40);
   });
 });

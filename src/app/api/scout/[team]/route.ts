@@ -56,10 +56,19 @@ export async function GET(request: Request, context: RouteContext) {
         ? report
         : ((await loadSavedHomeReport(leagueConfig.homeTeam)) ??
           (await loadScoutReport(leagueConfig.homeTeam).catch(() => null)));
-    const homePool =
+    let homePool =
       teamName === leagueConfig.homeTeam
         ? report.roster
         : (homeReport?.roster ?? (await loadSavedHomeRoster(leagueConfig.homeTeam)));
+    const missingOurs = ours.filter(
+      (tag) => !homePool?.some((player) => player.battletag.toLowerCase() === tag.toLowerCase()),
+    );
+    if (missingOurs.length > 0 && teamName !== leagueConfig.homeTeam) {
+      const lined = await loadScoutReport(leagueConfig.homeTeam, { starters: ours }).catch(
+        () => null,
+      );
+      if (lined?.roster?.length) homePool = lined.roster;
+    }
     const want = new Set(ours.map((s) => s.toLowerCase()));
     const homeRoster =
       want.size === 0 || !homePool

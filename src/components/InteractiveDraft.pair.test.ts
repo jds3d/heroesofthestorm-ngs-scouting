@@ -6,7 +6,8 @@ import {
   rankDoublePickPairs,
   scoreOrderedPair,
 } from "@/lib/scoring/pickPairs";
-import { buildDraftMetaTable } from "@/lib/scoring/draftMeta";
+import { buildDraftMetaTable, type ComputedHeroMeta, type DraftMetaTable } from "@/lib/scoring/draftMeta";
+import { heroKey } from "@/lib/scoring/heroMeta";
 import {
   buildPlayerComfort,
   heroUnplayedBy,
@@ -365,6 +366,7 @@ describe("ban deviation grading", () => {
     });
 
     expect(card.factors.some((factor) => factor.id === "matchup")).toBe(false);
+    expect(card.factors.some((factor) => factor.id === "likely")).toBe(false);
   });
 
   it("does not treat an off-list ban as a structural throw", () => {
@@ -478,5 +480,140 @@ describe("pairSideBreakdown", () => {
       ["Patch win rate", 10],
       ["Pair synergy", 5],
     ]);
+  });
+});
+
+function matchupRow(name: string, samples: ComputedHeroMeta["matchupSamples"]): ComputedHeroMeta {
+  return {
+    hero: name,
+    winRate: 50,
+    influence: 0,
+    popularity: 0,
+    banRate: 0,
+    pickRate: 0,
+    games: 1000,
+    timing: "flex",
+    counteredBy: [],
+    synergiesWith: [],
+    allySamples: [],
+    matchupSamples: samples,
+    matchupsLoaded: true,
+    mapStrong: [],
+    note: "",
+  };
+}
+
+function tableInto(
+  hero: string,
+  into: { hero: string; ourWinRate: number }[],
+): DraftMetaTable {
+  return {
+    patch: "test",
+    source: "heroesprofile-sl",
+    byHero: {
+      [heroKey(hero)]: matchupRow(
+        hero,
+        into.map((enemy) => ({
+          hero: enemy.hero,
+          theirWinRate: 100 - enemy.ourWinRate,
+          games: 200,
+          deltaPp: 0,
+        })),
+      ),
+    },
+  };
+}
+
+const pickArgs = {
+  hero: "Valla",
+  gone: new Set<string>(),
+  map: null,
+  ourPickCount: 1,
+  inPlan: false,
+  fromAlt: false,
+  planRole: null,
+  lockedAllies: [],
+  banPriority: [],
+  comfort: 0,
+  swapDelta: 0,
+  takeAndRebuild: false,
+  kind: "pick" as const,
+};
+
+describe("locked and likely matchups", () => {
+  const table = tableInto("Valla", [
+    { hero: "Diablo", ourWinRate: 60 },
+    { hero: "Malthael", ourWinRate: 40 },
+  ]);
+  const likelySeat = (hero: string): DraftCompPick => ({
+    hero,
+    role: "Flex",
+    player: null,
+    note: null,
+  });
+
+  it("scores locked at full range and likely at half on the same pick", () => {
+    const card = buildPickScorecard({
+      ...pickArgs,
+      table,
+      theirLocked: ["Diablo"],
+      theirLikely: [likelySeat("Diablo"), likelySeat("Malthael")],
+    });
+    const locked = card.factors.find((factor) => factor.id === "matchup");
+    const likely = card.factors.find((factor) => factor.id === "likely");
+    expect(locked?.label).toBe("Vs their locked");
+    expect(locked?.points).toBe(6);
+    expect(locked?.lines?.some((line) => line.startsWith("into Diablo"))).toBe(true);
+    expect(likely?.label).toBe("Vs their likely");
+    expect(likely?.points).toBe(-3);
+    expect(likely?.lines?.some((line) => line.startsWith("into Malthael"))).toBe(true);
+    expect(likely?.lines?.some((line) => line.startsWith("into Diablo"))).toBe(false);
+    expect(likely?.formula).toContain("Half of the locked range");
+  });
+
+  it("uses only likely when nobody is locked", () => {
+    const card = buildPickScorecard({
+      ...pickArgs,
+      table,
+      theirLocked: [],
+      theirLikely: [likelySeat("Diablo")],
+    });
+    expect(card.factors.some((factor) => factor.id === "matchup")).toBe(false);
+    expect(card.factors.find((factor) => factor.id === "likely")?.points).toBe(3);
+  });
+
+  it("drops likely on the last pick and when that hero is already gone", () => {
+    const last = buildPickScorecard({
+      ...pickArgs,
+      table,
+      theirLocked: ["Diablo"],
+      theirLikely: [likelySeat("Malthael")],
+      lastPick: true,
+    });
+    expect(last.factors.some((factor) => factor.id === "matchup")).toBe(true);
+    expect(last.factors.some((factor) => factor.id === "likely")).toBe(false);
+
+    const gone = buildPickScorecard({
+      ...pickArgs,
+      table,
+      gone: new Set([heroKey("Malthael")]),
+      theirLocked: ["Diablo"],
+      theirLikely: [likelySeat("Malthael")],
+    });
+    expect(gone.factors.some((factor) => factor.id === "likely")).toBe(false);
+  });
+
+  it("scores a reseat by the comfort gap on the hero someone was pushed onto", () => {
+    const card = buildPickScorecard({
+      ...pickArgs,
+      table,
+      theirLocked: [],
+      theirLikely: [],
+      swapDelta: -0.28,
+      swapNote: "Beachyman takes Maiev from HuckIt (seat comfort 40 → 12)",
+    });
+    const swap = card.factors.find((factor) => factor.id === "swap");
+    expect(swap?.points).toBe(-22);
+    expect(swap?.detail).toContain("Beachyman takes Maiev");
   });
 });

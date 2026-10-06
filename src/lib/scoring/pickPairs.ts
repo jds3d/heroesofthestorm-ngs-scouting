@@ -4,6 +4,7 @@
  */
 import {
   allyDuos,
+  heroAlliesLoaded,
   heroDraftMeta,
   scoreDuos,
   SYNERGY_DUO,
@@ -106,6 +107,21 @@ export function pairRoleCheck(
   };
 }
 
+function allyPairGames(
+  table: DraftMetaTable | null | undefined,
+  a: string,
+  b: string,
+): number {
+  const gamesOf = (hero: string, other: string) => {
+    const row = heroDraftMeta(table, hero);
+    const counted = row.allyGameCounts?.[heroKey(other)];
+    if (counted != null) return counted;
+    const sample = row.allySamples.find((edge) => heroKey(edge.hero) === heroKey(other));
+    return sample?.games ?? 0;
+  };
+  return Math.max(gamesOf(a, b), gamesOf(b, a));
+}
+
 /** Duo WR between the two locks (not yet on the board). */
 export function pairDuoSynergy(
   table: DraftMetaTable | null | undefined,
@@ -114,18 +130,23 @@ export function pairDuoSynergy(
 ): { points: number; detail: string } {
   const [duo] = allyDuos(table, a, [b]);
   if (!duo) {
-    const aMeta = heroDraftMeta(table, a);
-    const bMeta = heroDraftMeta(table, b);
-    const hasAnyAllyData =
-      (aMeta.allySamples?.length ?? 0) > 0 ||
-      (bMeta.allySamples?.length ?? 0) > 0 ||
-      aMeta.synergiesWith.length > 0 ||
-      bMeta.synergiesWith.length > 0;
+    const missing = [a, b].filter((hero) => !heroAlliesLoaded(table, hero));
+    if (missing.length) {
+      return {
+        points: 0,
+        detail: `${a} and ${b}: ally matchups not loaded for ${missing.join(", ")} — fetching`,
+      };
+    }
+    const games = allyPairGames(table, a, b);
+    if (games > 0) {
+      return {
+        points: 0,
+        detail: `${a} and ${b}: only ${games.toLocaleString("en-US")} SL games together (need 60)`,
+      };
+    }
     return {
       points: 0,
-      detail: hasAnyAllyData
-        ? `No duo sample between ${a} and ${b} with enough games to count.`
-        : `ally data unavailable for ${a} and ${b} right now; no verified sample to score.`,
+      detail: `${a} and ${b}: no Storm League games together on record`,
     };
   }
   const points = Math.round(scoreDuos([duo], SYNERGY_DUO, "together").points);

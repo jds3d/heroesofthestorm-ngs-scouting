@@ -27,7 +27,7 @@ import {
 } from "@/lib/scoring/draftGrade";
 import { heroKey } from "@/lib/scoring/heroMeta";
 import { solveSeatAssignments } from "@/lib/scoring/draftPlan";
-import { assignUniqueOwners } from "@/lib/scoring/draftSwap";
+import { assignUniqueOwners, displacedComfort, nextSeatLabels } from "@/lib/scoring/draftSwap";
 import { pairDuoSynergy, pairRoleCheck } from "@/lib/scoring/pickPairs";
 import {
   HeroesProfileError,
@@ -40,11 +40,17 @@ import {
 import {
   allyDuos,
   buildDraftMetaTable,
+  counterPenalty,
   counterPoolNote,
+  duoMissingLine,
   enemyDuos,
   heroesMissingMatchupLoad,
+  MATCHUP_DUO,
   mergeLoadedMatchupRows,
+  matchupFetchQueue,
   missingDuoLabel,
+  missingDuoReason,
+  pairingGameCount,
   scoreDuos,
   SYNERGY_DUO,
   isMapSpecialist,
@@ -240,10 +246,11 @@ describe("draftGrade", () => {
     const withAzmodan = gradeFinishedDraft({
       ...base,
       homeRoster,
-      ourLocked: [...ourLocked.slice(0, 4), { hero: "Azmodan", player: null }],
+      ourLocked: [...ourLocked.slice(0, 4), { hero: "Azmodan", player: "C" }],
       steps: [],
     });
-    expect(withAzmodan.ours.notes[0]).toContain("Unplayed: Azmodan");
+    expect(withAzmodan.ours.notes[0]).toContain("Unplayed: Azmodan (C, blind)");
+    expect(withAzmodan.ours.notes[0]).toContain("blind game");
     expect(withAzmodan.ours.quality).toBeLessThan(full.ours.quality - 15);
     expect(withAzmodan.reasons.join(" ")).toContain("locked Azmodan");
   });
@@ -283,6 +290,59 @@ describe("draftGrade", () => {
     expect(card.mmrWinPct).toBeGreaterThan(card.draftWinPct);
     expect(card.mmrGap).toBe(100);
     expect(favouredLabel(41, "LBB", "TG")).toBe("TG favoured, 59%");
+  });
+});
+
+describe("counter severity", () => {
+  const g = (hero: string, winRate: number) => ({
+    hero,
+    winRate,
+    influence: 0,
+    popularity: 0,
+    banRate: 0,
+    pickRate: 0,
+    games: 5000,
+  });
+  const enemy = (hero: string, enemyWinRate: number, games: number) => ({
+    hero,
+    wins: 0,
+    losses: 0,
+    games,
+    enemyWinRate,
+  });
+  // Samuro baseline 53.5 → enemies are expected to win 46.5% into him.
+  const table = buildDraftMetaTable({
+    patch: "test",
+    global: [g("Samuro", 53.5), g("Hogger", 51), g("Illidan", 50), g("Noise", 50)],
+    matchups: {
+      Samuro: [
+        enemy("Hogger", 54.4, 3333),
+        enemy("Illidan", 55, 4705),
+        enemy("Noise", 49, 4000),
+        enemy("Thin", 62, 50),
+        enemy("Tiny", 70, 20),
+      ],
+    },
+  });
+  const counters = table.byHero.Samuro?.counteredBy ?? [];
+
+  it("keeps a sub-55% answer when it beats the hero's normal loss rate", () => {
+    expect(counters.map((c) => c.hero)).toContain("Hogger");
+    expect(counters.map((c) => c.hero)).toContain("Illidan");
+    expect(counters.map((c) => c.hero)).toContain("Thin");
+    expect(counters.map((c) => c.hero)).not.toContain("Noise");
+    expect(counters.map((c) => c.hero)).not.toContain("Tiny");
+  });
+
+  it("charges a big-sample 54% answer more than a thin 62% sample", () => {
+    const hogger = counters.find((c) => c.hero === "Hogger");
+    const thin = counters.find((c) => c.hero === "Thin");
+    expect(hogger).toBeTruthy();
+    expect(thin).toBeTruthy();
+    expect(counterPenalty(hogger!)).toBeGreaterThan(4);
+    expect(counterPenalty(hogger!)).toBeLessThanOrEqual(8);
+    expect(counterPenalty(thin!)).toBeLessThan(2);
+    expect(counterPenalty(hogger!)).toBeGreaterThan(counterPenalty(thin!));
   });
 });
 
@@ -348,6 +408,88 @@ describe("duo scoring", () => {
     ]);
     expect(Math.round(result.points)).toBe(13);
     expect(missingDuoLabel(result.lines[2]!)).toBe("with Valla");
+  });
+
+  it("prioritizes their likely heroes in the matchup fetch queue", () => {
+    const bare = (hero: string, loaded = false) => ({
+      hero,
+      winRate: 50,
+      influence: 0,
+      popularity: 0,
+      banRate: 0,
+      pickRate: 0,
+      games: 0,
+      timing: "flex" as const,
+      counteredBy: [],
+      synergiesWith: [],
+      allySamples: [],
+      matchupSamples: [],
+      matchupsLoaded: loaded,
+      allyGameCounts: loaded ? {} : undefined,
+      matchupGameCounts: loaded ? {} : undefined,
+      mapStrong: [],
+      note: "",
+    });
+    const table = {
+      patch: "test",
+      source: "heroesprofile-sl" as const,
+      byHero: {
+        Anduin: bare("Anduin", true),
+        Samuro: bare("Samuro"),
+        Garrosh: bare("Garrosh"),
+        Junkrat: bare("Junkrat"),
+        Deathwing: bare("Deathwing"),
+        Guldan: bare("Gul'dan"),
+      },
+    };
+    expect(
+      matchupFetchQueue(
+        table,
+        ["Garrosh", "Anduin", "Junkrat", "Deathwing", "Gul'dan", "Samuro"],
+        ["Samuro", "Anduin"],
+      ),
+    ).toEqual(["Samuro", "Garrosh", "Junkrat", "Deathwing", "Gul'dan"]);
+  });
+
+  it("does not flag a hero as missing data into itself", () => {
+    const table = buildDraftMetaTable({
+      patch: "test",
+      global: [
+        { hero: "Samuro", winRate: 51.5, influence: 10, popularity: 6, banRate: 0, pickRate: 0, games: 1380 },
+        { hero: "Anduin", winRate: 50, influence: 0, popularity: 10, banRate: 0, pickRate: 0, games: 4000 },
+      ],
+      matchups: {
+        Samuro: [{ hero: "Anduin", wins: 55, losses: 45, games: 1000, enemyWinRate: 45 }],
+        Anduin: [{ hero: "Samuro", wins: 45, losses: 55, games: 1000, enemyWinRate: 55 }],
+      },
+    });
+    expect(duoMissingLine(table, "Samuro", "Samuro", "into")).toBeNull();
+    const duos = enemyDuos(table, "Samuro", ["Anduin", "Samuro"]);
+    const result = scoreDuos(duos, MATCHUP_DUO, "into", ["Anduin", "Samuro"], (enemy) =>
+      duoMissingLine(table, "Samuro", enemy, "into"),
+    );
+    expect(result.lines.some((line) => /into Samuro/i.test(line))).toBe(false);
+    expect(result.lines.some((line) => line.startsWith("into Anduin:"))).toBe(true);
+  });
+
+  it("explains why a duo scored 0 instead of a generic loading message", () => {
+    const table = buildDraftMetaTable({
+      patch: "test",
+      global: [
+        { hero: "Garrosh", winRate: 52, influence: 10, popularity: 20, banRate: 0, pickRate: 0, games: 4000 },
+        { hero: "Samuro", winRate: 50, influence: 0, popularity: 10, banRate: 0, pickRate: 0, games: 800 },
+      ],
+      matchups: {
+        Garrosh: [{ hero: "Samuro", wins: 6, losses: 6, games: 12, enemyWinRate: 50 }],
+        Samuro: [{ hero: "Garrosh", wins: 6, losses: 6, games: 12, enemyWinRate: 50 }],
+      },
+    });
+    expect(pairingGameCount(table, "Garrosh", "Samuro")).toBe(12);
+    const line = duoMissingLine(table, "Garrosh", "Samuro", "into");
+    expect(line).toBe("into Samuro: only 12 SL games (need 40) → 0");
+    expect(missingDuoReason(line ?? "")).toBe("only 12 SL games (need 40)");
+    const unloaded = duoMissingLine(table, "Garrosh", "Anduin", "into");
+    expect(unloaded).toContain("Anduin matchups not loaded");
   });
 
   it("reads into Tyrael from Tyrael's row when our hero was never fetched", () => {
@@ -559,8 +701,39 @@ describe("data-driven structure checks", () => {
 
     const result = pairDuoSynergy(table, "Whitemane", "Tyrael");
 
-    expect(result.detail).toContain("ally data unavailable");
+    expect(result.detail).toContain("ally matchups not loaded");
     expect(result.points).toBe(0);
+  });
+
+  it("scores Tyrael with Azmodan from the ally payload instead of calling it missing", () => {
+    const table = buildDraftMetaTable({
+      patch: "test",
+      global: [
+        { hero: "Tyrael", winRate: 52, influence: 10, popularity: 20, banRate: 0, pickRate: 0, games: 4000 },
+        { hero: "Azmodan", winRate: 51, influence: 10, popularity: 20, banRate: 0, pickRate: 0, games: 4000 },
+      ],
+      matchups: { Tyrael: [], Azmodan: [] },
+      allies: {
+        Tyrael: [{ hero: "Azmodan", wins: 808, losses: 651, games: 1459, allyWinRate: 55.38 }],
+      },
+    });
+    const result = pairDuoSynergy(table, "Tyrael", "Azmodan");
+    expect(result.detail).toContain("55.4% together");
+    expect(result.detail).not.toContain("not loaded");
+    expect(result.points).not.toBe(0);
+  });
+
+  it("keeps fetching a hero that has enemy rows but no ally payload", () => {
+    const table = buildDraftMetaTable({
+      patch: "test",
+      global: [
+        { hero: "Tyrael", winRate: 52, influence: 10, popularity: 20, banRate: 0, pickRate: 0, games: 4000 },
+      ],
+      matchups: {
+        Tyrael: [{ hero: "Raynor", wins: 40, losses: 60, games: 100, enemyWinRate: 60 }],
+      },
+    });
+    expect(matchupFetchQueue(table, ["Tyrael"])).toEqual(["Tyrael"]);
   });
 
   it("uses HeroesProfile map rows as the source of truth, not a hardcoded map list", () => {
@@ -835,7 +1008,105 @@ describe("assignUniqueOwners", () => {
     ]);
   });
 
-  it("leaves a seat empty only when nobody can take it", () => {
+  it("seats a hero nobody has on record with whoever is left over", () => {
+    const roster = [
+      player("A#1", [["Genji", 0.4], ["Arthas", 0.1]]),
+      player("B#1", [["Arthas", 0.3]]),
+      player("C#1", []),
+    ];
+    const assigned = assignUniqueOwners({
+      locked: [{ hero: "Genji" }, { hero: "Arthas" }, { hero: "Probius" }],
+      roster,
+    });
+    expect(assigned.map((a) => a.player)).toEqual(["A", "B", "C"]);
+  });
+
+  it("charges the comfort gap when a new lock pushes someone onto an earlier hero", () => {
+    const roster = [
+      player("HuckIt#1", [
+        ["Maiev", 0.4],
+        ["Rehgar", 0.5],
+      ]),
+      player("Beachyman#1", [
+        ["Maiev", 0.12],
+        ["Rehgar", 0.05],
+      ]),
+    ];
+    const moved = displacedComfort({
+      roster,
+      locked: [{ hero: "Maiev", player: "HuckIt" }],
+      hero: "Rehgar",
+    });
+    expect(moved.moves).toEqual([
+      {
+        hero: "Maiev",
+        from: "HuckIt",
+        to: "Beachyman",
+        fromComfort: 0.4,
+        toComfort: 0.12,
+      },
+    ]);
+    expect(moved.delta).toBeCloseTo(-0.28);
+    expect(moved.detail).toContain("Beachyman takes Maiev from HuckIt");
+    expect(moved.detail).toContain("40 → 12");
+
+    const stayed = displacedComfort({
+      roster: [
+        player("HuckIt#1", [["Maiev", 0.4]]),
+        player("Beachyman#1", [
+          ["Rehgar", 0.5],
+          ["Maiev", 0.05],
+        ]),
+      ],
+      locked: [{ hero: "Maiev", player: "HuckIt" }],
+      hero: "Rehgar",
+    });
+    expect(stayed.moves).toEqual([]);
+    expect(stayed.delta).toBe(0);
+  });
+
+  it("moves an earlier owner when the swap raises total comfort, and keeps who it was drafted for", () => {
+    const roster = [
+      player("HuckIt#1", [
+        ["Tyrande", 0.3],
+        ["Tyrael", 0.4],
+      ]),
+      player("MrHustler#1", [["Tyrande", 0.28]]),
+    ];
+    const first = nextSeatLabels({
+      picks: [{ hero: "Tyrande" }],
+      roster,
+      reshuffle: true,
+    });
+    expect(first[0]).toEqual({
+      hero: "Tyrande",
+      player: "HuckIt",
+      draftedFor: "HuckIt",
+    });
+    const both = nextSeatLabels({
+      picks: [
+        { hero: "Tyrande", draftedFor: first[0].draftedFor },
+        { hero: "Tyrael" },
+      ],
+      roster,
+      reshuffle: true,
+    });
+    expect(both.map((a) => [a.hero, a.player, a.draftedFor])).toEqual([
+      ["Tyrande", "MrHustler", "HuckIt"],
+      ["Tyrael", "HuckIt", "HuckIt"],
+    ]);
+    const frozen = nextSeatLabels({
+      picks: both.map((a) => ({ hero: a.hero, draftedFor: a.draftedFor })),
+      roster,
+      reshuffle: false,
+    });
+    expect(frozen.map((a) => [a.player, a.draftedFor])).toEqual([
+      ["HuckIt", "HuckIt"],
+      ["MrHustler", "HuckIt"],
+    ]);
+  });
+
+  it("leaves a seat empty only when no player is free", () => {
     const roster = [player("A#1", [["Genji", 0.4]])];
     const assigned = assignUniqueOwners({
       locked: [{ hero: "Genji" }, { hero: "Azmodan" }],

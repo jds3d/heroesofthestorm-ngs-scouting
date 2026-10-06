@@ -10,6 +10,7 @@ import {
   type ReactNode,
 } from "react";
 import type { ReplayAction } from "@/lib/review/replayDraft";
+import { UNSEEN_BAN } from "@/lib/lobby/screenLobby";
 import { criticalTalentsFor } from "@/config/compCriticalTalents";
 import { divePlaybook, chooseDivePivot } from "@/config/divePlaybook";
 import {
@@ -44,17 +45,22 @@ import {
   counterRoleFillNote,
   earlyPickScore,
   enemyDuos,
+  counterPenalty,
   formatCounter,
   heroDraftMeta,
-  heroesMissingMatchupLoad,
+  duoMissingLine,
   isFlexibleAnchorRole,
   isMapSpecialist,
   isOfflanePlanRole,
+  LIKELY_MATCHUP_DUO,
   MATCHUP_DUO,
   mapSpecialistTooltip,
   liveCountersUp,
   mergeLoadedMatchupRows,
   missingDuoLabel,
+  missingDuoReason,
+  MATCHUP_FETCH_BATCH,
+  matchupFetchQueue,
   nakedOfflaneOpeningRisk,
   scoreDuos,
   shouldTakeAndRebuild,
@@ -74,6 +80,8 @@ import {
 import {
   assignUniqueOwners,
   bestFreeOwner,
+  displacedComfort,
+  nextSeatLabels,
   findEndDraftSwaps,
   findPickSwap,
   lockedPlayerIds,
@@ -89,8 +97,10 @@ import {
   heroMeetsSuggestBar,
   heroUnplayedBy,
   pairHasDistinctOwners,
+  playerComfortOn,
   playersMeetingSuggestBar,
   anySuggestablePair,
+  slHeroSuggestions,
   suggestablePairOwners,
   UNPLAYED_PICK_PENALTY,
 } from "@/lib/scoring/comfort";
@@ -132,6 +142,8 @@ type BoardAction = DraftTreeAction & {
   reason?: string;
   score?: StepScore;
   breakdown?: BoardBreakdown;
+  /** Best owner when this hero was locked. Stays put when later rounds swap seats. */
+  draftedFor?: string | null;
 };
 
 /**
@@ -809,12 +821,13 @@ const SCORE_FACTOR_HELP: Record<string, string> = {
   influence: "Meta influence captures how central the hero is to the current drafting environment. It is best read as a popularity/impact signal rather than a direct ban rule, because very good heroes can still be poor picks if they are contested or misfit the board.",
   map: "Map fit measures whether the hero is a specialist on the chosen map. This matters for map-specific power, but it is only a small nudge unless the map is a known staple for that hero.",
   synergy: "Ally synergy reflects how well this hero performs with already-locked teammates in current win-rate samples. It is useful for pair planning, but it is not a ban heuristic by itself because team composition and role fill often matter more.",
-  matchup: "Matchup value compares this hero against the enemy’s likely or locked picks. This is one of the most useful real-draft signals, but it should be interpreted as a contextual advantage check rather than a pure ban trigger.",
-  answers: "Hard counters asks whether the opposing side still has a clean counterpick in its played pool if this hero is locked. This is the timing signal: heroes with live counters want to be picked late or protected with a ban.",
+  matchup: "Vs their locked compares this hero with heroes the other side has already locked. It is a full-weight matchup check because those heroes are definite.",
+  likely: "Vs their likely compares this hero with heroes the other side is still expected to pick. It uses the same matchup samples as locked, at half the range, because those heroes are not definite.",
+  answers: "Hard counters asks whether the opposing side still has a counter in its played pool. The penalty scales with how far that hero beats this one past its normal loss rate, and a thin Storm League sample counts for less. Heroes they do not play are named and then ignored.",
   roles: "Roles checks tank, healer, offlane and ranged damage. It is 0 as long as every missing role still fits in the remaining picks, even with no room to spare, and only goes negative when a lock makes the team impossible to complete.",
   comfort: "Player comfort is the roster-specific fit for the player who would actually play this hero. It is a good pick signal because it captures skill, familiarity, and seat ownership, but it should not dominate hard meta or matchup logic.",
   deny: "Deny / contest is the HP-backed contest signal: if the hero is strong and likely to be prioritized by the other side, we should either take it early or ban it. This is not generic draft logic; it reflects current pick/ban pressure from the data and the board state.",
-  swap: "Swap value measures the benefit of keeping a seat flexible so the plan can adapt later. It is a planning signal, not a direct ban recommendation, because many heroes with high swap value are still poor bans.",
+  swap: "Swap value is the comfort change on heroes that change hands when this lock reseats the five. A player pushed onto a hero they play worse lowers the score by that comfort gap. The new hero's own comfort stays on the player-comfort line.",
   banPri: "Ban priority is the current priority list for removing a hero from the draft. It is a valid ban signal when a hero is both strong and clearly being contested, but it only matters after the board state and lane roles are considered.",
 };
 
@@ -853,6 +866,11 @@ export function buildPickScorecard(args: {
   /** Who owns the comfort signal (for the factor detail line). */
   comfortWho?: string | null;
   swapDelta: number;
+  /**
+   * Set when this lock moves someone already seated. The points are the
+   * comfort gap on those earlier heroes, on the same scale as player comfort.
+   */
+  swapNote?: string | null;
   takeAndRebuild: boolean;
   kind: "ban" | "pick";
   /** Last pick of the draft — open counters cannot answer. */
@@ -928,30 +946,58 @@ export function buildPickScorecard(args: {
     synergy.lines,
   );
 
-  // A pick plays into their locked heroes. A ban candidate is a hero they may
-  // take alongside their likely five, so comparing that candidate against its
-  // prospective teammates is backwards. Ban urgency comes from deny, comfort,
-  // map, and meta evidence instead.
+  // A pick plays into heroes they have locked and heroes they are still
+  // expected to lock. Likely is half the locked range. A ban is not scored
+  // as a teammate of their five — ban urgency comes from deny, comfort, map,
+  // and meta evidence instead.
   if (args.kind === "pick") {
-    const enemies =
-      args.theirLocked.length > 0
-        ? args.theirLocked
-        : args.theirLikely.map((p) => p.hero).slice(0, 5);
-    const matchup = scoreDuos(
-      enemyDuos(args.table, args.hero, enemies),
-      MATCHUP_DUO,
-      "into",
-      enemies,
-    );
-    addFactor(
-      factors,
-      "matchup",
-      args.theirLocked.length ? "Vs their locked" : "Vs their likely",
-      matchup.points,
-      matchup.summary || "No sampled matchups against these heroes",
-      matchup.math,
-      matchup.lines,
-    );
+    const self = heroKey(args.hero);
+    const lockedEnemies = args.theirLocked.filter((enemy) => heroKey(enemy) !== self);
+    const lockedKeys = new Set(lockedEnemies.map((enemy) => heroKey(enemy)));
+    const likelySeen = new Set<string>();
+    const likelyEnemies = args.lastPick
+      ? []
+      : args.theirLikely
+          .map((pick) => pick.hero)
+          .filter((enemy) => {
+            const key = heroKey(enemy);
+            if (key === self || lockedKeys.has(key) || isGone(enemy, args.gone)) return false;
+            if (likelySeen.has(key)) return false;
+            likelySeen.add(key);
+            return true;
+          });
+    const into = (enemies: string[], weights: typeof MATCHUP_DUO) =>
+      scoreDuos(
+        enemyDuos(args.table, args.hero, enemies),
+        weights,
+        "into",
+        enemies,
+        (enemy) => duoMissingLine(args.table, args.hero, enemy, "into"),
+      );
+    if (lockedEnemies.length) {
+      const matchup = into(lockedEnemies, MATCHUP_DUO);
+      addFactor(
+        factors,
+        "matchup",
+        "Vs their locked",
+        matchup.points,
+        matchup.summary || "No sampled matchups against these heroes",
+        matchup.math,
+        matchup.lines,
+      );
+    }
+    if (likelyEnemies.length) {
+      const likely = into(likelyEnemies, LIKELY_MATCHUP_DUO);
+      addFactor(
+        factors,
+        "likely",
+        "Vs their likely",
+        likely.points,
+        likely.summary || "No sampled matchups against these heroes",
+        `${likely.math}. Half of the locked range because these picks are not definite`,
+        likely.lines,
+      );
+    }
   }
 
   // Open counters still available to the answering side (risk).
@@ -980,10 +1026,11 @@ export function buildPickScorecard(args: {
         args.answeringTeamPool,
         args.answerPerspective ?? "theirs",
       );
-  const answerPts = openAnswers.reduce((s, c) => {
-    return s - Math.min(8, (c.theirWinRate - 50) * 0.35 + c.games / 80);
-  }, 0);
-  const answerList = openAnswers
+  const rankedAnswers = [...openAnswers].sort(
+    (a, b) => counterPenalty(b) - counterPenalty(a) || b.games - a.games,
+  );
+  const answerPts = rankedAnswers.reduce((sum, c) => sum - counterPenalty(c), 0);
+  const answerList = rankedAnswers
     .slice(0, 3)
     .map(formatCounter)
     .join(", ");
@@ -1014,7 +1061,7 @@ export function buildPickScorecard(args: {
     answerDetail,
     args.lastPick
       ? "0 because last pick means nobody can answer afterwards"
-      : `sum of remaining counter answer penalties = ${answerValue.toFixed(2)} → rounded to ${Math.round(answerValue)}`,
+      : `each live counter min(8, 0.8 × edge over normal loss rate × sample confidence); sum ${answerPts.toFixed(2)} capped at -22 → ${Math.round(answerValue)}`,
   );
 
   const comfortPts = comfortPickPoints(args.comfort);
@@ -1035,7 +1082,7 @@ export function buildPickScorecard(args: {
       "unplayed",
       "Unplayed",
       UNPLAYED_PICK_PENALTY,
-      `Nobody on this five has ${args.hero} on record — the draft cannot field it.`,
+      `Nobody on this five has ${args.hero} on record — whoever is left over plays it blind.`,
       `flat ${UNPLAYED_PICK_PENALTY} because no roster player has ever logged ${args.hero}`,
     );
   }
@@ -1062,18 +1109,28 @@ export function buildPickScorecard(args: {
       : "0 because this hero is not a likely contest target",
   );
 
-  const swapPts = args.swapDelta > 0 ? 8 + args.swapDelta * 30 : 0;
+  const reseat = args.swapNote != null && args.swapNote !== "";
+  const swapRaw = reseat
+    ? args.swapDelta * COMFORT_PICK_MULTIPLIER
+    : args.swapDelta > 0
+      ? 8 + args.swapDelta * 30
+      : 0;
+  const swapPts = Math.round(swapRaw);
   addFactor(
     factors,
     "swap",
     "Swap value",
     swapPts,
-    args.swapDelta > 0
-      ? `Post-lock comfort swap (+${args.swapDelta.toFixed(2)})`
-      : "No comfort-positive swap unlocked",
-    args.swapDelta > 0
-      ? `8 + (${args.swapDelta.toFixed(2)} × 30) = ${swapPts.toFixed(2)} → rounded to ${Math.round(swapPts)}`
-      : "0 because no comfort-positive swap is unlocked",
+    reseat
+      ? args.swapNote!
+      : args.swapDelta > 0
+        ? `Post-lock comfort swap (+${args.swapDelta.toFixed(2)})`
+        : "No comfort-positive swap unlocked",
+    reseat
+      ? `${args.swapDelta.toFixed(2)} comfort on seats that moved × ${COMFORT_PICK_MULTIPLIER} = ${swapRaw.toFixed(2)} → rounded to ${swapPts}`
+      : args.swapDelta > 0
+        ? `8 + (${args.swapDelta.toFixed(2)} × 30) = ${swapRaw.toFixed(2)} → rounded to ${swapPts}`
+        : "0 because no comfort-positive swap is unlocked",
   );
 
   if (args.kind === "ban") {
@@ -1457,7 +1514,7 @@ function applyLockedToPlan(
     next[idx] = {
       ...seat,
       hero: L.hero,
-      player: seat.player ?? L.player,
+      player: L.player ?? seat.player,
       note: "locked",
     };
   }
@@ -1658,6 +1715,119 @@ function seatPairCandidates(
   return seats;
 }
 
+/** Heroes that must have SL matchup rows before this step can be scored. */
+export function matchupHeroesForStep(args: {
+  step: (typeof DRAFT_ORDER)[number] | null;
+  stepIndex: number;
+  ours: boolean;
+  gone: Set<string>;
+  history: BoardAction[];
+  theirLikely: DraftCompPick[];
+  planPicks: DraftCompPick[];
+  livePicks: DraftCompPick[];
+  planned: { hero: string; side: "our" | "their"; kind: "ban" | "pick" }[];
+  playableBanPriority: { hero: string }[];
+  theirRoster: PlayerScout[];
+  homeRoster: PlayerScout[];
+  locked: { hero: string }[];
+  takenPlayers: Set<string>;
+}): { names: string[]; priority: string[] } {
+  const names: string[] = [];
+  const priority: string[] = [];
+  const seen = new Set<string>();
+  const add = (hero: string, pri = false) => {
+    if (!hero || heroRole(hero) === "Unknown") return;
+    const key = heroKey(hero);
+    if (seen.has(key)) return;
+    seen.add(key);
+    names.push(hero);
+    if (pri) priority.push(hero);
+  };
+
+  for (const pick of args.theirLikely) add(pick.hero, true);
+  for (const action of args.history) {
+    if (action.kind === "pick") add(action.hero, true);
+  }
+  for (const pick of args.planPicks) add(pick.hero);
+
+  if (!args.step) return { names, priority };
+
+  if (args.ours && args.step.kind === "ban") {
+    const ourPlanned = new Set(args.livePicks.map((p) => heroKey(p.hero)));
+    const banPool = [
+      ...args.playableBanPriority.map((b) => b.hero),
+      ...args.theirLikely.map((p) => p.hero),
+    ]
+      .filter((h, i, arr) => {
+        if (isGone(h, args.gone)) return false;
+        if (ourPlanned.has(heroKey(h))) return false;
+        return arr.findIndex((x) => heroKey(x) === heroKey(h)) === i;
+      })
+      .filter((h) => theirPlaysHero(args.theirRoster, h, args.theirLikely));
+    const treeBan = args.planned[args.stepIndex];
+    if (
+      treeBan?.side === "our" &&
+      treeBan.kind === "ban" &&
+      !isGone(treeBan.hero, args.gone) &&
+      theirPlaysHero(args.theirRoster, treeBan.hero, args.theirLikely) &&
+      !banPool.some((h) => heroKey(h) === heroKey(treeBan.hero))
+    ) {
+      banPool.unshift(treeBan.hero);
+    }
+    for (const h of banPool) add(h, true);
+    return { names, priority };
+  }
+
+  if (args.ours && args.step.kind === "pick") {
+    const candMeta = pickCandidates(
+      args.livePicks,
+      args.gone,
+      args.homeRoster,
+    ).filter((c) => {
+      const who = displayPlayer(c.player);
+      return !(who && args.takenPlayers.has(who.toLowerCase()));
+    });
+    for (const c of candMeta) add(c.hero, true);
+    if (
+      isDoublePickWindow(DRAFT_ORDER, args.stepIndex) &&
+      args.livePicks.filter((p) => !isLockedPlanSeat(p)).length >= 2
+    ) {
+      for (const seat of seatPairCandidates(
+        args.livePicks,
+        args.gone,
+        args.takenPlayers,
+        args.homeRoster,
+      )) {
+        for (const c of seat.cands) add(c.hero, true);
+      }
+    }
+    return { names, priority };
+  }
+
+  if (!args.ours) {
+    const pool = [
+      ...(args.planned[args.stepIndex]?.side === "their" &&
+      !isGone(args.planned[args.stepIndex].hero, args.gone)
+        ? [args.planned[args.stepIndex].hero]
+        : []),
+      ...args.theirLikely.map((p) => p.hero),
+    ]
+      .filter((h, i, arr) => {
+        if (isGone(h, args.gone)) return false;
+        return arr.findIndex((x) => heroKey(x) === heroKey(h)) === i;
+      })
+      .filter((h) =>
+        args.step?.kind === "ban"
+          ? !args.homeRoster.length ||
+            heroMeetsSuggestBar(args.homeRoster, h, null)
+          : theirPlaysHero(args.theirRoster, h, args.theirLikely),
+      );
+    for (const h of pool) add(h, true);
+  }
+
+  return { names, priority };
+}
+
 function heroFromTitle(title: string): string | null {
   const m =
     title.match(/^(?:Expected|Plan):\s*(.+)$/i) ||
@@ -1723,8 +1893,44 @@ function slotsFor(
   return Array.from({ length: count }, (_, i) => got[i] ?? null);
 }
 
+/** Heroes already locked on screen that the turn order has not placed yet. */
+function fillUnplacedLocks(
+  slots: (BoardAction | null)[],
+  heroes: readonly string[],
+  players: readonly (string | null)[],
+  side: "our" | "their",
+): (BoardAction | null)[] {
+  if (!heroes.length) return slots;
+  const next = [...slots];
+  const have = new Set(
+    next.flatMap((slot) =>
+      slot && slot.hero !== UNSEEN_BAN ? [heroKey(slot.hero)] : [],
+    ),
+  );
+  for (let i = 0; i < heroes.length; i++) {
+    const hero = heroes[i];
+    if (!hero || have.has(heroKey(hero))) continue;
+    const hole = next.findIndex((slot) => !slot);
+    if (hole < 0) break;
+    const player = players[i] ?? null;
+    next[hole] = {
+      side,
+      kind: "pick",
+      ordinal: hole + 1,
+      hero,
+      player,
+      draftedFor: player,
+      reason: "Locked on the shared screen",
+    };
+    have.add(heroKey(hero));
+  }
+  return next;
+}
+
 function goneKeys(history: BoardAction[]): Set<string> {
-  return new Set(history.map((a) => heroKey(a.hero)));
+  return new Set(
+    history.filter((action) => action.hero !== UNSEEN_BAN).map((action) => heroKey(action.hero)),
+  );
 }
 
 function isGone(hero: string, gone: Set<string>): boolean {
@@ -1825,9 +2031,19 @@ export function stepHeading(args: {
   kind: "ban" | "pick";
   ordinal: number;
   pair: boolean;
+  watch?: boolean;
 }): string {
   const side = args.ours ? "Our" : "Their";
   const who = args.ours ? "we" : "they";
+  if (args.watch) {
+    if (args.kind === "ban") {
+      return `${side} ${ordinalWord(args.ordinal)} ban — waiting for it on screen`;
+    }
+    if (args.pair) {
+      return `${side} ${ordinalWord(args.ordinal)} + ${ordinalWord(args.ordinal + 1)} picks — waiting for them on screen`;
+    }
+    return `${side} ${ordinalWord(args.ordinal)} pick — waiting for it on screen`;
+  }
   if (args.kind === "ban") {
     return `${side} ${ordinalWord(args.ordinal)} ban — tap the hero ${who} ban${args.ours ? "" : "ned"}`;
   }
@@ -2141,8 +2357,7 @@ function hardCounterCaution(
   );
   if (!live.length) return null;
   const ranked = [...live].sort(
-    (a, b) =>
-      b.games - a.games || b.theirWinRate - a.theirWinRate || a.hero.localeCompare(b.hero),
+    (a, b) => counterPenalty(b) - counterPenalty(a) || b.games - a.games,
   );
   const top = ranked[0];
   const list = ranked.slice(0, 3).map(formatCounter).join(", ");
@@ -2776,7 +2991,11 @@ function theirOwnerForHero(
   return displayPlayer(next?.player ?? null);
 }
 
-/** Re-stamp every pick on a side so each player owns at most one hero. */
+/**
+ * Re-stamp every pick on a side. Tournament mode moves players whenever the
+ * new assignment has a higher comfort total; the owner at lock time stays on
+ * `draftedFor`.
+ */
 function restampSidePlayers(
   history: BoardAction[],
   side: "our" | "their",
@@ -2784,36 +3003,55 @@ function restampSidePlayers(
   planHints: DraftCompPick[],
   /** heroKey → player known for certain (e.g. from a replay); never re-guessed. */
   pinned?: ReadonlyMap<string, string>,
+  reshuffle = true,
+  /** False keeps the name under the portrait and does not invent a comfort owner. */
+  guess = true,
 ): BoardAction[] {
   const sidePicks = history.filter((a) => a.side === side && a.kind === "pick");
   if (!sidePicks.length) return history;
+  if (!guess) {
+    return history.map((action) => {
+      if (action.side !== side || action.kind !== "pick") return action;
+      const pinnedPlayer = pinned?.get(heroKey(action.hero));
+      if (!pinnedPlayer) return action;
+      return { ...action, player: pinnedPlayer, draftedFor: pinnedPlayer };
+    });
+  }
   if (pinned?.size) {
-    const guessed = restampSidePlayers(history, side, roster, planHints);
+    const guessed = restampSidePlayers(
+      history,
+      side,
+      roster,
+      planHints,
+      undefined,
+      reshuffle,
+    );
     return guessed.map((a) =>
       a.side === side && a.kind === "pick" && pinned.has(heroKey(a.hero))
-        ? { ...a, player: pinned.get(heroKey(a.hero))! }
+        ? {
+            ...a,
+            player: pinned.get(heroKey(a.hero))!,
+            draftedFor: pinned.get(heroKey(a.hero))!,
+          }
         : a,
     );
   }
 
-  const assigned = assignUniqueOwners({
-    locked: sidePicks.map((a) => ({ hero: a.hero })),
+  const labels = nextSeatLabels({
+    picks: sidePicks.map((a) => ({
+      hero: a.hero,
+      draftedFor: a.draftedFor ?? null,
+    })),
     roster,
     planHints,
-    previous: sidePicks.map((a) => ({
-      hero: a.hero,
-      player: displayPlayer(a.player),
-    })),
+    reshuffle,
   });
-  const byHero = new Map(
-    assigned.map((a) => [heroKey(a.hero), a.player] as const),
-  );
-
+  let pickIndex = 0;
   return history.map((a) => {
     if (a.side !== side || a.kind !== "pick") return a;
-    const nextPlayer = byHero.get(heroKey(a.hero));
-    if (nextPlayer === undefined) return a;
-    return { ...a, player: nextPlayer };
+    const label = labels[pickIndex++];
+    if (!label) return a;
+    return { ...a, player: label.player, draftedFor: label.draftedFor };
   });
 }
 
@@ -2856,6 +3094,12 @@ export function InteractiveDraft({
   theirMmr = null,
   allowSeatReshuffle = true,
   replay = null,
+  screen = null,
+  observedPicks = null,
+  watchOnly = false,
+  tournamentMode,
+  onTournamentModeChange,
+  stormLeagueOnly = false,
 }: {
   tree: DraftTreeNode;
   weFirst: boolean;
@@ -2887,11 +3131,36 @@ export function InteractiveDraft({
   allowSeatReshuffle?: boolean;
   /** A played draft (DRAFT_ORDER) to lock in automatically, graded like live clicks. */
   replay?: readonly ReplayAction[] | null;
+  /** Locks read off the shared draft screen, in draft order. Ignored while a replay is playing. */
+  screen?: readonly ReplayAction[] | null;
+  /** Every hero already locked on screen, even if the turn order has not reached it. */
+  observedPicks?: {
+    ourPicks: readonly string[];
+    theirPicks: readonly string[];
+    ourPickPlayers: readonly (string | null)[];
+    theirPickPlayers: readonly (string | null)[];
+  } | null;
+  /** Screen watch fills every lock. Recommendations stay; clicks cannot add a hero. */
+  watchOnly?: boolean;
+  /**
+   * When set, the parent owns the checkbox. On uses NGS pools. Off uses Storm
+   * League history only.
+   */
+  tournamentMode?: boolean;
+  onTournamentModeChange?: (on: boolean) => void;
+  /** Stay on Storm League suggestions even if tournament mode is checked, until NGS pools are ready. */
+  stormLeagueOnly?: boolean;
 }) {
   const [history, setHistory] = useState<BoardAction[]>([]);
-  const [tournamentDraftMode, setTournamentDraftMode] = useState(
-    allowSeatReshuffle,
+  const [tournamentDraftModeState, setTournamentDraftModeState] = useState(
+    () => (screen ? false : allowSeatReshuffle),
   );
+  const tournamentDraftMode = tournamentMode ?? tournamentDraftModeState;
+  const useStormLeague = stormLeagueOnly || !tournamentDraftMode;
+  const setTournamentDraftMode = (on: boolean) => {
+    onTournamentModeChange?.(on);
+    if (tournamentMode === undefined) setTournamentDraftModeState(on);
+  };
   const [filter, setFilter] = useState("");
   /** During consecutive double-picks: heroes selected for the pair lock (max 2). */
   const [pairPick, setPairPick] = useState<string[]>([]);
@@ -2904,14 +3173,25 @@ export function InteractiveDraft({
   const [matchupError, setMatchupError] = useState<string | null>(null);
   const [matchupTrack, setMatchupTrack] = useState<MatchupTrack | null>(null);
   const scoringMeta = matchupPatch ?? draftMeta;
+  const screenDefaulted = useRef(Boolean(screen));
+  useEffect(() => {
+    if (tournamentMode !== undefined) return;
+    if (!screen || screenDefaulted.current) return;
+    screenDefaulted.current = true;
+    setTournamentDraftModeState(false);
+  }, [screen, tournamentMode]);
   const allHeroes = useMemo(() => allDraftHeroes(), []);
   const replaySeats = useMemo(() => {
     const seats = new Map<string, string>();
     for (const a of replay ?? []) {
       if (a.kind === "pick" && a.player) seats.set(heroKey(a.hero), a.player);
     }
+    // The name under the portrait is who locked it. Comfort must not replace it.
+    for (const a of screen ?? []) {
+      if (a.kind === "pick" && a.player) seats.set(heroKey(a.hero), a.player);
+    }
     return seats;
-  }, [replay]);
+  }, [replay, screen]);
   const planned = useMemo(() => expectedPath(tree), [tree]);
   const planPicks = useMemo(() => {
     const raw = ourLikely.length
@@ -2956,7 +3236,15 @@ export function InteractiveDraft({
   const done = stepIndex >= DRAFT_ORDER.length;
   const step = done ? null : DRAFT_ORDER[stepIndex];
   const ours = step ? (step.side === "fp") === weFirst : false;
-  const gone = goneKeys(history);
+  const gone = useMemo(() => {
+    const keys = goneKeys(history);
+    if (watchOnly && observedPicks) {
+      for (const hero of [...observedPicks.ourPicks, ...observedPicks.theirPicks]) {
+        if (hero) keys.add(heroKey(hero));
+      }
+    }
+    return keys;
+  }, [history, watchOnly, observedPicks]);
   /** Same-side pick-pick — always lock both together, never one at a time. */
   const pairWindow = Boolean(
     step &&
@@ -3004,12 +3292,39 @@ export function InteractiveDraft({
   );
 
   // One player per hero — specialist locks can steal earlier flex seats.
+  // A live screen with tournament mode off keeps the name under the portrait.
+  const guessSeats = !watchOnly || tournamentDraftMode;
   const stampedHistory = useMemo(() => {
     let h = history;
-    h = restampSidePlayers(h, "our", homeRoster, planPicks, replaySeats);
-    h = restampSidePlayers(h, "their", theirRoster, theirLikely, replaySeats);
+    h = restampSidePlayers(
+      h,
+      "our",
+      homeRoster,
+      planPicks,
+      replaySeats,
+      tournamentDraftMode,
+      guessSeats,
+    );
+    h = restampSidePlayers(
+      h,
+      "their",
+      theirRoster,
+      theirLikely,
+      replaySeats,
+      tournamentDraftMode,
+      guessSeats,
+    );
     return h;
-  }, [history, homeRoster, theirRoster, planPicks, theirLikely, replaySeats]);
+  }, [
+    history,
+    homeRoster,
+    theirRoster,
+    planPicks,
+    theirLikely,
+    replaySeats,
+    tournamentDraftMode,
+    guessSeats,
+  ]);
 
   const leaveDiveLive = useMemo(() => {
     const locked = history
@@ -3046,6 +3361,48 @@ export function InteractiveDraft({
     );
   }
 
+  /**
+   * Tournament mode swaps every seat at the end, so the owner of a hero being
+   * drafted is whoever the comfort-max assignment gives it.
+   */
+  function seatedOwner(
+    roster: PlayerScout[],
+    lockedHeroes: string[],
+    hero: string,
+    hints: DraftCompPick[],
+  ): { player: string | null; comfort: number } | null {
+    if (!tournamentDraftMode || !roster.length) return null;
+    const heroes = lockedHeroes.some((h) => heroKey(h) === heroKey(hero))
+      ? lockedHeroes
+      : [...lockedHeroes, hero];
+    const assigned = assignUniqueOwners({
+      locked: heroes.map((h) => ({ hero: h })),
+      roster,
+      planHints: hints,
+    });
+    const player =
+      assigned.find((a) => heroKey(a.hero) === heroKey(hero))?.player ?? null;
+    return {
+      player,
+      comfort: player ? playerComfortOn(roster, hero, player) : 0,
+    };
+  }
+
+  /** Comfort gap on heroes this lock pushes someone else onto. */
+  function reseatFor(
+    roster: PlayerScout[],
+    locked: LockedPick[],
+    hero: string,
+    hints: DraftCompPick[],
+  ): { swapDelta: number; swapNote: string | null } {
+    if (!tournamentDraftMode || !roster.length) {
+      return { swapDelta: 0, swapNote: null };
+    }
+    const move = displacedComfort({ roster, locked, hero, planHints: hints });
+    if (!move.detail) return { swapDelta: 0, swapNote: null };
+    return { swapDelta: move.delta, swapNote: move.detail };
+  }
+
   function singleScorer(sugg: Suggestion): (h: string) => ScoredOption {
     const kind = step?.kind ?? "pick";
     const isLastStep = stepIndex === DRAFT_ORDER.length - 1;
@@ -3066,12 +3423,25 @@ export function InteractiveDraft({
       if (fromOpts && !fromOpts.pairWith) return fromOpts;
       if (!ours) {
         const matched = matchTheirPlanSeat(h, theirLikely);
-        const seatWho = theirOwnerName(h, theirLikely);
-        const sig = comfortSignal(
-          kind === "ban" ? homeRoster : theirRoster,
-          h,
-          kind === "ban" ? null : seatWho,
-        );
+        const seated =
+          kind === "pick"
+            ? seatedOwner(theirRoster, theirLockedHeroes, h, theirLikely)
+            : null;
+        const seatWho = seated?.player ?? theirOwnerName(h, theirLikely);
+        const sig = seated?.player
+          ? { comfort: seated.comfort, who: seated.player }
+          : comfortSignal(
+              kind === "ban" ? homeRoster : theirRoster,
+              h,
+              kind === "ban" ? null : seatWho,
+            );
+        const theirSeats: LockedPick[] = history
+          .filter((a) => a.side === "their" && a.kind === "pick")
+          .map((a) => ({ hero: a.hero, player: displayPlayer(a.player) }));
+        const reseat =
+          kind === "pick"
+            ? reseatFor(theirRoster, theirSeats, h, theirLikely)
+            : { swapDelta: 0, swapNote: null };
         return {
           ...buildPickScorecard({
             hero: h,
@@ -3086,11 +3456,12 @@ export function InteractiveDraft({
             theirLocked: answeringTeamLocked,
             answeringTeamPool: answeringPool,
             answerPerspective,
-            theirLikely: [],
+            theirLikely: kind === "pick" ? planPicks : [],
             banPriority: [],
             comfort: sig.comfort,
             comfortWho: sig.who,
-            swapDelta: 0,
+            swapDelta: reseat.swapDelta,
+            swapNote: reseat.swapNote,
             takeAndRebuild: false,
             kind,
             lastPick: isLastStep,
@@ -3112,7 +3483,13 @@ export function InteractiveDraft({
       const preferredHit = preferred
         ? qualified.find((o) => o.player.toLowerCase() === preferred.toLowerCase())
         : undefined;
-      const owner = preferredHit ?? qualified[0] ?? null;
+      const seated =
+        kind === "pick"
+          ? seatedOwner(homeRoster, ourLockedHeroes, h, planPicks)
+          : null;
+      const owner = seated?.player
+        ? { player: seated.player, comfort: seated.comfort }
+        : (preferredHit ?? qualified[0] ?? null);
       const sig = owner
         ? { comfort: owner.comfort, who: owner.player }
         : comfortSignal(
@@ -3120,6 +3497,15 @@ export function InteractiveDraft({
             h,
             kind === "ban" ? null : preferred,
           );
+      const reseat =
+        kind === "pick"
+          ? reseatFor(
+              homeRoster,
+              ourLockedPicks(history, planPicks, homeRoster),
+              h,
+              planPicks,
+            )
+          : { swapDelta: 0, swapNote: null };
       const ourCard = buildPickScorecard({
         hero: h,
         table: scoringMeta,
@@ -3138,7 +3524,8 @@ export function InteractiveDraft({
         theirRoster,
         comfort: sig.comfort,
         comfortWho: sig.who,
-        swapDelta: 0,
+        swapDelta: reseat.swapDelta,
+        swapNote: reseat.swapNote,
         takeAndRebuild: shouldTakeAndRebuild(scoringMeta, h),
         kind,
         lastPick: isLastStep,
@@ -3146,7 +3533,7 @@ export function InteractiveDraft({
       });
       return {
         ...(kind === "pick" ? withRolesFactor(ourCard, ourLockedHeroes) : ourCard),
-        player: kind === "ban" ? null : (owner?.player ?? preferred),
+        player: kind === "ban" ? null : (seated?.player ?? owner?.player ?? preferred),
       };
     };
   }
@@ -3171,6 +3558,9 @@ export function InteractiveDraft({
         const seat = findSeatForCandidate(beforePlan, hero);
         const preferred = displayPlayer(seat?.seat.player ?? null);
         const taken = lockedPlayerIds(locked);
+        const seated = forcedOwner
+          ? null
+          : seatedOwner(homeRoster, ourLockedHeroes, hero, planPicks);
         const qualified = playersMeetingSuggestBar(homeRoster, hero, taken);
         const wanted = forcedOwner ?? preferred;
         const preferredHit = wanted
@@ -3178,10 +3568,18 @@ export function InteractiveDraft({
               (o) => o.player.toLowerCase() === wanted.toLowerCase(),
             )
           : undefined;
-        const owner = preferredHit ?? (forcedOwner ? null : qualified[0] ?? null);
+        const owner = seated?.player
+          ? { player: seated.player, comfort: seated.comfort }
+          : forcedOwner
+            ? {
+                player: forcedOwner,
+                comfort: playerComfortOn(homeRoster, hero, forcedOwner),
+              }
+            : (preferredHit ?? qualified[0] ?? null);
         const sig = owner
           ? { comfort: owner.comfort, who: owner.player }
           : comfortSignal(homeRoster, hero, wanted);
+        const reseat = reseatFor(homeRoster, locked, hero, planPicks);
         return {
           ...buildPickScorecard({
             hero,
@@ -3201,7 +3599,8 @@ export function InteractiveDraft({
             theirRoster,
             comfort: sig.comfort,
             comfortWho: sig.who,
-            swapDelta: 0,
+            swapDelta: reseat.swapDelta,
+            swapNote: reseat.swapNote,
             takeAndRebuild: shouldTakeAndRebuild(scoringMeta, hero),
             kind: "pick",
             lastPick: false,
@@ -3211,8 +3610,19 @@ export function InteractiveDraft({
         };
       }
       const matched = matchTheirPlanSeat(hero, theirLikely);
-      const player = theirOwnerName(hero, theirLikely);
-      const sig = comfortSignal(theirRoster, hero, player);
+      const seated = forcedOwner
+        ? null
+        : seatedOwner(theirRoster, theirLockedHeroes, hero, theirLikely);
+      const player =
+        forcedOwner ?? seated?.player ?? theirOwnerName(hero, theirLikely);
+      const sig =
+        forcedOwner || seated?.player
+          ? { comfort: playerComfortOn(theirRoster, hero, player), who: player }
+          : comfortSignal(theirRoster, hero, player);
+      const theirSeats: LockedPick[] = history
+        .filter((a) => a.side === "their" && a.kind === "pick")
+        .map((a) => ({ hero: a.hero, player: displayPlayer(a.player) }));
+      const reseat = reseatFor(theirRoster, theirSeats, hero, theirLikely);
       return {
         ...buildPickScorecard({
           hero,
@@ -3227,11 +3637,12 @@ export function InteractiveDraft({
           theirLocked: ourLockedHeroes,
           answeringTeamPool: ourHeroPool,
           answerPerspective: "ours",
-          theirLikely: [],
+          theirLikely: planPicks,
           banPriority: [],
           comfort: sig.comfort,
           comfortWho: sig.who,
-          swapDelta: 0,
+          swapDelta: reseat.swapDelta,
+          swapNote: reseat.swapNote,
           takeAndRebuild: false,
           kind: "pick",
           lastPick: false,
@@ -3266,6 +3677,27 @@ export function InteractiveDraft({
      * different players and rescore comfort for whoever really plays it.
      */
     const seatPair = (a: string, b: string): [ScoredOption, ScoredOption] => {
+      if (tournamentDraftMode && sideRoster.length) {
+        const assigned = assignUniqueOwners({
+          locked: [...sideLocked, a, b]
+            .filter(
+              (h, i, all) =>
+                all.findIndex((x) => heroKey(x) === heroKey(h)) === i,
+            )
+            .map((hero) => ({ hero })),
+          roster: sideRoster,
+          planHints: ours ? planPicks : theirLikely,
+        });
+        const who = (hero: string) =>
+          assigned.find((row) => heroKey(row.hero) === heroKey(hero))?.player ??
+          undefined;
+        const firstWho = who(a);
+        const secondWho = who(b);
+        return [
+          firstWho ? solo(a, firstWho) : solo(a),
+          secondWho ? solo(b, secondWho) : solo(b),
+        ];
+      }
       const first = solo(a);
       const second = solo(b);
       const same =
@@ -3329,17 +3761,21 @@ export function InteractiveDraft({
     if (step?.kind !== "pick") return heroes;
     const { roster, taken } = pickingSide();
     if (!roster.length) return heroes;
+    // Tournament mode can move anyone, so a seated player still counts.
+    const gateTaken = tournamentDraftMode ? undefined : taken;
     const legal = heroes.filter(
-      (h) => playersMeetingSuggestBar(roster, h, taken).length > 0,
+      (h) => playersMeetingSuggestBar(roster, h, gateTaken).length > 0,
     );
     if (!legal.length) return heroes;
-    if (pair && !anySuggestablePair(roster, legal, taken)) return heroes;
+    if (pair && !anySuggestablePair(roster, legal, gateTaken)) return heroes;
     return legal;
   }
 
   /** Promote any open hero (or pair) that outscores the shortlist's top. */
   function sweepSuggestion(base: Suggestion | null): Suggestion | null {
+    if (useStormLeague) return base;
     if (!base || !step || !base.options.length) return base;
+    const cardLimit = ours ? 6 : 3;
     const top = base.options[0];
     const open = gradeField(base);
     const field = comfortGatedField(open, Boolean(top.pairWith));
@@ -3352,7 +3788,14 @@ export function InteractiveDraft({
         field.some((h) => heroKey(h) === heroKey(hero));
       // One player cannot lock both halves of a double pick.
       const seatable = (a: string, b: string) =>
-        relaxed || !roster.length || pairHasDistinctOwners(roster, a, b, taken);
+        relaxed ||
+        !roster.length ||
+        pairHasDistinctOwners(
+          roster,
+          a,
+          b,
+          tournamentDraftMode ? undefined : taken,
+        );
       let best: ScoredOption | null =
         (relaxed || (inField(top.hero) && inField(top.pairWith))) &&
         seatable(top.hero, top.pairWith)
@@ -3397,7 +3840,7 @@ export function InteractiveDraft({
         return {
           ...base,
           hero: seed,
-          options: completions.slice(0, 3),
+          options: completions.slice(0, cardLimit),
           originalPair: chosen,
         };
       }
@@ -3421,7 +3864,7 @@ export function InteractiveDraft({
       return {
         ...base,
         hero: chosen.hero,
-        options: [chosen, ...rest].slice(0, 3),
+        options: [chosen, ...rest].slice(0, cardLimit),
         originalPair: chosen,
         reason: samePair
           ? base.reason
@@ -3438,7 +3881,14 @@ export function InteractiveDraft({
       if (heroKey(h) === heroKey(seed)) return false;
       const { roster, taken } = pickingSide();
       return (
-        relaxed || !roster.length || pairHasDistinctOwners(roster, seed, h, taken)
+        relaxed ||
+        !roster.length ||
+        pairHasDistinctOwners(
+          roster,
+          seed,
+          h,
+          tournamentDraftMode ? undefined : taken,
+        )
       );
     };
     const singleField = field.filter(partnerOk);
@@ -3450,29 +3900,102 @@ export function InteractiveDraft({
     }
     if (!best) return base;
     const chosen = best;
-    if (heroKey(chosen.hero) === heroKey(top.hero)) return base;
+    const rankedField = singleField
+      .map((hero) => score(hero))
+      .sort((a, b) => b.total - a.total || a.hero.localeCompare(b.hero));
+    if (heroKey(chosen.hero) === heroKey(top.hero)) {
+      if (!ours) return base;
+      const seen = new Set<string>();
+      const options = [...base.options, ...rankedField].filter((option) => {
+        if (seen.has(heroKey(option.hero))) return false;
+        seen.add(heroKey(option.hero));
+        return true;
+      });
+      return { ...base, options: options.slice(0, cardLimit) };
+    }
     const seedHeld = seed && heroKey(top.hero) === heroKey(seed);
+    const seen = new Set<string>();
+    const options = [
+      chosen,
+      ...base.options.filter(
+        (o) =>
+          heroKey(o.hero) !== heroKey(chosen.hero) &&
+          singleField.some((h) => heroKey(h) === heroKey(o.hero)),
+      ),
+      ...rankedField,
+    ].filter((option) => {
+      if (seen.has(heroKey(option.hero))) return false;
+      seen.add(heroKey(option.hero));
+      return true;
+    });
     return {
       ...base,
       hero: chosen.hero,
-      options: [
-        chosen,
-        ...base.options.filter(
-          (o) =>
-            heroKey(o.hero) !== heroKey(chosen.hero) &&
-            singleField.some((h) => heroKey(h) === heroKey(o.hero)),
-        ),
-      ].slice(0, 3),
+      options: options.slice(0, cardLimit),
       reason: seedHeld
         ? `${seed} is held — ${chosen.hero} scores ${signedPoints(chosen.total)} as the second half of the pair.`
         : `${chosen.hero} scores ${signedPoints(chosen.total)} on this board — more than the plan's ${top.hero} (${signedPoints(score(top.hero).total)}).`,
     };
   }
 
-  const suggestion = useMemo(
-    () => sweepSuggestion(baseSuggestion()),
+  const matchupScope = useMemo(() => {
+    if (!step) return { names: [] as string[], priority: [] as string[] };
+    const locked = ourLockedPicks(history, planPicks, homeRoster);
+    const livePicks = applyLockedToPlan(
+      livePlanPicks(planPicks, gone),
+      locked,
+      homeRoster,
+      gone,
+    );
+    return matchupHeroesForStep({
+      step,
+      stepIndex,
+      ours,
+      gone,
+      history,
+      theirLikely,
+      planPicks,
+      livePicks,
+      planned,
+      playableBanPriority,
+      theirRoster,
+      homeRoster,
+      locked,
+      takenPlayers: lockedPlayerIds(locked),
+    });
+  }, [
+    step,
+    stepIndex,
+    ours,
+    gone,
+    history,
+    theirLikely,
+    planPicks,
+    planned,
+    playableBanPriority,
+    theirRoster,
+    homeRoster,
+  ]);
+
+  const scopeMissing = useMemo(
+    () =>
+      matchupFetchQueue(scoringMeta, matchupScope.names, matchupScope.priority),
+    [scoringMeta, matchupScope],
+  );
+
+  const matchupFetchFailed =
+    Boolean(matchupError) || matchupTrack?.stage === "failed";
+
+  const provisional = useMemo(
+    () =>
+      watchOnly || scopeMissing.length === 0 || matchupFetchFailed
+        ? sweepSuggestion(baseSuggestion())
+        : null,
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [
+      scopeMissing.length,
+      matchupFetchFailed,
+      watchOnly,
       step,
       planned,
       stepIndex,
@@ -3498,22 +4021,35 @@ export function InteractiveDraft({
       ourHeroPool,
       leaveDiveLive,
       pairPick,
+      tournamentDraftMode,
     ],
   );
 
-  const matchupTargetKey = useMemo(() => {
+  const suggestionHeroes = useMemo(() => {
     const names: string[] = [];
-    for (const action of history) {
-      if (action.kind === "pick") names.push(action.hero);
-    }
-    for (const opt of suggestion?.options ?? []) {
+    for (const opt of provisional?.options ?? []) {
       names.push(opt.hero);
       if (opt.pairWith) names.push(opt.pairWith);
     }
-    for (const pick of theirLikely) names.push(pick.hero);
-    for (const pick of planPicks) names.push(pick.hero);
-    return heroesMissingMatchupLoad(scoringMeta, names).join("|");
-  }, [history, suggestion, theirLikely, planPicks, scoringMeta]);
+    if (provisional?.originalPair) {
+      names.push(provisional.originalPair.hero);
+      if (provisional.originalPair.pairWith) names.push(provisional.originalPair.pairWith);
+    }
+    return names;
+  }, [provisional]);
+
+  const optionMissing = useMemo(
+    () => matchupFetchQueue(scoringMeta, suggestionHeroes, suggestionHeroes),
+    [scoringMeta, suggestionHeroes],
+  );
+
+  const matchupMissing = scopeMissing.length ? scopeMissing : optionMissing;
+  const matchupTargetKey = matchupMissing.join("|");
+  const matchupsLoading = matchupMissing.length > 0 && !matchupFetchFailed;
+  const suggestion =
+    !watchOnly && optionMissing.length > 0 && !matchupFetchFailed
+      ? null
+      : provisional;
 
   useEffect(() => {
     setMatchupPatch(null);
@@ -3523,20 +4059,18 @@ export function InteractiveDraft({
   }, [draftMeta]);
 
   useEffect(() => {
-    const batch = matchupTargetKey.split("|").filter(Boolean).slice(0, 4);
+    const batch = matchupTargetKey.split("|").filter(Boolean).slice(0, MATCHUP_FETCH_BATCH);
     if (!batch.length) {
       setMatchupPending([]);
       setMatchupTrack((current) =>
-        current?.stage === "pulling" || current?.stage === "failed" ? null : current,
+        current?.stage === "pulling" ? null : current,
       );
-      setMatchupError((current) => (current ? null : current));
       return;
     }
     const ctrl = new AbortController();
     let cancelled = false;
     setMatchupPending(batch);
     setMatchupError(null);
-    setMatchupTrack({ stage: "pulling", heroes: batch });
     const url = `/api/matchups?heroes=${encodeURIComponent(batch.join("|"))}`;
     const secret = process.env.NEXT_PUBLIC_SCOUT_API_SECRET?.trim();
     fetch(url, {
@@ -3568,7 +4102,6 @@ export function InteractiveDraft({
           setMatchupPending([]);
           return;
         }
-        setMatchupTrack({ stage: "cached", heroes: batch });
         setMatchupPending([]);
       })
       .catch((err: unknown) => {
@@ -3633,7 +4166,80 @@ export function InteractiveDraft({
       ours && step.kind === "ban",
     );
 
+    function watchSlSuggestion(
+      roster: PlayerScout[],
+      kind: "ban" | "pick",
+      takenPlayers: Set<string>,
+    ): Suggestion | null {
+      const targets = slHeroSuggestions({ roster, gone, takenPlayers });
+      if (!targets.length) return null;
+      const ourLockedHeroes = history
+        .filter((a) => a.side === "our" && a.kind === "pick")
+        .map((a) => a.hero);
+      const theirLockedHeroes = history
+        .filter((a) => a.side === "their" && a.kind === "pick")
+        .map((a) => a.hero);
+      const banning = kind === "ban";
+      const options = targets.map((target) => ({
+        ...buildPickScorecard({
+          hero: target.hero,
+          table: scoringMeta,
+          gone,
+          map,
+          ourPickCount,
+          inPlan: false,
+          fromAlt: false,
+          planRole: null,
+          lockedAllies: banning ? theirLockedHeroes : ourLockedHeroes,
+          theirLocked: banning ? ourLockedHeroes : theirLockedHeroes,
+          answeringTeamPool: banning ? ourHeroPool : theirHeroPool,
+          answerPerspective: banning ? "ours" : "theirs",
+          theirLikely,
+          banPriority: playableBanPriority,
+          theirRoster,
+          comfort: target.comfort,
+          comfortWho: target.player,
+          swapDelta: 0,
+          takeAndRebuild: false,
+          kind,
+          lastPick,
+        }),
+        player: target.player,
+      }));
+      const first = targets[0];
+      const games =
+        first.games > 0 ? ` (${first.games} Storm League games)` : "";
+      return {
+        hero: first.hero,
+        badge: banning ? "Suggested bans" : "Suggested picks",
+        showOurPlan: true,
+        planPicks: livePicks,
+        compLine: comp,
+        expectLine: expect,
+        cautionLine: null,
+        swapLine: null,
+        reason: banning
+          ? `Ban ${first.hero} — ${first.player} is comfortable on it in Storm League${games}. One suggestion per opponent.`
+          : `${first.player}: ${first.hero} from Storm League history${games}. One suggestion per player.`,
+        options,
+      };
+    }
+
+    if (useStormLeague && !ours) {
+      const theirTaken = lockedPlayerIds(
+        history
+          .filter((action) => action.side === "their" && action.kind === "pick")
+          .map((action) => ({ hero: action.hero, player: action.player ?? null })),
+      );
+      return watchSlSuggestion(
+        step.kind === "ban" ? homeRoster : theirRoster,
+        step.kind,
+        step.kind === "pick" ? theirTaken : new Set(),
+      );
+    }
+
     if (ours && step.kind === "ban") {
+      if (useStormLeague) return watchSlSuggestion(theirRoster, "ban", new Set());
       const ourLockedHeroes = history
         .filter((a) => a.side === "our" && a.kind === "pick")
         .map((a) => a.hero);
@@ -3699,7 +4305,7 @@ export function InteractiveDraft({
           };
         })
         .sort((a, b) => b.total - a.total || a.hero.localeCompare(b.hero))
-        .slice(0, 3);
+        .slice(0, 6);
       const hero = options[0]?.hero;
       if (!hero) return null;
       const banReason =
@@ -3785,6 +4391,10 @@ export function InteractiveDraft({
               const matched = matchTheirPlanSeat(hero, theirLikely);
               const seatWho = theirOwnerName(hero, theirLikely);
               const sig = comfortSignal(theirRoster, hero, seatWho);
+              const theirSeats: LockedPick[] = history
+                .filter((a) => a.side === "their" && a.kind === "pick")
+                .map((a) => ({ hero: a.hero, player: displayPlayer(a.player) }));
+              const reseat = reseatFor(theirRoster, theirSeats, hero, theirLikely);
               const card = buildPickScorecard({
                 hero,
                 table: scoringMeta,
@@ -3798,11 +4408,12 @@ export function InteractiveDraft({
                 theirLocked: ourLockedHeroes,
                 answeringTeamPool: ourHeroPool,
                 answerPerspective: "ours",
-                theirLikely: [],
+                theirLikely: planPicks,
                 banPriority: [],
                 comfort: sig.comfort,
                 comfortWho: sig.who,
-                swapDelta: 0,
+                swapDelta: reseat.swapDelta,
+                swapNote: reseat.swapNote,
                 takeAndRebuild: false,
                 kind: "pick",
                 lastPick: false,
@@ -3922,6 +4533,13 @@ export function InteractiveDraft({
           );
           // Ban: if we take it, they answer. Pick: if they take it, we answer.
           const theyAnswer = step.kind === "ban";
+          const theirSeats: LockedPick[] = history
+            .filter((a) => a.side === "their" && a.kind === "pick")
+            .map((a) => ({ hero: a.hero, player: displayPlayer(a.player) }));
+          const reseat =
+            step.kind === "pick"
+              ? reseatFor(theirRoster, theirSeats, h, theirLikely)
+              : { swapDelta: 0, swapNote: null };
           return {
             ...buildPickScorecard({
               hero: h,
@@ -3936,11 +4554,12 @@ export function InteractiveDraft({
               theirLocked: theyAnswer ? theirLockedHeroes : ourLockedHeroes,
               answeringTeamPool: theyAnswer ? theirHeroPool : ourHeroPool,
               answerPerspective: theyAnswer ? "theirs" : "ours",
-              theirLikely: [],
+              theirLikely: step.kind === "pick" ? planPicks : [],
               banPriority: [],
               comfort: sig.comfort,
               comfortWho: sig.who,
-              swapDelta: 0,
+              swapDelta: reseat.swapDelta,
+              swapNote: reseat.swapNote,
               takeAndRebuild: false,
               kind: step.kind,
               lastPick,
@@ -3990,6 +4609,7 @@ export function InteractiveDraft({
 
     // Our pick — plan heroes + seat alternatives, scored for this step.
     const takenPlayers = lockedPlayerIds(locked);
+    if (useStormLeague) return watchSlSuggestion(homeRoster, "pick", takenPlayers);
     const candMeta = pickCandidates(livePicks, gone, homeRoster).filter((c) => {
       const who = displayPlayer(c.player);
       // Seat already filled — don't offer another hero for that player.
@@ -4024,6 +4644,7 @@ export function InteractiveDraft({
             .flatMap((s) => s.cands)
             .find((c) => heroKey(c.hero) === k);
           const sig = comfortSignal(homeRoster, hero, meta?.player ?? null);
+          const reseat = reseatFor(homeRoster, locked, hero, planPicks);
           const card = buildPickScorecard({
             hero,
             table: scoringMeta,
@@ -4044,7 +4665,8 @@ export function InteractiveDraft({
             theirRoster,
             comfort: sig.comfort,
             comfortWho: sig.who,
-            swapDelta: 0,
+            swapDelta: reseat.swapDelta,
+            swapNote: reseat.swapNote,
             takeAndRebuild: shouldTakeAndRebuild(scoringMeta, hero),
             kind: "pick",
             lastPick: false,
@@ -4136,7 +4758,7 @@ export function InteractiveDraft({
               pairFactors: pair.pairFactors,
             };
           };
-          const options = pairSet.slice(0, 3).map(toOption);
+          const options = pairSet.slice(0, 6).map(toOption);
           const originalPair = toOption(pairs[0]);
           const best = pairSet[0];
           const shownPlan = showSuggestionOnPlan(
@@ -4244,7 +4866,8 @@ export function InteractiveDraft({
 
     const scorecards = candidates.map((hero) => {
       const cand = metaOf(hero);
-      const swap = swapFor(hero);
+      const reseat = reseatFor(homeRoster, locked, hero, planPicks);
+      const swap = reseat.swapNote ? null : swapFor(hero);
       const sig = comfortSignal(
         homeRoster,
         hero,
@@ -4269,7 +4892,8 @@ export function InteractiveDraft({
           theirRoster,
           comfort: sig.comfort,
           comfortWho: sig.who,
-          swapDelta: swap?.comfortDelta ?? 0,
+          swapDelta: reseat.swapNote ? reseat.swapDelta : (swap?.comfortDelta ?? 0),
+          swapNote: reseat.swapNote,
           takeAndRebuild: shouldTakeAndRebuild(scoringMeta, hero),
           kind: "pick",
           lastPick,
@@ -4318,7 +4942,7 @@ export function InteractiveDraft({
         };
       })
       .sort((a, b) => b.total - a.total || a.hero.localeCompare(b.hero))
-      .slice(0, 3);
+      .slice(0, 6);
 
     const hero = options[0]?.hero ?? ranked[0];
     const cand = metaOf(hero);
@@ -4593,7 +5217,8 @@ export function InteractiveDraft({
     });
   }, [allHeroes, gone, filter]);
 
-  function lock(hero: string, reason?: string) {
+  function lock(hero: string, reason?: string, fromWatch = false) {
+    if (watchOnly && !fromWatch) return;
     if (!step || isGone(hero, gone)) return;
 
     if (pairWindow && step.kind === "pick") {
@@ -4699,6 +5324,8 @@ export function InteractiveDraft({
             ours ? homeRoster : theirRoster,
             ours ? planPicks : theirLikely,
             replaySeats,
+            tournamentDraftMode,
+            guessSeats,
           );
         });
         setPairPick([]);
@@ -4712,12 +5339,16 @@ export function InteractiveDraft({
         ? (ours ? ourBanCount : theirBanCount) + 1
         : (ours ? ourPickCount : theirPickCount) + 1;
     const lockedSoFar = ourLockedPicks(history, planPicks, homeRoster);
+    const sideKey = ours ? "our" : "their";
+    const plated = step.kind === "pick" ? platePlayer(sideKey, hero) : null;
     const player =
       step.kind !== "pick"
         ? null
-        : ours
-          ? ownerForHero(hero, planPicks, homeRoster, lockedSoFar)
-          : theirOwnerForHero(hero, theirLikely, history, theirRoster);
+        : fromWatch
+          ? plated
+          : ours
+            ? ownerForHero(hero, planPicks, homeRoster, lockedSoFar)
+            : theirOwnerForHero(hero, theirLikely, history, theirRoster);
 
     let stepScore: StepScore | undefined;
     let breakdown: BoardBreakdown | undefined;
@@ -4853,6 +5484,7 @@ export function InteractiveDraft({
           ordinal,
           hero,
           player,
+          draftedFor: player,
           reason,
           score: stepScore,
           breakdown,
@@ -4865,9 +5497,22 @@ export function InteractiveDraft({
         ours ? homeRoster : theirRoster,
         ours ? planPicks : theirLikely,
         replaySeats,
+        tournamentDraftMode,
+        guessSeats,
       );
     });
     setFilter("");
+  }
+
+  function platePlayer(side: "our" | "their", hero: string): string | null {
+    const heroes = side === "our" ? observedPicks?.ourPicks : observedPicks?.theirPicks;
+    const players =
+      side === "our" ? observedPicks?.ourPickPlayers : observedPicks?.theirPickPlayers;
+    if (!heroes) return null;
+    const index = heroes.findIndex((name) => heroKey(name) === heroKey(hero));
+    if (index < 0) return null;
+    const name = players?.[index]?.trim();
+    return name || null;
   }
 
   /** Next replay action to play; stays put after undo so the user can explore alternatives. */
@@ -4890,6 +5535,79 @@ export function InteractiveDraft({
     lock(next.hero, "Played in the replay");
   });
 
+  const screenCursor = useRef(0);
+  const screenHadLocks = useRef(false);
+  const screenIndex = history.length + pairPick.length;
+  useEffect(() => {
+    if (replay || !screen) return;
+    if (screen.length === 0) {
+      screenCursor.current = 0;
+      if (screenHadLocks.current) {
+        screenHadLocks.current = false;
+        setHistory([]);
+        setPairPick([]);
+      }
+      return;
+    }
+    screenHadLocks.current = true;
+    setHistory((prev) => {
+      let changed = false;
+      const next = prev.map((action, index) => {
+        const fromScreen = screen[index];
+        if (
+          !fromScreen ||
+          fromScreen.kind !== action.kind ||
+          fromScreen.side !== action.side
+        ) {
+          return action;
+        }
+        const heroArrived =
+          action.hero === UNSEEN_BAN &&
+          fromScreen.hero !== UNSEEN_BAN;
+        const plated = platePlayer(action.side, action.hero);
+        const playerArrived =
+          (heroKey(action.hero) === heroKey(fromScreen.hero) &&
+            Boolean(fromScreen.player) &&
+            fromScreen.player !== action.player) ||
+          Boolean(plated && plated !== action.player);
+        if (!heroArrived && !playerArrived) return action;
+        changed = true;
+        const player = plated ?? fromScreen.player ?? action.player;
+        return {
+          ...action,
+          hero: heroArrived ? fromScreen.hero : action.hero,
+          player,
+          draftedFor: player ?? action.draftedFor,
+          reason: "Locked on the shared screen",
+        };
+      });
+      return changed ? next : prev;
+    });
+    if (screenIndex !== screenCursor.current || screenIndex >= screen.length || !step) return;
+    const next = screen[screenIndex];
+    if (next.kind !== step.kind || next.side !== (ours ? "our" : "their")) return;
+    if (next.hero === UNSEEN_BAN) {
+      screenCursor.current = screenIndex + 1;
+      setHistory((prev) => [
+        ...prev,
+        {
+          side: next.side,
+          kind: "ban",
+          ordinal:
+            prev.filter((action) => action.side === next.side && action.kind === "ban").length +
+            1,
+          hero: UNSEEN_BAN,
+          player: null,
+          reason: "Already locked before it was on screen",
+        },
+      ]);
+      return;
+    }
+    if (isGone(next.hero, gone)) return;
+    screenCursor.current = screenIndex + 1;
+    lock(next.hero, "Locked on the shared screen", true);
+  });
+
   function undo() {
     if (pairPick.length) {
       setPairPick([]);
@@ -4908,6 +5626,8 @@ export function InteractiveDraft({
         removed.side === "our" ? homeRoster : theirRoster,
         removed.side === "our" ? planPicks : theirLikely,
         replaySeats,
+        tournamentDraftMode,
+        guessSeats,
       );
     });
     setDeviationNote(null);
@@ -4921,8 +5641,22 @@ export function InteractiveDraft({
 
   const ourBans = slotsFor(history, "our", "ban", 3);
   const theirBans = slotsFor(history, "their", "ban", 3);
-  const ourPicks = slotsFor(stampedHistory, "our", "pick", 5);
-  const theirPicks = slotsFor(stampedHistory, "their", "pick", 5);
+  const ourPicks = watchOnly
+    ? fillUnplacedLocks(
+        slotsFor(stampedHistory, "our", "pick", 5),
+        observedPicks?.ourPicks ?? [],
+        observedPicks?.ourPickPlayers ?? [],
+        "our",
+      )
+    : slotsFor(stampedHistory, "our", "pick", 5);
+  const theirPicks = watchOnly
+    ? fillUnplacedLocks(
+        slotsFor(stampedHistory, "their", "pick", 5),
+        observedPicks?.theirPicks ?? [],
+        observedPicks?.theirPickPlayers ?? [],
+        "their",
+      )
+    : slotsFor(stampedHistory, "their", "pick", 5);
   const heldHero = pairWindow ? pairPick[0] : undefined;
   const heldSlots = ours ? ourPicks : theirPicks;
   const heldIndex = heldHero ? heldSlots.indexOf(null) : -1;
@@ -4955,11 +5689,12 @@ export function InteractiveDraft({
         kind: step.kind,
         ordinal: stepOrdinal,
         pair: pairWindow,
+        watch: watchOnly,
       });
 
   return (
     <div className="relative space-y-4 overflow-visible rounded-md border border-[#2a3a48] bg-[#0f1821] p-4 text-[#e8eef2]">
-      {matchupTrack ? (
+      {matchupTrack?.stage === "failed" ? (
         <MatchupTracker
           track={matchupTrack}
           error={matchupError}
@@ -4980,22 +5715,26 @@ export function InteractiveDraft({
             />
             <span>Tournament draft mode</span>
           </label>
-          <button
-            type="button"
-            onClick={undo}
-            disabled={history.length === 0 && pairPick.length === 0}
-            className="rounded-md border border-[#e11d48]/60 bg-[#e11d48]/15 px-3 py-1.5 text-sm font-semibold text-[#fecdd3] disabled:opacity-40"
-          >
-            Undo last
-          </button>
-          <button
-            type="button"
-            onClick={reset}
-            disabled={history.length === 0}
-            className="rounded-md border border-[#3d5163] px-3 py-1.5 text-sm font-semibold text-[#c5d4e0] disabled:opacity-40"
-          >
-            Reset draft
-          </button>
+          {!watchOnly && (
+            <>
+              <button
+                type="button"
+                onClick={undo}
+                disabled={history.length === 0 && pairPick.length === 0}
+                className="rounded-md border border-[#e11d48]/60 bg-[#e11d48]/15 px-3 py-1.5 text-sm font-semibold text-[#fecdd3] disabled:opacity-40"
+              >
+                Undo last
+              </button>
+              <button
+                type="button"
+                onClick={reset}
+                disabled={history.length === 0}
+                className="rounded-md border border-[#3d5163] px-3 py-1.5 text-sm font-semibold text-[#c5d4e0] disabled:opacity-40"
+              >
+                Reset draft
+              </button>
+            </>
+          )}
         </div>
       </div>
 
@@ -5005,6 +5744,7 @@ export function InteractiveDraft({
         picks={theirPicks}
         heldIndex={ours ? -1 : heldIndex}
         accent="enemy"
+        roster={theirRoster}
       />
       <DraftSideRow
         label={ourLabel}
@@ -5012,6 +5752,7 @@ export function InteractiveDraft({
         picks={ourPicks}
         heldIndex={ours ? heldIndex : -1}
         accent="ally"
+        roster={homeRoster}
       />
 
       {remainingBans.length > 0 && (
@@ -5022,6 +5763,16 @@ export function InteractiveDraft({
           <ul className="flex flex-wrap gap-3">
             {remainingBans.map((b, i) => (
               <li key={b.hero} className="flex flex-col items-center gap-1">
+                {watchOnly ? (
+                  <HeroFace
+                    hero={b.hero}
+                    kind="select"
+                    size="sm"
+                    banned
+                    label={`${i + 1}. ${b.hero}`}
+                    title={b.reason}
+                  />
+                ) : (
                 <button
                   type="button"
                   disabled={done || !step || step.kind !== "ban"}
@@ -5037,6 +5788,7 @@ export function InteractiveDraft({
                     label={`${i + 1}. ${b.hero}`}
                   />
                 </button>
+                )}
               </li>
             ))}
           </ul>
@@ -5052,7 +5804,9 @@ export function InteractiveDraft({
         {done ? (
           <div className="space-y-3">
             <p className="text-sm font-semibold text-[#9dceb0]">
-              Draft walk complete. Undo if something was logged wrong.
+              {watchOnly
+                ? "Draft complete. Grade and win chance are from the heroes on screen."
+                : "Draft walk complete. Undo if something was logged wrong."}
             </p>
             {draftReport && <DraftReportCardView report={draftReport} />}
             {deviationNote && (
@@ -5142,14 +5896,30 @@ export function InteractiveDraft({
                 Step {stepIndex + 1} / {DRAFT_ORDER.length}
               </p>
             </div>
+            {watchOnly && (
+              <p className="text-sm text-[#c5d4e0]">
+                {tournamentDraftMode && !stormLeagueOnly
+                  ? "Tournament mode uses NGS hero pools. Heroes lock from the shared screen."
+                  : tournamentDraftMode
+                    ? "Loading NGS hero pools. Heroes lock from the shared screen."
+                  : ours && step?.kind === "ban"
+                    ? "Ban suggestions are each opponent's Storm League comfort. Heroes lock from the shared screen."
+                    : ours && step?.kind === "pick"
+                      ? "One Storm League suggestion for each player still to lock. Heroes lock from the shared screen."
+                      : "Storm League history only. Heroes lock from the shared screen."}
+              </p>
+            )}
 
             {deviationNote && <DeviationCallout note={deviationNote} />}
             {pairWindow && pairPick.length > 0 && (
               <div className="rounded-md border border-[var(--accent)]/40 bg-[var(--accent)]/10 px-3 py-2 text-sm text-[#9dceb0]">
-                Pair in progress: {pairPick.join(" + ")} — choose one more hero to lock the duo.
+                {watchOnly
+                  ? `Pair in progress: ${pairPick.join(" + ")} — the next lock from the screen completes it.`
+                  : `Pair in progress: ${pairPick.join(" + ")} — choose one more hero to lock the duo.`}
               </div>
             )}
 
+            {!watchOnly && (
             <div className="space-y-1.5">
               <label
                 htmlFor="hero-search"
@@ -5173,16 +5943,38 @@ export function InteractiveDraft({
                 className="h-11 w-full rounded-md border border-[#3d5163] bg-[#0f1821] px-3 text-base text-[#e8eef2] outline-none placeholder:text-[#5a6b78] focus:border-[var(--accent)] focus:ring-1 focus:ring-[var(--accent)]"
               />
             </div>
+            )}
+
+            {matchupsLoading && !watchOnly ? (
+              <div
+                role="status"
+                aria-live="polite"
+                className="rounded-md border border-[#3d5163] bg-[#162230] px-3 py-3 text-sm text-[#dfeaf4]"
+              >
+                <p className="font-semibold text-[#e8eef2]">
+                  Loading Storm League matchups before scoring…
+                </p>
+                <p className="mt-1 text-[#c5d4e0]">
+                  {matchupPending.length > 0
+                    ? `Pulling ${matchupPending.join(", ")} (${matchupMissing.length} left in queue)`
+                    : `${matchupMissing.length} hero${matchupMissing.length === 1 ? "" : "es"} queued`}
+                </p>
+              </div>
+            ) : null}
+
+            {watchOnly && !suggestion && step ? (
+              <p className="text-sm text-[#c5d4e0]">
+                Reading the names on screen. A Storm League suggestion for each player shows up as soon as those histories load.
+              </p>
+            ) : null}
 
             {suggestion && (
               <div className="flex flex-wrap items-start gap-4 rounded-md border border-[var(--accent)]/40 bg-[var(--accent)]/10 px-3 py-3">
-                {!matchupTrack ? (
-                  <MissingDuoBanner
-                    options={suggestion.options}
-                    pending={matchupPending}
-                    error={matchupError}
-                  />
-                ) : null}
+                <MissingDuoBanner
+                  options={suggestion.options}
+                  pending={matchupPending}
+                  error={matchupError}
+                />
                 <div className="flex flex-wrap items-start gap-3">
                   {suggestion.options.map((opt, i) => (
                     <ScoredHeroOption
@@ -5205,6 +5997,7 @@ export function InteractiveDraft({
                               : "Alt #3"
                       }
                       banned={step?.kind === "ban"}
+                      canLock={!watchOnly}
                       onLock={() =>
                         lock(
                           pairCardClickHero(opt.hero, opt.pairWith, pairPick),
@@ -5300,6 +6093,7 @@ export function InteractiveDraft({
                       )}
                     </>
                   )}
+                  {!watchOnly && (
                   <button
                     type="button"
                     onClick={() => lock(suggestion.hero, suggestion.reason)}
@@ -5321,10 +6115,12 @@ export function InteractiveDraft({
                       ? ` (then ${suggestion.options[0].pairWith})`
                       : ""}
                   </button>
+                  )}
                 </div>
               </div>
             )}
 
+            {!watchOnly && (
             <div className="space-y-2">
               <p className="text-xs font-semibold uppercase tracking-wide text-[#8aa0b2]">
                 All heroes still available
@@ -5362,6 +6158,7 @@ export function InteractiveDraft({
                 })}
               </div>
             </div>
+            )}
           </div>
         )}
       </div>
@@ -5936,6 +6733,52 @@ function DeviationWhyHeader({
   );
 }
 
+/** Pointer must rest this long before a hover card opens. Usual tooltip delay. */
+const TOOLTIP_HOVER_MS = 400;
+
+function useDelayedTooltip() {
+  const timer = useRef<number | null>(null);
+  const point = useRef({ x: 0, y: 0 });
+  const open = useRef(false);
+
+  const clearTimer = () => {
+    if (timer.current != null) window.clearTimeout(timer.current);
+    timer.current = null;
+  };
+
+  useEffect(() => clearTimer, []);
+
+  return {
+    /** Begin the delay. Moves before it opens only change where it will land. */
+    hover(x: number, y: number, show: (x: number, y: number) => void) {
+      point.current = { x, y };
+      if (open.current) {
+        show(x, y);
+        return;
+      }
+      if (timer.current != null) return;
+      timer.current = window.setTimeout(() => {
+        timer.current = null;
+        open.current = true;
+        show(point.current.x, point.current.y);
+      }, TOOLTIP_HOVER_MS);
+    },
+    focus(x: number, y: number, show: (x: number, y: number) => void) {
+      clearTimer();
+      open.current = true;
+      show(x, y);
+    },
+    /** Pointer left before the card opened. */
+    cancelPending() {
+      clearTimer();
+    },
+    close() {
+      clearTimer();
+      open.current = false;
+    },
+  };
+}
+
 function HoverExplain({
   help,
   className,
@@ -5947,6 +6790,7 @@ function HoverExplain({
 }) {
   const [open, setOpen] = useState(false);
   const [pos, setPos] = useState({ left: 12, top: 12 });
+  const tip = useDelayedTooltip();
 
   const place = (x: number, y: number) => {
     const width = 352;
@@ -5965,15 +6809,18 @@ function HoverExplain({
     setPos({ left, top });
   };
 
-  const onMouse = (event: MouseEvent<HTMLSpanElement>) => {
-    place(event.clientX, event.clientY);
+  const reveal = (x: number, y: number) => {
+    place(x, y);
     setOpen(true);
+  };
+
+  const onMouse = (event: MouseEvent<HTMLSpanElement>) => {
+    tip.hover(event.clientX, event.clientY, reveal);
   };
 
   const onFocus = (event: FocusEvent<HTMLSpanElement>) => {
     const rect = event.currentTarget.getBoundingClientRect();
-    place(rect.left + rect.width / 2, rect.bottom);
-    setOpen(true);
+    tip.focus(rect.left + rect.width / 2, rect.bottom, reveal);
   };
 
   return (
@@ -5983,9 +6830,15 @@ function HoverExplain({
         aria-label={help}
         onMouseEnter={onMouse}
         onMouseMove={onMouse}
-        onMouseLeave={() => setOpen(false)}
+        onMouseLeave={() => {
+          tip.close();
+          setOpen(false);
+        }}
         onFocus={onFocus}
-        onBlur={() => setOpen(false)}
+        onBlur={() => {
+          tip.close();
+          setOpen(false);
+        }}
       >
         {children}
       </span>
@@ -6006,12 +6859,14 @@ function ScoredHeroOption({
   rank,
   badge,
   banned,
+  canLock = true,
   onLock,
 }: {
   option: ScoredOption;
   rank: number;
   badge: string;
   banned: boolean;
+  canLock?: boolean;
   onLock: () => void;
 }) {
   const primary = rank === 1;
@@ -6019,6 +6874,7 @@ function ScoredHeroOption({
   const pairFactors = option.pairFactors ?? [];
   const [showScorecard, setShowScorecard] = useState(false);
   const [scorecardPos, setScorecardPos] = useState({ left: 12, top: 12 });
+  const tip = useDelayedTooltip();
 
   const placeScorecard = (x: number, y: number) => {
     const pad = 12;
@@ -6030,28 +6886,39 @@ function ScoredHeroOption({
     setScorecardPos({ left, top: y + 16 });
   };
 
-  const openScorecard = (event: MouseEvent<HTMLButtonElement>) => {
-    placeScorecard(event.clientX, event.clientY);
+  const revealScorecard = (x: number, y: number) => {
+    placeScorecard(x, y);
     setShowScorecard(true);
+  };
+
+  const openScorecard = (event: MouseEvent<HTMLButtonElement>) => {
+    tip.hover(event.clientX, event.clientY, revealScorecard);
   };
 
   const focusScorecard = (event: FocusEvent<HTMLButtonElement>) => {
     const rect = event.currentTarget.getBoundingClientRect();
-    placeScorecard(rect.left + rect.width / 2, rect.bottom);
-    setShowScorecard(true);
+    tip.focus(rect.left + rect.width / 2, rect.bottom, revealScorecard);
   };
 
   return (
     <div className="flex flex-col items-center">
       <button
         type="button"
-        onClick={onLock}
+        onClick={canLock ? onLock : undefined}
         onMouseEnter={openScorecard}
         onMouseMove={openScorecard}
-        onMouseLeave={() => setShowScorecard(false)}
+        onMouseLeave={() => {
+          tip.close();
+          setShowScorecard(false);
+        }}
         onFocus={focusScorecard}
-        onBlur={() => setShowScorecard(false)}
-        className={`flex w-[12.5rem] flex-col items-center gap-1 rounded-md p-1.5 transition hover:bg-[#1e3040]/80 ${
+        onBlur={() => {
+          tip.close();
+          setShowScorecard(false);
+        }}
+        className={`flex w-[12.5rem] flex-col items-center gap-1 rounded-md p-1.5 ${
+          canLock ? "transition hover:bg-[#1e3040]/80" : "cursor-default"
+        } ${
           primary ? "ring-2 ring-[var(--accent)]" : "ring-1 ring-[#3d5163]"
         }`}
       >
@@ -6254,7 +7121,9 @@ function MatchupTracker({
   );
 }
 
-function missingDuoLabelsForOption(option: ScoredOption): string[] {
+function missingDuoEntriesForOption(
+  option: ScoredOption,
+): { label: string; reason: string }[] {
   const texts: string[] = [];
   const take = (factors?: { detail: string; lines?: string[] }[]) => {
     for (const factor of factors ?? []) {
@@ -6266,13 +7135,16 @@ function missingDuoLabelsForOption(option: ScoredOption): string[] {
   take(option.firstSoloFactors);
   take(option.secondSoloFactors);
   take(option.pairFactors);
-  const out: string[] = [];
+  const out: { label: string; reason: string }[] = [];
   const seen = new Set<string>();
   for (const text of texts) {
     const label = missingDuoLabel(text);
     if (!label || seen.has(label)) continue;
     seen.add(label);
-    out.push(label);
+    out.push({
+      label,
+      reason: missingDuoReason(text) ?? "scored as 0",
+    });
   }
   return out;
 }
@@ -6287,27 +7159,43 @@ function MissingDuoBanner({
   error: string | null;
 }) {
   const seen = new Set<string>();
-  const labels: string[] = [];
+  const entries: { label: string; reason: string }[] = [];
   for (const opt of options) {
-    for (const label of missingDuoLabelsForOption(opt)) {
-      if (seen.has(label)) continue;
-      seen.add(label);
-      labels.push(label);
+    for (const entry of missingDuoEntriesForOption(opt)) {
+      if (seen.has(entry.label)) continue;
+      seen.add(entry.label);
+      entries.push(entry);
     }
   }
-  if (!labels.length && !error) return null;
+  const stillFetching = entries.filter((e) => /fetching/i.test(e.reason));
+  const settled = entries.filter((e) => !/fetching/i.test(e.reason));
+  if (!entries.length && !error && !pending.length) return null;
   return (
     <div
       role="alert"
       className="basis-full rounded-md border-2 border-red-500 bg-red-950 px-3 py-3 text-red-50"
     >
       <p className="text-sm font-bold uppercase tracking-wide text-red-300">
-        Matchup data missing
+        Matchup data gap
       </p>
-      {labels.length > 0 ? (
+      {pending.length > 0 ? (
         <p className="mt-1 text-base font-semibold leading-snug">
-          {labels.join(" · ")} — scored as 0 until a Storm League sample is loaded.
+          Fetching Storm League: {pending.join(", ")}…
         </p>
+      ) : null}
+      {stillFetching.length > 0 && pending.length === 0 ? (
+        <p className="mt-1 text-base font-semibold leading-snug">
+          {stillFetching.map((e) => `${e.label} (${e.reason})`).join(" · ")}
+        </p>
+      ) : null}
+      {settled.length > 0 ? (
+        <ul className="mt-1 space-y-1 text-base font-semibold leading-snug">
+          {settled.map((e) => (
+            <li key={e.label}>
+              {e.label}: {e.reason} → scored as 0
+            </li>
+          ))}
+        </ul>
       ) : null}
       {error && pending.length === 0 ? (
         <p className="mt-1 text-sm font-semibold text-red-200">{error}</p>
@@ -6373,12 +7261,41 @@ function ScoreFactorList({ factors }: { factors: ScoreFactor[] }) {
   );
 }
 
+/** Finished board: comfort is whoever plays the hero now, not who it was drafted for. */
+function breakdownForCurrentSeat(
+  action: BoardAction,
+  roster: PlayerScout[],
+): BoardBreakdown | undefined {
+  const breakdown = action.breakdown;
+  if (!breakdown || action.kind !== "pick" || !roster.length) return breakdown;
+  const who = displayPlayer(action.player);
+  if (!who) return breakdown;
+  const comfort = playerComfortOn(roster, action.hero, who);
+  const points = Math.round(comfortPickPoints(comfort));
+  const factors = breakdown.factors.map((factor) =>
+    factor.id !== "comfort"
+      ? factor
+      : {
+          ...factor,
+          points,
+          detail: `${who} · seat comfort ${(comfort * 100).toFixed(0)}`,
+          formula: `min(${COMFORT_PICK_CAP}, ${comfort.toFixed(2)} × ${COMFORT_PICK_MULTIPLIER}) = ${comfortPickPoints(comfort).toFixed(2)} → rounded to ${points}`,
+        },
+  );
+  if (!factors.some((factor) => factor.id === "comfort")) return breakdown;
+  return {
+    total: factors.reduce((sum, factor) => sum + factor.points, 0),
+    factors,
+  };
+}
+
 function DraftSideRow({
   label,
   bans,
   picks,
   heldIndex = -1,
   accent,
+  roster = [],
 }: {
   label: string;
   bans: (BoardAction | null)[];
@@ -6386,8 +7303,18 @@ function DraftSideRow({
   /** Slot showing the first hero of a double pick that is not locked yet. */
   heldIndex?: number;
   accent: "ally" | "enemy";
+  /** This side's five — marks seats whose owner has no games on the hero. */
+  roster?: PlayerScout[];
 }) {
   const banRing = accent === "enemy" ? "ring-red-700/80" : "ring-teal-700/80";
+  const blind = (p: BoardAction | null) =>
+    Boolean(
+      p &&
+        p.kind === "pick" &&
+        p.player &&
+        roster.length &&
+        playerComfortOn(roster, p.hero, displayPlayer(p.player)) <= 0,
+    );
   return (
     <div className="space-y-2">
       <p
@@ -6413,12 +7340,17 @@ function DraftSideRow({
           {picks.map((p, i) => (
             <EmptyOrFace
               key={`pick-${i}`}
-              action={p}
+              action={
+                p
+                  ? { ...p, breakdown: breakdownForCurrentSeat(p, roster) }
+                  : p
+              }
               ring={
                 accent === "enemy" ? "ring-red-500/50" : "ring-teal-500/50"
               }
               placeholder="Pick"
               held={i === heldIndex}
+              blind={blind(p)}
             />
           ))}
         </div>
@@ -6448,16 +7380,20 @@ function EmptyOrFace({
   ring,
   placeholder,
   held,
+  blind,
 }: {
   action: BoardAction | null;
   banned?: boolean;
   ring: string;
   placeholder: string;
   held?: boolean;
+  /** Seated, but the owner has no games on this hero. */
+  blind?: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const [pos, setPos] = useState({ left: 12, top: 12 });
   const closeTimer = useRef<number | null>(null);
+  const tip = useDelayedTooltip();
   const breakdown = action?.breakdown;
 
   const cancelClose = () => {
@@ -6465,21 +7401,36 @@ function EmptyOrFace({
   };
   const scheduleClose = () => {
     cancelClose();
-    closeTimer.current = window.setTimeout(() => setOpen(false), 120);
+    tip.cancelPending();
+    closeTimer.current = window.setTimeout(() => {
+      tip.close();
+      setOpen(false);
+    }, 120);
   };
   const showAt = (x: number, y: number) => {
     if (!breakdown?.factors.length) return;
     cancelClose();
-    setPos(placeScorecardNear(x, y));
-    setOpen(true);
+    tip.hover(x, y, (px, py) => {
+      setPos(placeScorecardNear(px, py));
+      setOpen(true);
+    });
+  };
+  const showNow = (x: number, y: number) => {
+    if (!breakdown?.factors.length) return;
+    cancelClose();
+    tip.focus(x, y, (px, py) => {
+      setPos(placeScorecardNear(px, py));
+      setOpen(true);
+    });
   };
 
-  if (!action) {
+  if (!action || action.hero === UNSEEN_BAN) {
     return (
       <div
         className={`flex h-20 w-14 items-center justify-center rounded-sm border border-dashed border-[#3d5163] bg-[#162230] text-[10px] uppercase tracking-wide text-[#5a6b78] ring-1 ${ring}`}
+        title={action ? "Ban already locked before it was on screen" : undefined}
       >
-        {placeholder}
+        {action ? "—" : placeholder}
       </div>
     );
   }
@@ -6487,9 +7438,16 @@ function EmptyOrFace({
     !banned && action.kind === "pick"
       ? displayPlayer(action.player)
       : null;
+  const draftedFor =
+    !banned && action.kind === "pick"
+      ? displayPlayer(action.draftedFor ?? null)
+      : null;
+  const moved = Boolean(draftedFor && who && draftedFor !== who);
   const nativeTitle = breakdown
     ? undefined
-    : `${action.kind} · ${action.hero}${who ? ` (${who})` : ""}${action.reason ? ` — ${action.reason}` : ""}`;
+    : `${action.kind} · ${action.hero}${who ? ` (${who})` : ""}${
+        moved ? `, drafted for ${draftedFor}` : ""
+      }${action.reason ? ` — ${action.reason}` : ""}`;
   return (
     <div
       className={`flex flex-col items-center rounded-sm ${
@@ -6499,7 +7457,7 @@ function EmptyOrFace({
       onMouseLeave={scheduleClose}
       onFocus={(event) => {
         const rect = event.currentTarget.getBoundingClientRect();
-        showAt(rect.left + rect.width / 2, rect.bottom);
+        showNow(rect.left + rect.width / 2, rect.bottom);
       }}
       onBlur={scheduleClose}
       tabIndex={breakdown ? 0 : undefined}
@@ -6537,21 +7495,28 @@ function EmptyOrFace({
         </span>
       )}
       {who ? (
-        <span className="mt-0.5 max-w-[3.75rem] truncate text-center text-[10px] font-semibold leading-tight text-[#9dceb0]">
-          {who}
+        <span
+          className={`mt-0.5 max-w-[3.75rem] truncate text-center text-[10px] font-semibold leading-tight ${
+            blind ? "text-amber-300" : "text-[#9dceb0]"
+          }`}
+          title={
+            moved
+              ? `Drafted for ${draftedFor}. Now ${who}${
+                  blind ? " (no games on it)" : ""
+                } — seats moved because the five's comfort total is higher.`
+              : blind
+                ? `${who} has no games on ${action.hero} — blind pick`
+                : undefined
+          }
+        >
+          {blind ? `${who} · blind` : who}
+          {moved ? (
+            <span className="block truncate text-[9px] font-medium text-[#8aa0b2]">
+              was {draftedFor}
+            </span>
+          ) : null}
         </span>
-      ) : (
-        !banned &&
-        !held &&
-        action.kind === "pick" && (
-          <span
-            className="mt-0.5 max-w-[3.75rem] truncate text-center text-[10px] font-semibold leading-tight text-[#8aa0b2]"
-            title="Nobody on this five has this hero on record"
-          >
-            unplayed
-          </span>
-        )
-      )}
+      ) : null}
     </div>
   );
 }

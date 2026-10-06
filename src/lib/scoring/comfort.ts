@@ -502,6 +502,170 @@ export function buildPlayerComfort(args: {
   };
 }
 
+/** A player card built only from Storm League hero history. */
+export function playerFromStormLeague(
+  battletag: string,
+  stormLeague: Map<string, SourceHeroStat>,
+): PlayerScout {
+  const topHeroes: ComfortHero[] = [];
+  for (const [hero, source] of stormLeague) {
+    const score = stormLeagueScore(source);
+    if (score <= 0) continue;
+    const row = comfortFromSources(hero, undefined, source, undefined, false);
+    topHeroes.push({
+      ...row,
+      comfort: score,
+      games: source.games,
+      winRate: source.winRate,
+      playPct: source.playPct,
+      sources: { stormLeague: source },
+    });
+  }
+  topHeroes.sort(
+    (a, b) => b.comfort - a.comfort || a.hero.localeCompare(b.hero),
+  );
+  const games = sourceMapGames(stormLeague);
+  return {
+    battletag,
+    blizzId: null,
+    preferredRole: topHeroes[0] ? heroRole(topHeroes[0].hero) : null,
+    topHeroes,
+    ngsWins: 0,
+    ngsLosses: 0,
+    confidence: games >= 20 ? "high" : games >= 5 ? "medium" : "low",
+    heroesProfileUrl: "",
+    ngsProfileUrl: "",
+    returningFromPrior: false,
+  };
+}
+
+export type SlHeroSuggestion = {
+  player: string;
+  hero: string;
+  /** Storm League score used to choose and order the hero. */
+  sl: number;
+  /** Comfort to show on the scorecard. */
+  comfort: number;
+  games: number;
+};
+
+function slRank(hero: ComfortHero): { sl: number; games: number } {
+  const source = hero.sources.stormLeague;
+  if (!source || source.games <= 0) return { sl: 0, games: 0 };
+  return { sl: stormLeagueScore(source), games: source.games };
+}
+
+/**
+ * One still-available hero per player, chosen from Storm League comfort.
+ * Stronger Storm League comfort keeps its hero when two players share a best pick.
+ * Results stay in roster order.
+ */
+export function slHeroSuggestions(args: {
+  roster: PlayerScout[];
+  /** Hero keys already locked or banned. */
+  gone: ReadonlySet<string>;
+  /** Lowercase display names who already locked a hero. */
+  takenPlayers?: ReadonlySet<string>;
+}): SlHeroSuggestion[] {
+  const goneKeys = new Set([...args.gone].map((hero) => heroKey(hero)));
+  const taken = new Set(
+    [...(args.takenPlayers ?? [])].map((name) => name.toLowerCase()),
+  );
+  const rows: {
+    player: string;
+    options: { hero: string; sl: number; comfort: number; games: number }[];
+  }[] = [];
+
+  for (const player of args.roster) {
+    const name = playerDisplayName(player.battletag);
+    if (!name || taken.has(name.toLowerCase())) continue;
+    const options = player.topHeroes
+      .map((hero) => {
+        const rank = slRank(hero);
+        return {
+          hero: hero.hero,
+          sl: rank.sl,
+          comfort: rank.sl > 0 ? hero.comfort : 0,
+          games: rank.games,
+        };
+      })
+      .filter((option) => option.sl > 0 && !goneKeys.has(heroKey(option.hero)))
+      .sort(
+        (a, b) => b.sl - a.sl || a.hero.localeCompare(b.hero),
+      );
+    if (options.length) rows.push({ player: name, options });
+  }
+
+  const byStrength = [...rows].sort(
+    (a, b) => b.options[0].sl - a.options[0].sl || a.player.localeCompare(b.player),
+  );
+  const used = new Set<string>();
+  const assigned = new Map<string, SlHeroSuggestion>();
+  for (const row of byStrength) {
+    const pick = row.options.find((option) => !used.has(heroKey(option.hero)));
+    if (!pick) continue;
+    used.add(heroKey(pick.hero));
+    assigned.set(row.player.toLowerCase(), {
+      player: row.player,
+      hero: pick.hero,
+      sl: pick.sl,
+      comfort: pick.comfort,
+      games: pick.games,
+    });
+  }
+
+  const ordered: SlHeroSuggestion[] = [];
+  for (const player of args.roster) {
+    const name = playerDisplayName(player.battletag).toLowerCase();
+    const hit = assigned.get(name);
+    if (hit) ordered.push(hit);
+  }
+  return ordered;
+}
+
+/**
+ * Copy Storm League sources onto an existing roster and append players who
+ * were not already on it. Display names match with or without a #id.
+ */
+export function overlayStormLeague(
+  base: PlayerScout[],
+  storm: PlayerScout[],
+): PlayerScout[] {
+  if (!storm.length) return base;
+  const nameOf = (tag: string) => playerDisplayName(tag).toLowerCase();
+  const used = new Set<string>();
+  const merged = base.map((player) => {
+    const extra = storm.find((candidate) => nameOf(candidate.battletag) === nameOf(player.battletag));
+    if (!extra) return player;
+    used.add(nameOf(player.battletag));
+    const byHero = new Map(
+      player.topHeroes.map((hero) => [heroKey(hero.hero), hero]),
+    );
+    for (const slHero of extra.topHeroes) {
+      const key = heroKey(slHero.hero);
+      const existing = byHero.get(key);
+      const source = slHero.sources.stormLeague;
+      if (!source) continue;
+      if (existing) {
+        byHero.set(key, {
+          ...existing,
+          sources: { ...existing.sources, stormLeague: source },
+        });
+      } else {
+        byHero.set(key, slHero);
+      }
+    }
+    return { ...player, topHeroes: [...byHero.values()] };
+  });
+  for (const extra of storm) {
+    const name = nameOf(extra.battletag);
+    if (!name || used.has(name)) continue;
+    merged.push(extra);
+    used.add(name);
+  }
+  return merged;
+}
+
 /** Storm League games saved on this player's pool. Zero means the window came back empty. */
 export function stormLeagueGames(player: PlayerScout): number {
   let games = 0;
