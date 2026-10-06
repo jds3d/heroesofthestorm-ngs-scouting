@@ -21,7 +21,7 @@ SCOUT_API_SECRET=pick-a-long-random-string
 NEXT_PUBLIC_SCOUT_API_SECRET=pick-a-long-random-string
 ```
 
-(Use the same value for both so the browser can send `x-scout-secret`.)
+(Use the same value for both so the browser can send `x-scout-secret`. The page bundle includes that value, so it only blocks clients that never loaded the app. Cloudflare Access on the public tunnel is the real gate. The API does not accept `?secret=`.)
 
 3. Install and run (dev):
 
@@ -72,7 +72,7 @@ Season / division / weights live in [`src/config/league.ts`](src/config/league.t
 
 - Home team: `Little Buff Boyz`
 - Division: `A` (Season 22)
-- Comfort weights: NGS current **0.55**, Storm League **0.30**, prior NGS **0.15**
+- Comfort weights: NGS current **0.35**, Storm League **0.55**, prior NGS **0.10**
 
 Seed fallback for the team list: [`src/config/season22-a.json`](src/config/season22-a.json). Live data comes from `GET /api/division/get?division=a` on the NGS site.
 
@@ -101,7 +101,7 @@ Developer billing note: if **Switch** to Developer returns `422`, email Zemill �
 
 ## Refreshing the league list
 
-Team dropdown is loaded from the live NGS API. To force a refresh of **volatile** data (rosters / current-season profiles / SL), delete matching `.cache/` files or wait for TTL. Do **not** delete `hp-v1-ngs-replay-*`, `hp-v1-replay-*`, or `hp-v1-ngs-match-*` — those are finished games and never need re-fetching.
+Team dropdown is loaded from the live NGS API. To force a refresh of **volatile** data (rosters / current-season profiles / SL), delete matching `.cache/` files or wait for TTL. Finished replays with real battletags (`hp-v1-ngs-replay-*` once upgraded, `hp-v1-replay-ban-*`, and `hp-v1-ngs-match-*` with known winners) stay until you delete them. Draft-only shells expire after 6 hours, then the next scout calls `ngs/replay` for winners. A round cached before that fix, with every game stored as a loss, is rebuilt once.
 
 If NGS is down, the API falls back to the season seed JSON.
 
@@ -111,7 +111,7 @@ If NGS is down, the API falls back to the season seed JSON.
 |------|--------|-------|
 | NGS hero pools | `ngs/player` (1× per player/season) | Replaying every game |
 | Draft comps / bans | `replay/{id}/draft`, `replay/{id}/bans` | Full `ngs/replay/{id}` unless needed |
-| Past games | Forever cache in `.cache/` | Re-downloading |
+| Past games | Forever cache after a real replay; draft shells expire in 6 hours | Re-downloading finished games |
 
 ## Scripts
 
@@ -125,4 +125,4 @@ If NGS is down, the API falls back to the season seed JSON.
 ## Notes
 
 - The HeroesProfile token stays server-side (API routes only). Pass it via `.env.local` for Docker Compose.
-- This setup is meant for local always-on use, not a public Cloudflare/Vercel deploy.
+- Local use is `http://localhost:3000`. The public URL is the Cloudflare tunnel in this repo, with Access in front of it. The header secret is not a substitute for Access.

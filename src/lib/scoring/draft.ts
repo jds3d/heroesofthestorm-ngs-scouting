@@ -225,7 +225,8 @@ export function buildDraftInsights(
       const teamHeroes = game.team_heroes ?? [];
       const teamBans = game.team_bans ?? [];
       const enemyBans = game.enemy_bans ?? [];
-      const won = Boolean(game.winner);
+      const outcomeKnown = game.winner === true || game.winner === false;
+      const won = game.winner === true;
 
       if (teamHeroes.length > 0) {
         gamesWithHeroes += weight;
@@ -261,7 +262,7 @@ export function buildDraftInsights(
       }
 
       const mapName = game.map;
-      if (mapName && teamHeroes.length > 0) {
+      if (mapName && teamHeroes.length > 0 && outcomeKnown) {
         const cur = mapStats.get(mapName) ?? {
           games: 0,
           wins: 0,

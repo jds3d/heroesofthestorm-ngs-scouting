@@ -1,11 +1,20 @@
 import { classifyHeroesProfile, noteApiCall } from "@/lib/apiUsage";
+import { assertScoutBudget, isScoutBudgetExceeded } from "@/lib/scout/budget";
 import { leagueConfig, stormLeagueWindows } from "@/config/league";
 import { NGS_MAP_POOL } from "@/config/ngsMaps";
-import { FOREVER, cacheHas, cachedFetch, getCached, setCached } from "@/lib/cache";
+import { FOREVER, cacheHas, cachedFetch, getCached, readCacheEntry, setCached } from "@/lib/cache";
 import {
   heroesProfilePlayerUrl,
   ngsHeroesProfileUrl,
 } from "@/lib/heroesprofile/profileUrls";
+import {
+  DRAFT_SHELL_TTL_MS,
+  buildDraftShell,
+  cachedMatchTrustworthy,
+  isDraftOnlyReplay,
+  matchWinnersKnown,
+  ourSideWon,
+} from "@/lib/heroesprofile/replayCache";
 
 export { heroesProfilePlayerUrl, ngsHeroesProfileUrl };
 import type { PlayerScout } from "@/lib/scoring/types";
@@ -63,8 +72,34 @@ async function sleep(ms: number) {
 
 const HP_MIN_REQUEST_INTERVAL_MS = 1_250;
 const HP_MAX_RATE_LIMIT_RETRIES = 3;
+const HEROESPROFILE_ORIGIN = "https://www.heroesprofile.com";
 let hpRequestTail: Promise<void> = Promise.resolve();
 let hpNextRequestAt = 0;
+let hpAuthRejected = false;
+
+/** Stop the shared queue from spending more calls after a 401/403. */
+export function resetHeroesProfileAuthRejectionForTests(): void {
+  hpAuthRejected = false;
+}
+
+export function heroesProfileJobUrl(location: string): string {
+  let url: URL;
+  try {
+    url =
+      location.startsWith("https://") || location.startsWith("http://")
+        ? new URL(location)
+        : new URL(location, HEROESPROFILE_ORIGIN);
+  } catch {
+    throw new HeroesProfileError("HeroesProfile returned an invalid job URL", 202);
+  }
+  if (url.protocol !== "https:" || url.hostname !== "www.heroesprofile.com") {
+    throw new HeroesProfileError(
+      "HeroesProfile job URL was not on www.heroesprofile.com",
+      202,
+    );
+  }
+  return url.toString();
+}
 
 /** Parse both delta-seconds and HTTP-date Retry-After header forms. */
 export function heroesProfileRetryDelayMs(
@@ -97,10 +132,19 @@ async function hpFetch(url: string, headers: HeadersInit): Promise<Response> {
   });
 
   await previous;
-  const waitMs = Math.max(0, hpNextRequestAt - Date.now());
-  if (waitMs) await sleep(waitMs);
   try {
-    return await fetch(url, { headers });
+    const waitMs = Math.max(0, hpNextRequestAt - Date.now());
+    if (!hpAuthRejected) assertScoutBudget(waitMs);
+    if (waitMs && !hpAuthRejected) await sleep(waitMs);
+    if (hpAuthRejected) {
+      throw new HeroesProfileError(
+        "HeroesProfile API rejected the token (401/403). Confirm the v1 Bearer key in .env.local and Developer access.",
+        401,
+      );
+    }
+    const res = await fetch(url, { headers });
+    if (res.status === 401 || res.status === 403) hpAuthRejected = true;
+    return res;
   } finally {
     hpNextRequestAt = Math.max(
       hpNextRequestAt,
@@ -127,6 +171,12 @@ async function hpGet<T>(
     if (v !== undefined && v !== "") url.searchParams.set(k, String(v));
   }
 
+  if (hpAuthRejected) {
+    throw new HeroesProfileError(
+      "HeroesProfile API rejected the token (401/403). Confirm the v1 Bearer key in .env.local and Developer access.",
+      401,
+    );
+  }
   const kind = classifyHeroesProfile(endpoint);
   if (kind) noteApiCall(kind);
   const headers = authHeaders();
@@ -137,6 +187,7 @@ async function hpGet<T>(
       res.headers.get("Retry-After"),
       rateLimitRetries,
     );
+    assertScoutBudget(retryMs);
     // Extend the shared cooldown before waiting so queued requests also slow down.
     hpNextRequestAt = Math.max(hpNextRequestAt, Date.now() + retryMs);
     await sleep(retryMs);
@@ -148,6 +199,7 @@ async function hpGet<T>(
 
   while (res.status === 202 && polls < maxPolls) {
     const retryAfter = Number(res.headers.get("Retry-After") || "5");
+    assertScoutBudget(Math.max(retryAfter, 2) * 1000);
     const location = res.headers.get("Location");
     if (!location) {
       const body = await res.text();
@@ -157,10 +209,9 @@ async function hpGet<T>(
       );
     }
     await sleep(Math.max(retryAfter, 2) * 1000);
-    const jobUrl = location.startsWith("http")
-      ? location
-      : `https://www.heroesprofile.com${location}`;
+    const jobUrl = heroesProfileJobUrl(location);
     res = await fetch(jobUrl, { headers });
+    if (res.status === 401 || res.status === 403) hpAuthRejected = true;
     polls += 1;
   }
 
@@ -334,7 +385,8 @@ export async function getPlayerBlizzId(battletag: string): Promise<number | null
     if (!blizzId) return null;
     await setCached(blizzIdKey(battletag), blizzId, FOREVER);
     return blizzId;
-  } catch {
+  } catch (err) {
+    if (isScoutBudgetExceeded(err)) throw err;
     return null;
   }
 }
@@ -480,125 +532,120 @@ function normalizeBans(raw: unknown): string[][] {
   });
 }
 
+function isAuthError(err: unknown): boolean {
+  return (
+    err instanceof HeroesProfileError &&
+    (err.status === 401 || err.status === 403)
+  );
+}
+
+/** Keep a successful ban payload so the match builder does not fetch it again. */
+async function rememberReplayBans(replayId: number, raw: unknown): Promise<void> {
+  if (raw == null) return;
+  const bans = normalizeBans(raw);
+  if (!bans.some((side) => side.length > 0)) return;
+  await setCached(replayBanKey(replayId), bans, FOREVER);
+}
+
+function replayBanKey(replayId: number): string {
+  return `hp-v1-replay-ban-${replayId}`;
+}
+
+async function fetchDraftShell(replayId: number): Promise<HpReplayData | null> {
+  const [draftRaw, bansRaw] = await Promise.all([
+    hpGet<unknown>(`replay/${replayId}/draft`),
+    hpGet<unknown>(`replay/${replayId}/bans`).catch(() => null),
+  ]);
+  await rememberReplayBans(replayId, bansRaw);
+  const shell = buildDraftShell(normalizeDraft(draftRaw));
+  if (!shell) return null;
+  await setCached(`hp-v1-ngs-replay-${replayId}`, shell, DRAFT_SHELL_TTL_MS);
+  return shell;
+}
+
+async function fetchFullNgsReplay(replayId: number): Promise<HpReplayData> {
+  return cachedFetch(
+    `hp-v1-ngs-replay-${replayId}`,
+    async () => {
+      const raw = await hpGet<V1NgsReplay>(`ngs/replay/${replayId}`);
+      const players: HpReplayData["players"] = [];
+      const teams = raw.players ?? [];
+      teams.forEach((side, teamIndex) => {
+        for (const p of side ?? []) {
+          const hero = typeof p.hero === "string" ? p.hero : p.hero?.name;
+          if (!hero || !p.battletag) continue;
+          players.push({
+            battletag: p.battletag,
+            blizz_id: p.blizz_id,
+            hero,
+            team: typeof p.team === "number" ? p.team : teamIndex,
+            winner: Boolean(p.winner),
+          });
+        }
+      });
+
+      if (!players.length) {
+        throw new HeroesProfileError(`Empty NGS replay ${replayId}`, 404, "empty_replay");
+      }
+
+      const mapName =
+        typeof raw.game_map === "string" ? raw.game_map : raw.game_map?.name;
+
+      return {
+        game_date: raw.game_date,
+        game_length: raw.game_length,
+        game_map: mapName,
+        region: raw.region,
+        winner_team: raw.winner,
+        players,
+      } satisfies HpReplayData;
+    },
+    FOREVER,
+  );
+}
+
 /**
- * Prefer high-allowance `/replay/{id}/draft` + `/replay/{id}/bans`
- * over low-allowance `/ngs/replay/{id}`. Forever-cache successful past games.
+ * Prefer the cheap draft endpoint until its shell expires, then replace it
+ * with `/ngs/replay/{id}` so winners and battletags are real. A fresh shell
+ * is returned for comps and is not treated as a finished game.
  */
 export async function getNgsReplayData(
   replayId: number,
 ): Promise<HpReplayData | null> {
   const key = `hp-v1-ngs-replay-${replayId}`;
-  const existing = await getCached<HpReplayData>(key, FOREVER);
-  // Forever hits must have real battletags (not draft-only unknown-* shells).
-  if (
-    existing?.players?.length &&
-    existing.players.some((p) => p.battletag && !p.battletag.startsWith("unknown-"))
-  ) {
-    return existing;
+  const entry = await readCacheEntry<HpReplayData>(key);
+  if (entry?.fresh && entry.data.players?.length && !isDraftOnlyReplay(entry.data)) {
+    return entry.data;
   }
-  // Soft draft-only shell still usable for comps within TTL.
-  if (existing?.players?.length) return existing;
+  if (entry?.fresh && isDraftOnlyReplay(entry.data)) return entry.data;
 
-  const asDraftShell = (picks: ReturnType<typeof normalizeDraft>): HpReplayData => {
-    const real = picks.filter((e) => !isBanEntry(e) && heroName(e.hero || e));
-    return {
-      players: real.map((e, idx) => {
-        const hero = heroName(e.hero || e);
-        const team = typeof e.team === "number" ? e.team : idx < 5 ? 0 : 1;
-        return {
-          battletag: `unknown-${team}-${hero}`,
-          hero,
-          team,
-          winner: false,
-        };
-      }),
-      winner_team: undefined,
-    };
-  };
+  const shellExpired = Boolean(entry && !entry.fresh && isDraftOnlyReplay(entry.data));
 
   try {
-    // 1) Cheap draft API first — soft-cache only (never forever with unknown tags).
+    if (shellExpired) {
+      try {
+        return await fetchFullNgsReplay(replayId);
+      } catch (err) {
+        if (isScoutBudgetExceeded(err) || isAuthError(err)) throw err;
+      }
+    }
+
     try {
-      const [draftRaw, bansRaw] = await Promise.all([
-        hpGet<unknown>(`replay/${replayId}/draft`),
-        hpGet<unknown>(`replay/${replayId}/bans`).catch(() => null),
-      ]);
-      const draft = normalizeDraft(draftRaw);
-      normalizeBans(bansRaw);
-      const picks = draft.filter((e) => !isBanEntry(e) && heroName(e.hero || e));
-      if (picks.length >= 5) {
-        const shell = asDraftShell(draft);
-        await setCached(key, shell, 6 * 60 * 60 * 1000);
-        return shell;
-      }
+      const shell = await fetchDraftShell(replayId);
+      if (shell) return shell;
     } catch (err) {
-      if (
-        err instanceof HeroesProfileError &&
-        (err.status === 401 || err.status === 403)
-      ) {
-        throw err;
-      }
+      if (isScoutBudgetExceeded(err) || isAuthError(err)) throw err;
     }
 
-    // 2) Full NGS replay — forever-cache real battletags / winners.
-    return await cachedFetch(
-      key,
-      async () => {
-        const raw = await hpGet<V1NgsReplay>(`ngs/replay/${replayId}`);
-        const players: HpReplayData["players"] = [];
-        const teams = raw.players ?? [];
-        teams.forEach((side, teamIndex) => {
-          for (const p of side ?? []) {
-            const hero =
-              typeof p.hero === "string" ? p.hero : p.hero?.name;
-            if (!hero || !p.battletag) continue;
-            players.push({
-              battletag: p.battletag,
-              blizz_id: p.blizz_id,
-              hero,
-              team: typeof p.team === "number" ? p.team : teamIndex,
-              winner: Boolean(p.winner),
-            });
-          }
-        });
-
-        if (!players.length) {
-          throw new HeroesProfileError(
-            `Empty NGS replay ${replayId}`,
-            404,
-            "empty_replay",
-          );
-        }
-
-        const mapName =
-          typeof raw.game_map === "string"
-            ? raw.game_map
-            : raw.game_map?.name;
-
-        return {
-          game_date: raw.game_date,
-          game_length: raw.game_length,
-          game_map: mapName,
-          region: raw.region,
-          winner_team: raw.winner,
-          players,
-        } satisfies HpReplayData;
-      },
-      FOREVER,
-    );
+    return await fetchFullNgsReplay(replayId);
   } catch (err) {
-    if (
-      err instanceof HeroesProfileError &&
-      (err.status === 401 || err.status === 403)
-    ) {
-      throw err;
-    }
+    if (isScoutBudgetExceeded(err) || isAuthError(err)) throw err;
     return null;
   }
 }
 
 async function getReplayBansCached(replayId: number): Promise<string[][]> {
-  const key = `hp-v1-replay-ban-${replayId}`;
+  const key = replayBanKey(replayId);
   try {
     return await cachedFetch(
       key,
@@ -608,7 +655,8 @@ async function getReplayBansCached(replayId: number): Promise<string[][]> {
       },
       FOREVER,
     );
-  } catch {
+  } catch (err) {
+    if (isScoutBudgetExceeded(err)) throw err;
     return [[], []];
   }
 }
@@ -617,7 +665,9 @@ function gameHasHeroes(game: HpMatchGame): boolean {
   return (game.team_heroes?.length ?? 0) > 0;
 }
 
-/** Build a round's games from forever-cached per-replay payloads. */
+const matchBuilds = new Map<string, Promise<HpNgsMatch | null>>();
+
+/** Build a round's games from per-replay payloads. Unknown winners stay on a short TTL. */
 export async function getNgsMatch(
   team: string,
   round: number,
@@ -625,18 +675,20 @@ export async function getNgsMatch(
   division: string = leagueConfig.division,
 ): Promise<HpNgsMatch | null> {
   const key = `hp-v1-ngs-match-s${season}-${division}-${team}-r${round}`;
-  try {
-    const cached = await getCached<HpNgsMatch>(key, FOREVER);
+  const cached = await getCached<HpNgsMatch>(key, FOREVER);
+    if (cached && cachedMatchTrustworthy(cached)) return cached;
     if (
-      cached &&
-      Object.values(cached.match_data).some((g) => gameHasHeroes(g))
+      cached?.winnersKnown === false &&
+      Object.values(cached.match_data).some((game) => gameHasHeroes(game))
     ) {
       return cached;
     }
 
-    return await cachedFetch(
-      key,
-      async () => {
+    const pending = matchBuilds.get(key);
+    if (pending) return pending;
+
+    const promise = (async (): Promise<HpNgsMatch | null> => {
+      try {
         const all = await listTeamMatches(team, season, division);
         const games = all.filter((g) => String(g.round) === String(round));
         if (!games.length) {
@@ -667,10 +719,7 @@ export async function getNgsMatch(
             replay?.players
               .filter((p) => p.team !== ourTeamIndex)
               .map((p) => p.hero) ?? [];
-          const weWon =
-            replay?.players.some(
-              (p) => p.team === ourTeamIndex && p.winner,
-            ) ?? false;
+          const weWon = ourSideWon(replay, ourTeamIndex);
 
           if (teamHeroes.length) anyHeroes = true;
 
@@ -696,7 +745,7 @@ export async function getNgsMatch(
           );
         }
 
-        return {
+        const built = {
           season: String(season),
           division,
           team,
@@ -706,19 +755,25 @@ export async function getNgsMatch(
           team_map_bans: [],
           enemy_map_bans: [],
           match_data,
+          winnersKnown: false,
         } satisfies HpNgsMatch;
-      },
-      FOREVER,
-    );
-  } catch (err) {
-    if (
-      err instanceof HeroesProfileError &&
-      (err.status === 401 || err.status === 403)
-    ) {
-      throw err;
-    }
-    return null;
-  }
+        const winnersKnown = matchWinnersKnown(built);
+        const stored = { ...built, winnersKnown };
+        await setCached(
+          key,
+          stored,
+          winnersKnown ? FOREVER : DRAFT_SHELL_TTL_MS,
+        );
+        return stored;
+      } catch (err) {
+        if (isScoutBudgetExceeded(err) || isAuthError(err)) throw err;
+        return null;
+      }
+    })().finally(() => {
+      matchBuilds.delete(key);
+    });
+    matchBuilds.set(key, promise);
+    return promise;
 }
 
 export const globalHeroStatsKey = "hp-v1-global-heroes-sl-minor";
@@ -1371,7 +1426,8 @@ export async function getHeroMatchups(hero: string): Promise<{
         bundle = mergeMatchupsAdditive(bundle, next);
       }
       used.push(sub.key);
-    } catch {
+    } catch (err) {
+      if (isScoutBudgetExceeded(err)) throw err;
       // Skip a missing subpatch; keep walking older ones.
       continue;
     }
@@ -1393,27 +1449,51 @@ export async function getHeroMatchupsMany(
 ): Promise<{
   patch: string;
   byHero: Record<string, HeroMatchupBundle>;
+  /** True when the scout time budget stopped the queue before every hero. */
+  incomplete: boolean;
 }> {
   const unique = [...new Set(heroes.filter(Boolean))];
   const byHero: Record<string, HeroMatchupBundle> = {};
   let patch = "";
+  let incomplete = false;
   const queue = [...unique];
+  const rateRetries = new Map<string, number>();
   const workers = 2;
   async function worker() {
     while (queue.length) {
       const hero = queue.shift();
       if (!hero) break;
       try {
+        assertScoutBudget();
         const { patch: p, enemies, allies } = await getHeroMatchups(hero);
         if (p) patch = p;
         byHero[hero] = { enemies, allies };
       } catch (err) {
+        if (isScoutBudgetExceeded(err)) {
+          incomplete = true;
+          queue.length = 0;
+          break;
+        }
         if (
           err instanceof HeroesProfileError &&
           (err.status === 429 || err.code === "rate_limited")
         ) {
-          await sleep(8000);
-          queue.unshift(hero);
+          const tries = (rateRetries.get(hero) ?? 0) + 1;
+          rateRetries.set(hero, tries);
+          // hpGet already retried the 429. One extra pass, then skip the hero
+          // so a single limited hero cannot hold the scout open.
+          if (tries <= 1) {
+            try {
+              assertScoutBudget(8_000);
+              await sleep(8000);
+            } catch (budgetErr) {
+              if (!isScoutBudgetExceeded(budgetErr)) throw budgetErr;
+              incomplete = true;
+              queue.length = 0;
+              break;
+            }
+            queue.unshift(hero);
+          }
           continue;
         }
         // Skip failed hero — draft meta degrades to globals-only for them.
@@ -1424,7 +1504,7 @@ export async function getHeroMatchupsMany(
   await Promise.all(
     Array.from({ length: Math.min(workers, unique.length) }, () => worker()),
   );
-  return { patch, byHero };
+  return { patch, byHero, incomplete };
 }
 
 export async function checkHeroesProfileAuth(): Promise<{

@@ -3,11 +3,14 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { PlayerScout, ScoutReport } from "@/lib/scoring/types";
 import type { ReviewGame, ReviewGameSummary } from "@/lib/review/replayDraft";
+import { DraftTracker, type SlTrackRow } from "@/components/DraftTracker";
 import { LobbyScreenWatch } from "@/components/LobbyScreenWatch";
 import { ScoutReportView } from "@/components/ScoutReport";
 import { InteractiveDraft } from "@/components/InteractiveDraft";
 import {
   actionsFromObserved,
+  EMPTY_LIVE_DRAFT,
+  heroFromPlateText,
   rosterTagsForLobby,
   rosterTagsPresent,
   type LiveDraft,
@@ -122,6 +125,7 @@ export function ScoutApp() {
   const [theirFive, setTheirFive] = useState<string[]>([]);
   const [loadingRoster, setLoadingRoster] = useState(false);
   const [loadingProgress, setLoadingProgress] = useState(12);
+  const [scoutPass, setScoutPass] = useState(1);
   const [reviewOpen, setReviewOpen] = useState(false);
   const [loadingReview, setLoadingReview] = useState(false);
   const [reviewGames, setReviewGames] = useState<ReviewGameSummary[] | null>(null);
@@ -132,11 +136,17 @@ export function ScoutApp() {
   const [lobbyNames, setLobbyNames] = useState<string[]>([]);
   const [screenOurNames, setScreenOurNames] = useState<string[]>([]);
   const [statsNote, setStatsNote] = useState<string | null>(null);
+  const [slTrack, setSlTrack] = useState<SlTrackRow[]>([]);
+  const [slTrackError, setSlTrackError] = useState<string | null>(null);
   const [stormHome, setStormHome] = useState<PlayerScout[]>([]);
   const [stormTheirs, setStormTheirs] = useState<PlayerScout[]>([]);
   const [tournamentDraft, setTournamentDraft] = useState(false);
+  const [watchReset, setWatchReset] = useState(0);
+  const [draftSaved, setDraftSaved] = useState<string | null>(null);
   const liveScoutKey = useRef("");
   const ngsScoutKey = useRef("");
+  const draftFileId = useRef("");
+  const draftSaveBody = useRef<Record<string, unknown>>({});
   const tournamentDraftRef = useRef(false);
   tournamentDraftRef.current = tournamentDraft;
 
@@ -250,9 +260,13 @@ export function ScoutApp() {
     if (!sharing) {
       liveScoutKey.current = "";
       ngsScoutKey.current = "";
+      draftFileId.current = "";
+      setDraftSaved(null);
       setScreenOurNames([]);
       setStormHome([]);
       setStormTheirs([]);
+      setSlTrack([]);
+      setSlTrackError(null);
       setTournamentDraft(false);
     }
   }, [sharing]);
@@ -262,23 +276,42 @@ export function ScoutApp() {
     ...(liveDraft?.theirPickPlayers ?? []),
     ...screenOurNames,
     ...lobbyNames,
+    ...ourRoster.map((player) => player.battletag),
   ].join("|");
   const slLookup = useMemo(() => {
     const unique = (names: (string | null | undefined)[]) => {
       const seen = new Set<string>();
       const out: string[] = [];
       for (const name of names) {
-        const shown = name?.split("#")[0]?.trim();
+        const shown = name?.trim();
         if (!shown) continue;
-        const key = shown.toLowerCase();
+        const key = (shown.split("#")[0] ?? shown).toLowerCase();
         if (seen.has(key)) continue;
         seen.add(key);
         out.push(shown);
       }
       return out;
     };
-    const ourLookup = unique([...(liveDraft?.ourPickPlayers ?? []), ...screenOurNames]);
-    const theirLookup = unique([...(liveDraft?.theirPickPlayers ?? []), ...lobbyNames]);
+    const withHomeTags = (names: (string | null | undefined)[]) =>
+      unique(
+        names.map((name) => {
+          const shown = name?.split("#")[0]?.trim();
+          if (!shown) return name;
+          return rosterTagsPresent([shown], ourRoster)[0] ?? shown;
+        }),
+      );
+    const playersOnly = (names: (string | null | undefined)[]) =>
+      unique(names).filter((name) => !heroFromPlateText(name.split("#")[0] ?? name)).slice(0, 5);
+    const ourLookup = playersOnly(
+      withHomeTags([
+        ...screenOurNames,
+        ...(liveDraft?.ourPickPlayers ?? []),
+      ]),
+    );
+    const theirLookup = playersOnly([
+      ...lobbyNames,
+      ...(liveDraft?.theirPickPlayers ?? []),
+    ]);
     return {
       ourLookup,
       theirLookup,
@@ -290,38 +323,74 @@ export function ScoutApp() {
     if (!sharing) return;
     const { ourLookup, theirLookup, tags } = slLookup;
     const display = (tag: string) => tag.split("#")[0]?.trim().toLowerCase() ?? "";
-    if (!tags.length) return;
+    if (!tags.length) {
+      setSlTrack([]);
+      setSlTrackError(null);
+      return;
+    }
     const key = tags.map((tag) => tag.toLowerCase()).sort().join("|");
     if (liveScoutKey.current === `sl:${key}`) return;
     liveScoutKey.current = `sl:${key}`;
     let cancelled = false;
+    const ourNames = new Set(ourLookup.map((name) => display(name)));
+    const theirNames = new Set(theirLookup.map((name) => display(name)));
+    const rows: SlTrackRow[] = tags.map((tag) => ({
+      name: tag.split("#")[0]?.trim() || tag,
+      side: ourNames.has(display(tag)) ? "us" : "them",
+      status: "queued",
+      games: 0,
+    }));
+    setSlTrack(rows);
+    setSlTrackError(null);
     (async () => {
-      setStatsNote("Loading Storm League history for the names on screen.");
+      const home: PlayerScout[] = [];
+      const theirs: PlayerScout[] = [];
       try {
-        const slRes = await scoutFetch(
-          `/api/players/storm-league?tags=${encodeURIComponent(tags.join("|"))}`,
-        );
-        const slData = (await slRes.json()) as {
-          players?: PlayerScout[];
-          error?: string;
-        };
-        if (!slRes.ok) throw new Error(slData.error ?? "Storm League lookup failed");
-        if (cancelled) return;
-        const loaded = slData.players ?? [];
-        const ourNames = new Set(ourLookup.map((name) => display(name)));
-        const theirNames = new Set(theirLookup.map((name) => display(name)));
-        setStormHome(loaded.filter((player) => ourNames.has(display(player.battletag))));
-        setStormTheirs(loaded.filter((player) => theirNames.has(display(player.battletag))));
-        if (tournamentDraftRef.current) return;
-        const found = loaded.filter((player) => theirNames.has(display(player.battletag))).length;
-        setStatsNote(
-          theirLookup.length
-            ? `Storm League history loaded for ${found} of ${theirLookup.length} opponents.`
-            : "Storm League history loaded for the players on our side.",
-        );
+        for (let i = 0; i < tags.length; i++) {
+          if (cancelled) return;
+          setSlTrack((current) =>
+            current.map((row, index) =>
+              index === i ? { ...row, status: "pulling" } : row,
+            ),
+          );
+          const slRes = await scoutFetch(
+            `/api/players/storm-league?tags=${encodeURIComponent(tags[i])}`,
+          );
+          const slData = (await slRes.json()) as {
+            players?: PlayerScout[];
+            error?: string;
+          };
+          if (!slRes.ok) throw new Error(slData.error ?? "Storm League lookup failed");
+          if (cancelled) return;
+          const player = slData.players?.[0];
+          const games = player
+            ? player.topHeroes.reduce(
+                (sum, hero) => sum + (hero.sources.stormLeague?.games ?? 0),
+                0,
+              )
+            : 0;
+          if (player) {
+            const who = display(player.battletag);
+            if (ourNames.has(who)) home.push(player);
+            else if (theirNames.has(who)) theirs.push(player);
+            setStormHome([...home]);
+            setStormTheirs([...theirs]);
+          }
+          setSlTrack((current) =>
+            current.map((row, index) =>
+              index === i
+                ? {
+                    ...row,
+                    status: player ? "found" : "miss",
+                    games,
+                  }
+                : row,
+            ),
+          );
+        }
       } catch (e) {
-        if (!cancelled && !tournamentDraftRef.current) {
-          setStatsNote(e instanceof Error ? e.message : "Could not look up those players.");
+        if (!cancelled) {
+          setSlTrackError(e instanceof Error ? e.message : "Could not look up those players.");
         }
       }
     })();
@@ -477,6 +546,7 @@ export function ScoutApp() {
   ): Promise<boolean> {
     setLoadingReport(true);
     setLoadingProgress(12);
+    setScoutPass(1);
     setError(null);
     setReport(null);
     setPredictedCalls(null);
@@ -496,30 +566,57 @@ export function ScoutApp() {
         };
         setPredictedCalls(estimate.predicted ?? null);
       }
-      const res = await scoutFetch(`/api/scout/${teamPath}${fresh}`);
-      const raw = await res.text();
-      let data: unknown;
-      try {
-        data = JSON.parse(raw);
-      } catch {
-        throw new Error(
-          res.ok
-            ? "Scout returned a non-JSON response (often a proxy timeout). Try again."
-            : `Scout failed (${res.status}): server returned HTML instead of JSON.`,
-        );
+      // Cloudflare closes a single response around 125s with an HTML 524.
+      // The server pauses before that and the next pass continues from cache.
+      const maxPasses = 8;
+      let paused: (ScoutReport & { error?: string }) | null = null;
+      for (let pass = 1; pass <= maxPasses; pass++) {
+        setScoutPass(pass);
+        const res = await scoutFetch(`/api/scout/${teamPath}${fresh}`);
+        const raw = await res.text();
+        let data: unknown;
+        try {
+          data = JSON.parse(raw);
+        } catch {
+          throw new Error(
+            res.ok
+              ? "Scout returned a non-JSON response (often a proxy timeout). Try again."
+              : `Scout failed (${res.status}): server returned HTML instead of JSON.`,
+          );
+        }
+        if (!res.ok) {
+          const errMsg =
+            data &&
+            typeof data === "object" &&
+            "error" in data &&
+            typeof (data as { error: unknown }).error === "string"
+              ? (data as { error: string }).error
+              : "Scout failed";
+          throw new Error(errMsg);
+        }
+        const report = data as ScoutReport & { error?: string };
+        if (report.incomplete) {
+          paused = report.teamName ? report : paused;
+          continue;
+        }
+        if (!report.teamName) {
+          throw new Error(report.error ?? "Scout failed");
+        }
+        setReport(report);
+        return true;
       }
-      if (!res.ok) {
-        const errMsg =
-          data &&
-          typeof data === "object" &&
-          "error" in data &&
-          typeof (data as { error: unknown }).error === "string"
-            ? (data as { error: string }).error
-            : "Scout failed";
-        throw new Error(errMsg);
+      if (paused?.teamName) {
+        setReport({
+          ...paused,
+          incomplete: undefined,
+          warnings: [
+            ...paused.warnings,
+            "Scout paused before the connection timed out. Generate again to finish the remaining data.",
+          ],
+        });
+        return true;
       }
-      setReport(data as ScoutReport);
-      return true;
+      throw new Error(paused?.error ?? "Scout failed");
     } catch (e) {
       setError(e instanceof Error ? e.message : "Scout failed");
       return false;
@@ -528,7 +625,99 @@ export function ScoutApp() {
     }
   }
 
+  const homeLabels = useMemo(() => {
+    const names = new Set<string>();
+    for (const player of ourRoster) {
+      const shown = player.battletag.split("#")[0]?.trim().toLowerCase();
+      if (shown) names.add(shown);
+    }
+    return names;
+  }, [ourRoster]);
+  const opponentStorm = useMemo(
+    () =>
+      stormTheirs.filter((player) => {
+        const shown = player.battletag.split("#")[0]?.trim().toLowerCase() ?? "";
+        return shown && !homeLabels.has(shown);
+      }),
+    [stormTheirs, homeLabels],
+  );
+
+  const draftSaveKey = [
+    liveDraft?.map ?? "",
+    liveDraft?.phase ?? "",
+    liveDraft?.firstPick ?? "",
+    (liveDraft?.ourBans ?? []).join(","),
+    (liveDraft?.theirBans ?? []).join(","),
+    (liveDraft?.ourPicks ?? []).join(","),
+    (liveDraft?.theirPicks ?? []).join(","),
+    (liveDraft?.ourPickPlayers ?? []).join(","),
+    (liveDraft?.theirPickPlayers ?? []).join(","),
+    screenOurNames.join(","),
+    lobbyNames.join(","),
+  ].join("|");
+
+  useEffect(() => {
+    if (!sharing || !liveDraft) return;
+    const locks =
+      liveDraft.ourBans.length +
+      liveDraft.theirBans.length +
+      liveDraft.ourPicks.length +
+      liveDraft.theirPicks.length;
+    if (!locks && !liveDraft.map && screenOurNames.length + lobbyNames.length < 3) return;
+    if (!draftFileId.current) {
+      const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z");
+      draftFileId.current = `draft-${stamp}`;
+    }
+    draftSaveBody.current = {
+      id: draftFileId.current,
+      map: liveDraft.map,
+      phase: liveDraft.phase,
+      firstPick: liveDraft.firstPick,
+      ourNames: screenOurNames,
+      theirNames: lobbyNames,
+      ourBans: liveDraft.ourBans,
+      theirBans: liveDraft.theirBans,
+      ourPicks: liveDraft.ourPicks,
+      theirPicks: liveDraft.theirPicks,
+      ourPickPlayers: liveDraft.ourPickPlayers,
+      theirPickPlayers: liveDraft.theirPickPlayers,
+    };
+    const timer = window.setTimeout(() => {
+      void scoutFetch("/api/drafts", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(draftSaveBody.current),
+      })
+        .then(async (res) => {
+          const data = (await res.json()) as { file?: string };
+          if (res.ok && data.file) setDraftSaved(data.file);
+        })
+        .catch(() => undefined);
+    }, 500);
+    return () => window.clearTimeout(timer);
+  }, [sharing, draftSaveKey]);
+
+  function resetLiveDraft() {
+    liveScoutKey.current = "";
+    ngsScoutKey.current = "";
+    draftFileId.current = "";
+    setDraftSaved(null);
+    setLobbyNames([]);
+    setScreenOurNames([]);
+    setStormHome([]);
+    setStormTheirs([]);
+    setStatsNote(null);
+    setSlTrack([]);
+    setSlTrackError(null);
+    setLiveDraft({ ...EMPTY_LIVE_DRAFT });
+    setWatchReset((epoch) => epoch + 1);
+  }
+
   return (
+    <div className="flex w-full flex-col">
+    <p className="sticky top-0 z-30 border-b border-[#b8860b] bg-[#fff4d6] px-4 py-3 text-center text-sm font-semibold text-[#5c3b00] sm:text-base">
+      Move the drafter app to a screen with the same or higher resolution as the game in order to read it.
+    </p>
     <div className="mx-auto flex w-full max-w-none flex-col gap-8 px-4 py-10 sm:px-6 lg:px-8">
       {!sharing && (
       <header className="space-y-3">
@@ -570,6 +759,7 @@ export function ScoutApp() {
           onOurSide={setScreenOurNames}
           onDraft={setLiveDraft}
           onWatchingChange={setSharing}
+          resetEpoch={watchReset}
         />
         {!sharing && (
         <>
@@ -681,7 +871,9 @@ export function ScoutApp() {
                   : "Loading the draft review…"
                 : refreshPlayerData
                   ? "Refreshing source data and generating the scout report…"
-                  : "Generating the scout report…"}
+                  : scoutPass > 1
+                    ? "Continuing the scout from saved progress…"
+                    : "Generating the scout report…"}
             </p>
             <span className="text-xs font-semibold uppercase tracking-[0.18em] text-[var(--accent)]">
               {Math.round(currentProgress)}%
@@ -730,6 +922,7 @@ export function ScoutApp() {
           screenOnly
           tournamentMode
           onTournamentModeChange={setTournamentDraft}
+          onWatchReset={resetLiveDraft}
         />
       ) : null}
 
@@ -740,6 +933,10 @@ export function ScoutApp() {
         lineupMatches(report.homeRoster, screenOurTags)
       ) ? (
         <div className="space-y-3">
+          <DraftTracker rows={slTrack} error={slTrackError} />
+          {draftSaved ? (
+            <p className="text-sm text-[var(--muted)]">Saved drafts/{draftSaved}</p>
+          ) : null}
           {statsNote ? (
             <p className="text-sm text-[var(--muted)]">{statsNote}</p>
           ) : null}
@@ -752,7 +949,8 @@ export function ScoutApp() {
             theirLabel="Them"
             allowSeatReshuffle={false}
             homeRoster={stormHome}
-            theirRoster={stormTheirs}
+            theirRoster={opponentStorm}
+            onWatchReset={resetLiveDraft}
             ourLikely={[]}
             map={liveDraft?.map}
             watchOnly
@@ -771,6 +969,7 @@ export function ScoutApp() {
           liveDraft={liveDraft}
         />
       )}
+    </div>
     </div>
   );
 }

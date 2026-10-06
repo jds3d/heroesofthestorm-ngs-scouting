@@ -13,6 +13,7 @@ import { buildDraftMetaTable } from "@/lib/scoring/draftMeta";
 import { buildDraftPlan } from "@/lib/scoring/draftPlan";
 import { buildMapPlan } from "@/lib/scoring/mapPlan";
 import { heroKey } from "@/lib/scoring/heroMeta";
+import { isScoutBudgetExceeded, runWithScoutBudget } from "@/lib/scout/budget";
 import { draftHeroPool } from "@/lib/scout/draftHeroPool";
 import {
   loadSavedHomeReport,
@@ -45,17 +46,34 @@ export async function GET(request: Request, context: RouteContext) {
   const ours = lineupParam(url, "ours");
 
   try {
+    return await runWithScoutBudget(async () => {
     const report = await loadScoutReport(teamName, {
       refreshPlayerData,
       starters: theirs,
     });
+    if (report.incomplete) return NextResponse.json(report);
     // Our comfort comes from our own scout; build it if it was never saved,
     // or every one of our picks scores zero comfort.
-    const homeReport =
+    let homeReport =
       teamName === leagueConfig.homeTeam
         ? report
-        : ((await loadSavedHomeReport(leagueConfig.homeTeam)) ??
-          (await loadScoutReport(leagueConfig.homeTeam).catch(() => null)));
+        : await loadSavedHomeReport(leagueConfig.homeTeam);
+    // A paused home scout is not finished data. Rebuild it from the cache.
+    if (
+      teamName !== leagueConfig.homeTeam &&
+      (!homeReport || homeReport.incomplete)
+    ) {
+      try {
+        homeReport = await loadScoutReport(leagueConfig.homeTeam);
+      } catch (err) {
+        if (isScoutBudgetExceeded(err)) throw err;
+        if (homeReport?.incomplete) homeReport = null;
+      }
+    }
+    if (homeReport?.incomplete) {
+      report.incomplete = true;
+      return NextResponse.json(report);
+    }
     let homePool =
       teamName === leagueConfig.homeTeam
         ? report.roster
@@ -64,9 +82,17 @@ export async function GET(request: Request, context: RouteContext) {
       (tag) => !homePool?.some((player) => player.battletag.toLowerCase() === tag.toLowerCase()),
     );
     if (missingOurs.length > 0 && teamName !== leagueConfig.homeTeam) {
-      const lined = await loadScoutReport(leagueConfig.homeTeam, { starters: ours }).catch(
-        () => null,
-      );
+      let lined: Awaited<ReturnType<typeof loadScoutReport>> | null = null;
+      try {
+        lined = await loadScoutReport(leagueConfig.homeTeam, { starters: ours });
+      } catch (err) {
+        if (isScoutBudgetExceeded(err)) throw err;
+      }
+      if (lined?.incomplete) {
+        report.incomplete = true;
+        report.homeRoster = lined.roster;
+        return NextResponse.json(report);
+      }
       if (lined?.roster?.length) homePool = lined.roster;
     }
     const want = new Set(ours.map((s) => s.toLowerCase()));
@@ -77,7 +103,10 @@ export async function GET(request: Request, context: RouteContext) {
     report.homeRoster = homeRoster;
     report.homeHpMmrAvg =
       homeReport?.hpMmrAvg ??
-      (await getTeam(leagueConfig.homeTeam).catch(() => null))?.hpMmrAvg ??
+      (await getTeam(leagueConfig.homeTeam).catch((err) => {
+        if (isScoutBudgetExceeded(err)) throw err;
+        return null;
+      }))?.hpMmrAvg ??
       null;
     report.roster = await withProfileLinks(report.roster);
     if (report.homeRoster?.length) {
@@ -86,7 +115,10 @@ export async function GET(request: Request, context: RouteContext) {
 
     // Matchups + globals for draft meta — count real HP calls in "used".
     const { actual: metaActual } = await runWithApiUsage(async () => {
-      const meta = await getGlobalHeroStats().catch(() => []);
+      const meta = await getGlobalHeroStats().catch((err) => {
+        if (isScoutBudgetExceeded(err)) throw err;
+        return [];
+      });
       const metaBans = metaBanPriority(report.roster, meta);
       const seen = new Set<string>();
       report.adapt.banPriority = [...metaBans, ...report.adapt.banPriority]
@@ -139,25 +171,36 @@ export async function GET(request: Request, context: RouteContext) {
         .sort((a, b) => a.priority - b.priority);
 
       const pool = draftHeroPool(report);
-      const { patch, byHero: matchupBundles } = await getHeroMatchupsMany(
-        pool,
-      ).catch(() => ({
-        patch: "",
-        byHero: {} as Record<
-          string,
-          import("@/lib/heroesprofile/client").HeroMatchupBundle
-        >,
-      }));
+      const {
+        patch,
+        byHero: matchupBundles,
+        incomplete: matchupsIncomplete,
+      } = await getHeroMatchupsMany(pool).catch((err) => {
+        if (isScoutBudgetExceeded(err)) throw err;
+        return {
+          patch: "",
+          byHero: {} as Record<
+            string,
+            import("@/lib/heroesprofile/client").HeroMatchupBundle
+          >,
+          incomplete: false,
+        };
+      });
+      if (matchupsIncomplete) report.incomplete = true;
       let mapStats: Awaited<ReturnType<typeof getGlobalHeroStatsByMap>> = [];
       try {
         mapStats = await getGlobalHeroStatsByMap();
       } catch (err) {
-        const message =
-          err instanceof Error ? err.message : "HeroesProfile map stats failed";
-        report.warnings = [
-          ...(report.warnings ?? []),
-          `Map fit data unavailable (${message}). Scores for map specialists are disabled.`,
-        ];
+        if (isScoutBudgetExceeded(err)) {
+          report.incomplete = true;
+        } else {
+          const message =
+            err instanceof Error ? err.message : "HeroesProfile map stats failed";
+          report.warnings = [
+            ...(report.warnings ?? []),
+            `Map fit data unavailable (${message}). Scores for map specialists are disabled.`,
+          ];
+        }
       }
       const matchupsByKey: Record<
         string,
@@ -195,7 +238,15 @@ export async function GET(request: Request, context: RouteContext) {
     }
 
     return NextResponse.json(report);
+    });
   } catch (err) {
+    if (isScoutBudgetExceeded(err)) {
+      return NextResponse.json({
+        incomplete: true,
+        warnings: [],
+        error: "Scout paused before the proxy timeout.",
+      });
+    }
     const message = err instanceof Error ? err.message : "Scout failed";
     return NextResponse.json({ error: message }, { status: 500 });
   }

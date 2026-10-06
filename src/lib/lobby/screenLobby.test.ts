@@ -4,12 +4,17 @@ import {
   actionsFromObserved,
   inferFirstPick,
   bannerTurn,
+  shownBanSide,
   matchLobbyToRosters,
   sideFromBannerColor,
+  heroFromPlateText,
   heroesFromColumn,
+  nameFromPlate,
+  namesFromOcrLines,
   lobbyNamesFromOcr,
   mapFromTitle,
   namesFromColumn,
+  partyNamesFromText,
   nextTurn,
   opponentColumn,
   bansFromStrip,
@@ -114,6 +119,21 @@ describe("draft locks from the screen", () => {
     expect(namesFromColumn(text)).toEqual(["Beachyman", "Topgun707", "Marcy"]);
     expect(playerFromSlotText("LI-MING\nThomas")).toBe("Thomas");
     expect(playerFromSlotText("Li-Ming Thomas")).toBe("Thomas");
+    expect(heroFromPlateText("MALGANS")).toBe("Mal'Ganis");
+    expect(heroFromPlateText("MAL'GANS")).toBe("Mal'Ganis");
+    expect(nameFromPlate("MALGANS\nPeterWiggin")).toBe("PeterWiggin");
+    expect(nameFromPlate("MAL'GANS")).toBeNull();
+    expect(nameFromPlate("VALLA\nTopgun707")).toBe("Topgun707");
+    expect(nameFromPlate("PICKING\nMrHustler")).toBe("MrHustler");
+    expect(
+      namesFromOcrLines([
+        { text: "TASSADAR", top: 400 },
+        { text: "PeterWiggin", top: 20 },
+        { text: "Huckit", top: 90 },
+        { text: "AcldReign", top: 160 },
+      ]),
+    ).toEqual(["PeterWiggin", "Huckit", "AcldReign"]);
+    expect(snapToRoster("Huckit", ["HuckIt#1686"])).toBe("HuckIt");
   });
 
   it("treats a bright rim as locked and a dark rim as still open", () => {
@@ -326,9 +346,44 @@ describe("draft locks from the screen", () => {
     ).toBe(null);
   });
 
+  it("reads the five party names and ignores the queue menu", () => {
+    expect(
+      partyNamesFromText(
+        "Topgun707 Beachyman HuckIt MoJoE MrHustler\nPlatinum Gold Diamond\nQuick Match Searching",
+      ),
+    ).toEqual(["Topgun707", "Beachyman", "HuckIt", "MoJoE", "MrHustler"]);
+    expect(partyNamesFromText("Quick Match\nQuic Jers")).toEqual([]);
+    expect(namesFromColumn("Quic")).toEqual([]);
+  });
+
   it("reads RED PICK as their turn when we are on the left", () => {
     expect(bannerTurn("RED PICK")).toEqual({ phase: "pick", color: "red" });
     expect(bannerTurn("REDPICK")).toEqual({ phase: "pick", color: "red" });
+    expect(bannerTurn("Juno\nBanning\nYou pick a hero")).toEqual({
+      phase: "ban",
+      color: null,
+    });
+    expect(bannerTurn("Waiting for Enemy Ban...")).toEqual({ phase: "ban", color: null });
+    expect(
+      shownBanSide({
+        center: "ALARAK\nBANNED",
+        status: "Waiting for Enemy Ban...",
+        player: null,
+        ourNames: ["HuckIt", "PeterWiggin"],
+        theirNames: ["Gonkore"],
+      }),
+    ).toBe("our");
+    expect(
+      shownBanSide({
+        center: "Juno\nBanning",
+        status: "Waiting for Enemy Ban...",
+        player: "Juno",
+        ourNames: ["HuckIt"],
+        theirNames: ["Juno"],
+      }),
+    ).toBe("their");
+    expect(snapToRoster("MrHusti", ["MrHustler#1686"])).toBe("MrHustler");
+    expect(snapToRoster("Topguny03", ["Topgun707#1875"])).toBe("Topgun707");
     expect(sideFromBannerColor("red", true)).toBe("their");
     expect(sideFromBannerColor("blue", true)).toBe("our");
   });

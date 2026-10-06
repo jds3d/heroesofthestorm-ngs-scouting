@@ -297,6 +297,11 @@ export type ScoutReport = {
   /** Reported NGS match ids this report was built from. */
   reportedMatchIds: string[];
   warnings: string[];
+  /**
+   * Set when this HTTP call stopped early so Cloudflare would not return a
+   * 524. The client continues the same scout; cached pulls are kept.
+   */
+  incomplete?: boolean;
   apiUsage?: {
     predicted: import("@/lib/apiUsage").ApiCallCount[];
     actual: import("@/lib/apiUsage").ApiCallCount[];

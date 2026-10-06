@@ -15,6 +15,22 @@ export const FOREVER = null;
 const memory = new Map<string, CacheEnvelope<unknown>>();
 const inflight = new Map<string, Promise<unknown>>();
 const cacheDir = path.join(process.cwd(), ".cache");
+/** Disk is the source of truth. Memory only keeps the hot set. */
+const MAX_MEMORY_ENTRIES = 400;
+
+function remember(key: string, envelope: CacheEnvelope<unknown>): void {
+  if (memory.has(key)) memory.delete(key);
+  memory.set(key, envelope);
+  while (memory.size > MAX_MEMORY_ENTRIES) {
+    const oldest = memory.keys().next().value;
+    if (oldest === undefined) break;
+    memory.delete(oldest);
+  }
+}
+
+export function cacheMemorySize(): number {
+  return memory.size;
+}
 
 /** Keys for immutable past-game payloads (replays, drafts, bans, match shells). */
 export function isImmutableGameCacheKey(key: string): boolean {
@@ -43,13 +59,24 @@ function isFresh(
   envelope: CacheEnvelope<unknown>,
   now = Date.now(),
 ): boolean {
-  // Explicit TTL always wins — even on "immutable" key prefixes
-  // (used for draft-only soft shells on replay keys).
-  if (envelope.ttlMs != null) {
+  // A stored duration always wins, including a short TTL on a replay key.
+  if (typeof envelope.ttlMs === "number") {
     return now - envelope.storedAt <= envelope.ttlMs;
   }
-  if (isImmutableGameCacheKey(key)) return true;
-  return true;
+  // null is an explicit forever entry. Callers must pass this file's key,
+  // not the search prefix, so a later key-specific rule stays correct.
+  return envelope.ttlMs === null && key.length > 0;
+}
+
+function storedTtl(
+  key: string,
+  envelope: CacheEnvelope<unknown>,
+  fallback: number | null,
+): number | null {
+  if (typeof envelope.ttlMs === "number" || envelope.ttlMs === null) {
+    return envelope.ttlMs;
+  }
+  return isImmutableGameCacheKey(key) ? FOREVER : fallback;
 }
 
 async function readDisk<T>(key: string): Promise<CacheEnvelope<T> | null> {
@@ -81,7 +108,7 @@ export async function readCacheEntry<T>(
     const disk = await readDisk<T>(key);
     if (!disk) return null;
     envelope = disk;
-    memory.set(key, disk);
+    remember(key, disk);
   }
   return { data: envelope.data, fresh: isFresh(key, envelope) };
 }
@@ -127,7 +154,7 @@ export async function readNewestCacheByPrefix<T>(
       ) {
         continue;
       }
-      consider(envelope.storedAt, envelope.data, isFresh(prefix, envelope));
+      consider(envelope.storedAt, envelope.data, isFresh(name, envelope));
     } catch {
       continue;
     }
@@ -147,21 +174,18 @@ export async function getCached<T>(
     const disk = await readDisk<T>(key);
     if (!disk) return null;
     envelope = disk;
-    memory.set(key, disk);
+    remember(key, disk);
   }
   const effective: CacheEnvelope<T> = {
     ...envelope,
-    ttlMs: isImmutableGameCacheKey(key)
-      ? FOREVER
-      : envelope.ttlMs === undefined
-        ? ttlMs
-        : envelope.ttlMs,
+    ttlMs: storedTtl(key, envelope, ttlMs),
   };
   if (!isFresh(key, effective)) {
     memory.delete(key);
     await fs.unlink(fileFor(key)).catch(() => undefined);
     return null;
   }
+  remember(key, envelope);
   return effective.data;
 }
 
@@ -177,10 +201,11 @@ export async function setCached<T>(
 ): Promise<void> {
   const envelope: CacheEnvelope<T> = {
     storedAt: Date.now(),
-    ttlMs: isImmutableGameCacheKey(key) ? FOREVER : ttlMs,
+    // Caller TTL wins. Replay shells pass a few hours; finished games pass FOREVER.
+    ttlMs,
     data,
   };
-  memory.set(key, envelope);
+  remember(key, envelope);
   await writeDisk(key, envelope);
 }
 
@@ -210,7 +235,7 @@ export async function cachedFetch<T>(
   ttlMs: number | null = leagueConfig.cacheTtlMs,
   opts?: { isEmpty?: (data: T) => boolean },
 ): Promise<T> {
-  const effectiveTtl = isImmutableGameCacheKey(key) ? FOREVER : ttlMs;
+  const effectiveTtl = ttlMs;
   const hit = await getCached<T>(key, effectiveTtl);
   if (hit !== null) {
     const hollow =

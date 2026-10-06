@@ -3100,6 +3100,7 @@ export function InteractiveDraft({
   tournamentMode,
   onTournamentModeChange,
   stormLeagueOnly = false,
+  onWatchReset,
 }: {
   tree: DraftTreeNode;
   weFirst: boolean;
@@ -3150,6 +3151,8 @@ export function InteractiveDraft({
   onTournamentModeChange?: (on: boolean) => void;
   /** Stay on Storm League suggestions even if tournament mode is checked, until NGS pools are ready. */
   stormLeagueOnly?: boolean;
+  /** Clears the screen reader so the next frames load a new draft. */
+  onWatchReset?: () => void;
 }) {
   const [history, setHistory] = useState<BoardAction[]>([]);
   const [tournamentDraftModeState, setTournamentDraftModeState] = useState(
@@ -4232,7 +4235,7 @@ export function InteractiveDraft({
           .map((action) => ({ hero: action.hero, player: action.player ?? null })),
       );
       return watchSlSuggestion(
-        step.kind === "ban" ? homeRoster : theirRoster,
+        theirRoster,
         step.kind,
         step.kind === "pick" ? theirTaken : new Set(),
       );
@@ -5634,7 +5637,10 @@ export function InteractiveDraft({
   }
 
   function reset() {
+    screenCursor.current = 0;
+    screenHadLocks.current = false;
     setHistory([]);
+    setPairPick([]);
     setFilter("");
     setDeviationNote(null);
   }
@@ -5715,7 +5721,18 @@ export function InteractiveDraft({
             />
             <span>Tournament draft mode</span>
           </label>
-          {!watchOnly && (
+          {watchOnly ? (
+            <button
+              type="button"
+              onClick={() => {
+                reset();
+                onWatchReset?.();
+              }}
+              className="rounded-md border border-[#3d5163] px-3 py-1.5 text-sm font-semibold text-[#c5d4e0]"
+            >
+              Reset draft
+            </button>
+          ) : (
             <>
               <button
                 type="button"
@@ -5902,8 +5919,8 @@ export function InteractiveDraft({
                   ? "Tournament mode uses NGS hero pools. Heroes lock from the shared screen."
                   : tournamentDraftMode
                     ? "Loading NGS hero pools. Heroes lock from the shared screen."
-                  : ours && step?.kind === "ban"
-                    ? "Ban suggestions are each opponent's Storm League comfort. Heroes lock from the shared screen."
+                  : step?.kind === "ban"
+                    ? "Ban suggestions are the other team's Storm League comfort. Heroes lock from the shared screen."
                     : ours && step?.kind === "pick"
                       ? "One Storm League suggestion for each player still to lock. Heroes lock from the shared screen."
                       : "Storm League history only. Heroes lock from the shared screen."}
@@ -5960,12 +5977,6 @@ export function InteractiveDraft({
                     : `${matchupMissing.length} hero${matchupMissing.length === 1 ? "" : "es"} queued`}
                 </p>
               </div>
-            ) : null}
-
-            {watchOnly && !suggestion && step ? (
-              <p className="text-sm text-[#c5d4e0]">
-                Reading the names on screen. A Storm League suggestion for each player shows up as soon as those histories load.
-              </p>
             ) : null}
 
             {suggestion && (

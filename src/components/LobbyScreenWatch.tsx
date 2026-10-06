@@ -5,7 +5,8 @@ import { heroKey } from "@/lib/scoring/heroMeta";
 import type { Worker } from "tesseract.js";
 import {
   DRAFT_BAN_STRIPS,
-  DRAFT_NAME_COLUMNS,
+  DRAFT_NAME_PLATES,
+  DRAFT_STATUS_BOX,
   DRAFT_TITLE_BOX,
   DRAFT_TURN_BOX,
   EMPTY_LIVE_DRAFT,
@@ -15,14 +16,17 @@ import {
   pickCountsFit,
   borderLooksLockedSamples,
   DRAFT_PICK_SLOTS,
+  PARTY_NAME_ROW,
   heroesFromColumn,
+  heroOnPlate,
+  partyNamesFromText,
   mapFromTitle,
+  nameFromPlate,
   playerFromSlotText,
-  namesFromColumn,
   nextTurn,
   ocrFold,
-  ourSideIsLeft,
   rememberHeroes,
+  shownBanSide,
   sideFromBannerColor,
   snapToRoster,
   takeNewLocks,
@@ -116,6 +120,7 @@ export function LobbyScreenWatch({
   onOurSide,
   onDraft,
   onWatchingChange,
+  resetEpoch = 0,
 }: {
   ourNames: string[];
   /** Battletags the OCR names can snap onto (both lineups). */
@@ -125,6 +130,8 @@ export function LobbyScreenWatch({
   onOurSide?: (names: string[]) => void;
   onDraft: (draft: LiveDraft) => void;
   onWatchingChange?: (watching: boolean) => void;
+  /** Bump to drop the last game and read the current screen from scratch. */
+  resetEpoch?: number;
 }) {
   const [phase, setPhase] = useState<Phase>("idle");
   const [status, setStatus] = useState(
@@ -135,6 +142,8 @@ export function LobbyScreenWatch({
   const timerRef = useRef<number | null>(null);
   const workerRef = useRef<Worker | null>(null);
   const busyRef = useRef(false);
+  const epochRef = useRef(0);
+  const appliedReset = useRef(0);
   const oursRef = useRef(ourNames);
   const rosterRef = useRef(rosterNames);
   const onLobbyRef = useRef(onLobby);
@@ -150,6 +159,8 @@ export function LobbyScreenWatch({
   const rightSlotPlayers = useRef<(string | null)[]>([null, null, null, null, null]);
   const draftRef = useRef<LiveDraft>({ ...EMPTY_LIVE_DRAFT });
   const openTurnRef = useRef<OpenTurn | null>(null);
+  const lineMode = useRef<string | null>(null);
+  const sparseMode = useRef<string | null>(null);
 
   useEffect(() => {
     oursRef.current = ourNames;
@@ -200,6 +211,31 @@ export function LobbyScreenWatch({
     return result.data.text;
   }
 
+  /** One OCR line per name banner, so both teams are read the same way. */
+  async function readNamePlates(
+    frame: HTMLCanvasElement,
+    worker: Worker,
+    boxes: readonly Box[],
+  ): Promise<string[]> {
+    const names: string[] = [];
+    try {
+      if (lineMode.current) {
+        await worker.setParameters({ tessedit_pageseg_mode: lineMode.current as never });
+      }
+      for (const box of boxes) {
+        const name = nameFromPlate(await readColumn(frame, worker, box));
+        if (!name || names.some((have) => have.toLowerCase() === name.toLowerCase())) continue;
+        names.push(name);
+        if (names.length === 5) break;
+      }
+    } finally {
+      if (sparseMode.current) {
+        await worker.setParameters({ tessedit_pageseg_mode: sparseMode.current as never });
+      }
+    }
+    return names;
+  }
+
   async function lockedHeroes(
     frame: HTMLCanvasElement,
     worker: Worker,
@@ -217,16 +253,45 @@ export function LobbyScreenWatch({
       }
       if (!cache[i] || !players[i]) {
         const text = (await worker.recognize(plate)).data.text;
-        if (!cache[i]) cache[i] = heroesFromColumn(text)[0] ?? null;
+        if (!cache[i]) cache[i] = heroOnPlate(text);
         if (!players[i]) players[i] = playerFromSlotText(text);
       }
-      if (cache[i]) locks.push({ hero: cache[i] as string, player: players[i] });
+      if (cache[i] && players[i]) locks.push({ hero: cache[i] as string, player: players[i] });
     }
     return locks;
   }
 
+  function clearObserved() {
+    announcedPicksRef.current = [];
+    leftSlotHeroes.current = [null, null, null, null, null];
+    rightSlotHeroes.current = [null, null, null, null, null];
+    leftSlotPlayers.current = [null, null, null, null, null];
+    rightSlotPlayers.current = [null, null, null, null, null];
+    lastKeyRef.current = "";
+    lastOursKeyRef.current = "";
+    openTurnRef.current = null;
+    draftRef.current = {
+      ...EMPTY_LIVE_DRAFT,
+      ourPicks: [],
+      theirPicks: [],
+      ourBans: [],
+      theirBans: [],
+    };
+    onDraftRef.current(draftRef.current);
+    setNames([]);
+    setStatus("Draft reset. Reading this screen from scratch.");
+  }
+
+  useEffect(() => {
+    if (resetEpoch === appliedReset.current) return;
+    appliedReset.current = resetEpoch;
+    epochRef.current = resetEpoch;
+    clearObserved();
+  }, [resetEpoch]);
+
   async function readFrame(video: HTMLVideoElement, worker: Worker) {
     if (busyRef.current || video.readyState < 2) return;
+    const epoch = epochRef.current;
     busyRef.current = true;
     setPhase("reading");
     try {
@@ -237,15 +302,20 @@ export function LobbyScreenWatch({
       if (!ctx) return;
       ctx.drawImage(video, 0, 0);
       const roster = rosterRef.current;
-      const leftText = await readColumn(frame, worker, DRAFT_NAME_COLUMNS.left);
-      const rightText = await readColumn(frame, worker, DRAFT_NAME_COLUMNS.right);
-      const leftPlayers = namesFromColumn(leftText).map((name) => snapToRoster(name, roster));
-      const rightPlayers = namesFromColumn(rightText).map((name) => snapToRoster(name, roster));
-      const usOnLeft = ourSideIsLeft(leftPlayers, rightPlayers, oursRef.current);
-      const ourColumn = usOnLeft ? leftPlayers : rightPlayers;
+      const partyText = await readColumn(frame, worker, PARTY_NAME_ROW);
+      const leftPlayers = (await readNamePlates(frame, worker, DRAFT_NAME_PLATES.left)).map((name) =>
+        snapToRoster(name, roster),
+      );
+      const rightPlayers = (await readNamePlates(frame, worker, DRAFT_NAME_PLATES.right)).map((name) =>
+        snapToRoster(name, roster),
+      );
+      const usOnLeft = true;
+      const ourColumn = leftPlayers;
       const centerText = await readColumn(frame, worker, DRAFT_TURN_BOX);
-      const banner = bannerTurn(centerText);
+      const statusText = await readColumn(frame, worker, DRAFT_STATUS_BOX);
+      const banner = bannerTurn(`${centerText}\n${statusText}`);
       const centerRead = turnFromOcr(centerText, roster);
+      if (banner.phase) centerRead.phase = banner.phase;
       if ((centerRead.phase ?? banner.phase) === "pick" && centerRead.hero) {
         const announced = announcedPicksRef.current;
         const last = announced[announced.length - 1];
@@ -266,20 +336,26 @@ export function LobbyScreenWatch({
         rightSlotPlayers.current,
       );
       const draft = draftRef.current;
-      const ourLocked = takeNewLocks(
-        draft.ourPicks,
-        usOnLeft ? leftLocked : rightLocked,
-        announcedPicksRef.current,
-        draft.ourPickPlayers,
-      );
-      const theirLocked = takeNewLocks(
-        draft.theirPicks,
-        usOnLeft ? rightLocked : leftLocked,
-        announcedPicksRef.current,
-        draft.theirPickPlayers,
-      );
-      const ourPicks = ourLocked.heroes;
-      const theirPicks = theirLocked.heroes;
+      const phaseNow = banner.phase ?? centerRead.phase ?? draft.phase;
+      const allowPicks = phaseNow === "pick";
+      const ourLocked = allowPicks
+        ? takeNewLocks(
+            draft.ourPicks,
+            usOnLeft ? leftLocked : rightLocked,
+            announcedPicksRef.current,
+            draft.ourPickPlayers,
+          )
+        : { heroes: [] as string[], players: [] as (string | null)[] };
+      const theirLocked = allowPicks
+        ? takeNewLocks(
+            draft.theirPicks,
+            usOnLeft ? rightLocked : leftLocked,
+            announcedPicksRef.current,
+            draft.theirPickPlayers,
+          )
+        : { heroes: [] as string[], players: [] as (string | null)[] };
+      let ourPicks = ourLocked.heroes;
+      let theirPicks = theirLocked.heroes;
       const leftBanText = await readColumn(frame, worker, DRAFT_BAN_STRIPS.left);
       const rightBanText = await readColumn(frame, worker, DRAFT_BAN_STRIPS.right);
       const turn = nextTurn(
@@ -287,9 +363,11 @@ export function LobbyScreenWatch({
         centerRead.phase ? centerRead : { ...centerRead, phase: banner.phase },
         (player) => {
           const fold = ocrFold(player);
+          if (fold === ocrFold("HuckIt")) return "our";
           if (ourColumn.some((name) => ocrFold(name) === fold)) return "our";
           if (oursRef.current.some((name) => ocrFold(name) === fold)) return "our";
-          return "their";
+          if (rightPlayers.some((name) => ocrFold(name) === fold)) return "their";
+          return null;
         },
         banner.color ? sideFromBannerColor(banner.color, usOnLeft) : null,
       );
@@ -303,6 +381,29 @@ export function LobbyScreenWatch({
         else theirBans = rememberHeroes(theirBans, [turn.ban.hero], 3);
       }
       let phase = banner.phase ?? centerRead.phase ?? draft.phase;
+      if (phase === "ban" && centerRead.hero) {
+        const banSide = shownBanSide({
+          center: centerText,
+          status: statusText,
+          player: centerRead.player,
+          ourNames: [...ourColumn, ...oursRef.current],
+          theirNames: rightPlayers,
+        });
+        if (banSide) {
+          const key = heroKey(centerRead.hero);
+          if (banSide === "our") {
+            theirBans = theirBans.filter((hero) => heroKey(hero) !== key);
+            ourBans = rememberHeroes(ourBans, [centerRead.hero], 3);
+          } else {
+            ourBans = ourBans.filter((hero) => heroKey(hero) !== key);
+            theirBans = rememberHeroes(theirBans, [centerRead.hero], 3);
+          }
+        }
+      }
+      if (ourBans.length + theirBans.length < 2 && phase !== "pick") {
+        ourPicks = [];
+        theirPicks = [];
+      }
       let firstPick = draft.firstPick;
       const turnSide =
         turn.open?.side ??
@@ -319,6 +420,10 @@ export function LobbyScreenWatch({
       ) {
         const side = sideFromBannerColor(banner.color, usOnLeft);
         firstPick = side === "our" ? "us" : "them";
+      }
+      if (ourPicks.length + theirPicks.length === 0) {
+        if (ourBans.length > 0 && theirBans.length === 0) firstPick = "us";
+        else if (theirBans.length > 0 && ourBans.length === 0) firstPick = "them";
       }
       if (ourPicks.length + theirPicks.length > 0) {
         const inferred = inferFirstPick({
@@ -345,18 +450,28 @@ export function LobbyScreenWatch({
         phase,
         map,
       };
+      if (epoch !== epochRef.current) return;
       draftRef.current = nextDraft;
       onDraftRef.current(nextDraft);
 
-      if (ourColumn.length > 0) {
+      const partyNames = partyNamesFromText(partyText).map((name) => snapToRoster(name, roster));
+      const inParty = partyNames.length >= 3 && ourPicks.length + theirPicks.length === 0;
+      if (inParty) {
+        const partyKey = partyNames.map((name) => name.toLowerCase()).join("|");
+        if (partyKey !== lastOursKeyRef.current) {
+          lastOursKeyRef.current = partyKey;
+          onOurSideRef.current?.(partyNames);
+        }
+        setStatus(`In queue. Loading Storm League for ${partyNames.join(", ")}.`);
+      } else if (ourColumn.length > 0) {
         const oursKey = ourColumn.map((name) => name.toLowerCase()).join("|");
         if (oursKey !== lastOursKeyRef.current) {
           lastOursKeyRef.current = oursKey;
           onOurSideRef.current?.(ourColumn);
         }
       }
-      const opponents = usOnLeft ? rightPlayers : leftPlayers;
-      if (opponents.length > 0) {
+      const opponents = inParty ? [] : rightPlayers;
+      if (!inParty && opponents.length > 0) {
         const key = opponents.map((name) => name.toLowerCase()).join("|");
         if (key !== lastKeyRef.current) {
           lastKeyRef.current = key;
@@ -365,7 +480,7 @@ export function LobbyScreenWatch({
         }
       }
       const locks = ourPicks.length + theirPicks.length + ourBans.length + theirBans.length;
-      setStatus(
+      if (!inParty) setStatus(
         locks > 0
           ? `Draft from the screen: we banned ${ourBans.join(", ") || "—"}, picked ${ourPicks.join(", ") || "—"}. They banned ${theirBans.join(", ") || "—"}, picked ${theirPicks.join(", ") || "—"}.`
           : phase === "pick"
@@ -431,6 +546,8 @@ export function LobbyScreenWatch({
       await video.play();
       const { createWorker, PSM } = await import("tesseract.js");
       const worker = await createWorker("eng");
+      lineMode.current = PSM.SINGLE_LINE;
+      sparseMode.current = PSM.SPARSE_TEXT;
       await worker.setParameters({
         tessedit_pageseg_mode: PSM.SPARSE_TEXT,
         tessedit_char_whitelist: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'",

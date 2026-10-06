@@ -46,7 +46,30 @@ const UI_WORDS = new Set([
   "lobby",
   "map",
   "match",
+  "aram",
+  "brawl",
+  "bronze",
+  "collection",
+  "custom",
+  "diamond",
+  "gold",
+  "grandmaster",
+  "loot",
+  "master",
+  "platinum",
+  "play",
+  "quick",
+  "searching",
+  "season",
+  "selected",
+  "server",
+  "banned",
+  "teammates",
+  "browse",
+  "silver",
   "starting",
+  "watch",
+  "wins",
   "mercenary",
   "objective",
   "pass",
@@ -104,6 +127,38 @@ export const DRAFT_NAME_COLUMNS = {
   right: { x: 0.82, y: 0.08, w: 0.18, h: 0.8, rotate: 32 },
 } as const;
 
+/**
+ * One name banner per player. A single column mixes the hex borders into the
+ * letters, which turns Topgun707 into Topguny03 and cuts MrHustler short.
+ * The same boxes are used for both teams. Nothing here is guessed from a roster.
+ */
+/**
+ * The whole name column. `rotate` is degrees clockwise. Left banners tilt
+ * down to the right, so -30 lays them flat. Right banners tilt the other way.
+ * Measured on a 1024x576 Cursed Hollow draft.
+ */
+export const DRAFT_NAME_COLUMN = {
+  left: { x: 0, y: 40 / 576, w: 250 / 1024, h: 490 / 576, rotate: -30 },
+  right: { x: 800 / 1024, y: 30 / 576, w: 224 / 1024, h: 500 / 576, rotate: 26 },
+} as const;
+
+export const DRAFT_NAME_PLATES: { left: DraftBox[]; right: DraftBox[] } = {
+  left: [0, 1, 2, 3, 4].map((i) => ({
+    x: 0,
+    y: 0.17 + i * 0.156,
+    w: 0.19,
+    h: 0.096,
+    rotate: -18,
+  })),
+  right: [0, 1, 2, 3, 4].map((i) => ({
+    x: 0.79,
+    y: 0.17 + i * 0.156,
+    w: 0.21,
+    h: 0.1,
+    rotate: 18,
+  })),
+};
+
 export type DraftBox = { x: number; y: number; w: number; h: number; rotate: number };
 
 /**
@@ -128,11 +183,23 @@ export const DRAFT_PICK_SLOTS: { left: DraftBox[]; right: DraftBox[] } = {
   })),
 };
 
-/** Center announcement, including the hero name under the model. */
-export const DRAFT_TURN_BOX = { x: 0.26, y: 0.16, w: 0.48, h: 0.58, rotate: 0 } as const;
+/**
+ * Center announcement only. Kept narrow so the chat log, which overlaps the
+ * right side of the draft, cannot turn "Banning" into a pick.
+ */
+export const DRAFT_TURN_BOX = { x: 0.36, y: 0.28, w: 0.28, h: 0.36, rotate: 0 } as const;
+
+/** Bottom pill, such as "Waiting for Enemy Ban...". */
+export const DRAFT_STATUS_BOX = { x: 0.28, y: 0.78, w: 0.44, h: 0.08, rotate: 0 } as const;
 
 /** Map title along the top of a 16:9 draft. */
 export const DRAFT_TITLE_BOX = { x: 0.28, y: 0, w: 0.44, h: 0.1, rotate: 0 } as const;
+
+/**
+ * The five names above the rank medals on the Storm League party screen,
+ * while the group is still queuing.
+ */
+export const PARTY_NAME_ROW = { x: 0.04, y: 0.12, w: 0.92, h: 0.08, rotate: 0 } as const;
 
 /**
  * Locked ban portraits sit in a row under the map, inside the nameplates.
@@ -194,15 +261,96 @@ export type OpenTurn = {
   side: "our" | "their";
 };
 
-/** One line from a draft nameplate. Drops 1–3 letter OCR scraps. */
-export function nameFromPlate(text: string): string | null {
-  const tokens = text.split(/[^A-Za-z0-9']+/).filter(Boolean);
-  const ranked = tokens
-    .map((token) => token.replace(/^'+|'+$/g, ""))
-    .filter((token) => /^[A-Za-z][A-Za-z0-9']{3,17}$/.test(token))
-    .filter((token) => !UI_WORDS.has(token.toLowerCase()))
+function isUiFragment(token: string): boolean {
+  const fold = token.toLowerCase();
+  if (UI_WORDS.has(fold)) return true;
+  if (fold.length < 5) {
+    for (const word of UI_WORDS) {
+      if (word.startsWith(fold) && word.length > fold.length) return true;
+    }
+  }
+  return false;
+}
+
+function plateNameToken(token: string): string | null {
+  const cleaned = token.replace(/^'+|'+$/g, "");
+  if (!/^[A-Za-z][A-Za-z0-9']{3,17}$/.test(cleaned)) return null;
+  if (isUiFragment(cleaned) || isHero(cleaned) || heroFromPlateText(cleaned)) return null;
+  return cleaned;
+}
+
+function plateLines(text: string): string[] {
+  return text
+    .split(/\n+/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+}
+
+function playerToken(line: string): string | null {
+  if (isUiFragment(line)) return null;
+  const ranked = line
+    .split(/[^A-Za-z0-9']+/)
+    .map((token) => plateNameToken(token))
+    .filter((token): token is string => Boolean(token))
     .sort((a, b) => b.length - a.length);
   return ranked[0] ?? null;
+}
+
+/**
+ * The player on a nameplate. The top line is the hero (Valla, Mal'Ganis).
+ * The bottom line is who locked it (Topgun707, PeterWiggin). A hero line
+ * alone is not a player.
+ */
+export function nameFromPlate(text: string): string | null {
+  const lines = plateLines(text);
+  if (!lines.length) return null;
+  if (lines.length >= 2) return playerToken(lines[lines.length - 1]);
+  return playerToken(lines[0]);
+}
+
+/** The hero printed on the top line of a nameplate. "PICKING" is not a lock. */
+export function heroOnPlate(text: string): string | null {
+  const lines = plateLines(text);
+  if (!lines.length) return null;
+  const top = lines[0];
+  if (isUiFragment(top) || /\bpicking\b/i.test(top)) return null;
+  return heroFromPlateText(top);
+}
+
+/**
+ * Names across the Storm League party screen, left to right.
+ * Rank words and the top menu are ignored, so queuing can load our five
+ * before the draft opens.
+ */
+export function partyNamesFromText(text: string): string[] {
+  const names: string[] = [];
+  const seen = new Set<string>();
+  for (const token of text.split(/[^A-Za-z0-9']+/)) {
+    const name = plateNameToken(token);
+    if (!name || name.length < 5) continue;
+    const fold = name.toLowerCase();
+    if (seen.has(fold)) continue;
+    seen.add(fold);
+    names.push(name);
+    if (names.length === 5) break;
+  }
+  return names;
+}
+
+export type OcrNameLine = { text: string; top: number };
+
+/** Player names from a deskewed column, top to bottom. Hero labels are skipped. */
+export function namesFromOcrLines(lines: readonly OcrNameLine[]): string[] {
+  const names: string[] = [];
+  const sorted = [...lines].sort((a, b) => a.top - b.top);
+  for (const line of sorted) {
+    const name = nameFromPlate(line.text);
+    if (!name || heroFromPlateText(name)) continue;
+    if (names.some((have) => have.toLowerCase() === name.toLowerCase())) continue;
+    names.push(name);
+    if (names.length === 5) break;
+  }
+  return names;
 }
 
 /** Up to five player names, top to bottom. Hero labels on the same plates are skipped. */
@@ -224,27 +372,7 @@ export function namesFromColumn(text: string): string[] {
  * (including "LI-MING Thomas" on one line) are not the player.
  */
 export function playerFromSlotText(text: string): string | null {
-  const heroNorms = new Set<string>();
-  for (const hero of heroesFromColumn(text)) {
-    heroNorms.add(plateNorm(hero));
-    heroNorms.add(plateNorm(heroKey(hero)));
-  }
-  for (const line of text.split(/\n+/)) {
-    for (const token of line.split(/[^A-Za-z0-9']+/)) {
-      if (token.length < 4) continue;
-      if (heroFromPlateText(token)) continue;
-      const tokenNorm = plateNorm(token);
-      if (
-        heroNorms.has(tokenNorm) ||
-        [...heroNorms].some((norm) => norm.includes(tokenNorm))
-      ) {
-        continue;
-      }
-      const name = nameFromPlate(token);
-      if (name && !heroFromPlateText(name)) return name;
-    }
-  }
-  return null;
+  return nameFromPlate(text);
 }
 
 /** Locked heroes on one side, top to bottom, in draft-board spelling. */
@@ -389,11 +517,17 @@ export function heroFromPlateText(text: string): string | null {
   const list = plateHeroList();
   const exact = list.find((hero) => hero.norm === joined);
   if (exact) return exact.hero;
-  if (joined.length >= 8) {
+  if (joined.length >= 6) {
     const prefix = list.filter(
       (hero) => hero.norm.startsWith(joined) || joined.startsWith(hero.norm),
     );
     if (prefix.length === 1) return prefix[0].hero;
+    const near = list.filter(
+      (hero) =>
+        Math.abs(hero.norm.length - joined.length) <= 1 &&
+        editDistance(hero.norm, joined) <= 1,
+    );
+    if (near.length === 1) return near[0].hero;
   }
   for (const token of text.split(/[^A-Za-z0-9']+/)) {
     if (token.length < 3) continue;
@@ -441,10 +575,18 @@ export function snapToRoster(name: string, roster: readonly string[]): string {
     if (foldedTag === folded) return base;
     const dist = editDistance(foldedTag, folded);
     const limit = folded.length >= 8 ? 2 : 1;
+    let shared = 0;
+    while (shared < folded.length && shared < foldedTag.length && folded[shared] === foldedTag[shared]) {
+      shared += 1;
+    }
+    const truncated =
+      shared >= 6 &&
+      Math.abs(foldedTag.length - folded.length) <= 3 &&
+      shared >= Math.min(folded.length, foldedTag.length) - 1;
     if (
       folded.length >= 5 &&
       dist > 0 &&
-      dist <= limit &&
+      (dist <= limit || (truncated && dist <= 4)) &&
       (!closest || dist < closest.dist)
     ) {
       closest = { base, dist };
@@ -453,33 +595,80 @@ export function snapToRoster(name: string, roster: readonly string[]): string {
   return closest?.base ?? name;
 }
 
-/** Center banner such as "RED PICK" or "BLUE BAN". OCR may glue the words together. */
+/**
+ * Center banner such as "RED PICK", "Juno Banning", or "Waiting for Enemy Ban".
+ * "Banning" wins over a stray "pick" from chat or the hero browser.
+ */
 export function bannerTurn(text: string): {
   phase: "ban" | "pick" | null;
   color: "red" | "blue" | null;
 } {
-  const tight = text.toLowerCase().replace(/[^a-z]/g, "");
-  let phase: "ban" | "pick" | null = null;
-  if (
-    tight.includes("picking") ||
-    tight.includes("redpick") ||
-    tight.includes("bluepick") ||
-    /(^|[^a-z])pick([^a-z]|$)/.test(text.toLowerCase())
-  ) {
-    phase = "pick";
-  } else if (
+  const lower = text.toLowerCase();
+  const tight = lower.replace(/[^a-z]/g, "");
+  const banning =
+    /\bbanning\b/.test(lower) ||
     tight.includes("banning") ||
+    tight.includes("banned") ||
+    /\bbanned\b/.test(lower) ||
+    tight.includes("enemyban") ||
+    tight.includes("waitingforenemyban");
+  const picking = /\bpicking\b/.test(lower) || tight.includes("picking");
+  let phase: "ban" | "pick" | null = null;
+  if (banning && !picking) phase = "ban";
+  else if (picking && !banning) phase = "pick";
+  else if (banning && picking) {
+    const banAt = lower.search(/banning|enemy ban/);
+    const pickAt = lower.search(/picking/);
+    phase = pickAt >= 0 && pickAt < banAt ? "pick" : "ban";
+  } else if (
     tight.includes("redban") ||
     tight.includes("blueban") ||
-    /(^|[^a-z])ban([^a-z]|$)/.test(text.toLowerCase())
+    /(^|[^a-z])ban([^a-z]|$)/.test(lower)
   ) {
     phase = "ban";
+  } else if (
+    tight.includes("redpick") ||
+    tight.includes("bluepick") ||
+    /(^|[^a-z])pick([^a-z]|$)/.test(lower)
+  ) {
+    phase = "pick";
   }
   const color = tight.includes("red") ? "red" : tight.includes("blue") ? "blue" : null;
   return { phase, color };
 }
 
-/** Blue is the left column, red is the right. */
+/**
+ * Who owns the hero on the center ban splash.
+ * HuckIt's team is us, and that team is the left column. "Waiting for Enemy
+ * Ban" means their turn is now, so a hero already marked BANNED was locked by us.
+ * An unknown splash is not given to them.
+ */
+export function shownBanSide(args: {
+  center: string;
+  status: string;
+  player: string | null;
+  ourNames: readonly string[];
+  theirNames: readonly string[];
+}): "our" | "their" | null {
+  const fold = (name: string) => ocrFold(name.split("#")[0] ?? name);
+  const ours = new Set(args.ourNames.map(fold));
+  ours.add(fold("HuckIt"));
+  const theirs = new Set(args.theirNames.map(fold));
+  if (args.player) {
+    const who = fold(args.player);
+    if (ours.has(who)) return "our";
+    if (theirs.has(who)) return "their";
+  }
+  const blob = `${args.center}\n${args.status}`.toLowerCase();
+  const waitingOnEnemy = /waiting for enemy ban/.test(blob);
+  const locked = /\bbanned\b/.test(blob);
+  const choosing = /\bbanning\b/.test(blob);
+  if (waitingOnEnemy && locked && !choosing) return "our";
+  if (waitingOnEnemy && choosing && !locked) return "their";
+  return null;
+}
+
+/** Blue is the left column, red is the right. Us is the left column. */
 export function sideFromBannerColor(
   color: "red" | "blue",
   usOnLeft: boolean,
@@ -499,14 +688,11 @@ export function mapFromTitle(text: string): string | null {
 }
 
 export function turnFromOcr(text: string, roster: readonly string[]): TurnRead {
-  let phase: TurnRead["phase"] = null;
   let player: string | null = null;
   let hero: string | null = null;
   for (const line of text.split(/\n+/)) {
     const fold = line.trim().toLowerCase();
     if (!fold) continue;
-    if (/\bbanning\b/.test(fold) || /(^|[^a-z])ban([^a-z]|$)/.test(fold)) phase = "ban";
-    else if (/\bpicking\b/.test(fold) || /(^|[^a-z])pick([^a-z]|$)/.test(fold)) phase = "pick";
     const heroHit = heroFromPlateText(line);
     if (heroHit) {
       hero = heroHit;
@@ -515,7 +701,7 @@ export function turnFromOcr(text: string, roster: readonly string[]): TurnRead {
     const name = nameFromPlate(line);
     if (name) player = snapToRoster(name, roster);
   }
-  return { player, phase, hero };
+  return { player, phase: bannerTurn(text).phase, hero };
 }
 
 /**

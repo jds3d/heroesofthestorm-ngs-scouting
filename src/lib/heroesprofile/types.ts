@@ -43,7 +43,8 @@ export type HpDraftEntry = {
 export type HpMatchGame = {
   map: string;
   length: number;
-  winner: boolean;
+  /** null when this game came from a draft shell with no winner. */
+  winner: boolean | null;
   team_heroes: string[];
   team_bans: string[];
   enemy_heroes: string[];
@@ -61,6 +62,8 @@ export type HpNgsMatch = {
   round: string;
   total_games: number;
   match_data: Record<string, HpMatchGame>;
+  /** Set when a round was cached. Missing on older files. */
+  winnersKnown?: boolean;
 };
 
 /** Normalized replay used by the scout pipeline. */
@@ -77,7 +80,7 @@ export type HpReplayData = {
     blizz_id?: number;
     hero: string;
     team: number;
-    winner: boolean;
+    winner: boolean | null;
   }>;
 };
 

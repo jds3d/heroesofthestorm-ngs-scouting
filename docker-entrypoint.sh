@@ -1,5 +1,5 @@
 #!/bin/sh
 set -e
-mkdir -p /app/.cache
-chown -R nextjs:nodejs /app/.cache
+mkdir -p /app/.cache /app/drafts
+chown -R nextjs:nodejs /app/.cache /app/drafts
 exec su-exec nextjs "$@"

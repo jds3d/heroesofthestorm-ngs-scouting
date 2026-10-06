@@ -43,5 +43,8 @@ next-env.d.ts
 # local API cache
 .cache/
 
+# watched drafts
+/drafts/
+
 # Cloudflare tunnel credentials (never commit)
 cloudflared/credentials.json

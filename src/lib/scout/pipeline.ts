@@ -1,4 +1,5 @@
 import { leagueConfig, stormLeagueWindows } from "@/config/league";
+import { isScoutBudgetExceeded } from "@/lib/scout/budget";
 import {
   HeroesProfileError,
   getNgsMatch,
@@ -53,7 +54,16 @@ function withRecent(
   return out;
 }
 
+/** Real hero rows only. A name-only top-three list is not a game sample. */
+export function ngsCurrentFromProfile(profile: {
+  heroes?: NgsHeroRow[];
+  top_three_heroes?: string[];
+}): Map<string, SourceHeroStat> {
+  return heroRowsToSourceMap(profile.heroes ?? []);
+}
+
 /** Prefer ngs/player hero pool over per-game replay scraping. */
+
 function heroRowsToSourceMap(rows: NgsHeroRow[]): Map<string, SourceHeroStat> {
   const total = rows.reduce((n, h) => n + (h.games_played || 0), 0);
   const out = new Map<string, SourceHeroStat>();
@@ -123,22 +133,49 @@ export async function generateScoutReport(
 
   const [currentMatches, priorMatches] = await Promise.all([
     getTeamMatches(teamName, leagueConfig.season),
-    getTeamMatches(teamName, leagueConfig.priorSeason).catch(
-      () => [] as NgsMatch[],
-    ),
+    getTeamMatches(teamName, leagueConfig.priorSeason).catch((err) => {
+      if (isScoutBudgetExceeded(err)) throw err;
+      return [] as NgsMatch[];
+    }),
   ]);
 
   let hpAuthBroken = false;
   let returningCount = 0;
+  let incomplete = false;
+  const stop = (err: unknown) => {
+    if (!isScoutBudgetExceeded(err)) return false;
+    incomplete = true;
+    return true;
+  };
 
-  const players = await Promise.all(
-    roster.map(async (battletag) => {
+  const players: PlayerScout[] = [];
+  for (const battletag of roster) {
+    if (hpAuthBroken) {
+      players.push(
+        buildPlayerComfort({
+          battletag,
+          ngsCurrent: new Map(),
+          stormLeague: new Map(),
+          ngsPrior: new Map(),
+          includePrior: false,
+          ngsWins: 0,
+          ngsLosses: 0,
+          blizzId: null,
+          heroesProfileUrl: heroesProfilePlayerUrl(battletag, null),
+          ngsProfileUrl: ngsHeroesProfileUrl(battletag, null),
+        }),
+      );
+      continue;
+    }
+    players.push(await (async () => {
       let slMap = new Map<string, SourceHeroStat>();
-      if (!hpAuthBroken) {
+      if (!hpAuthBroken && !incomplete) {
         try {
           slMap = await loadWindowedMode(battletag, "Storm League");
         } catch (err) {
-          if (err instanceof HeroesProfileError) {
+          if (stop(err)) {
+            /* keep the pools already loaded */
+          } else if (err instanceof HeroesProfileError) {
             warnings.push(err.message);
             if (err.status === 401 || err.status === 403) hpAuthBroken = true;
           }
@@ -155,7 +192,7 @@ export async function generateScoutReport(
       let ngsPrior = new Map<string, SourceHeroStat>();
       let includePrior = false;
 
-      if (!hpAuthBroken) {
+      if (!hpAuthBroken && !incomplete) {
         try {
           const profile = await getNgsPlayerProfile(
             battletag,
@@ -165,27 +202,18 @@ export async function generateScoutReport(
           preferredRole = profile.preferred_role ?? null;
           ngsWins = Number(profile.wins) || 0;
           ngsLosses = Number(profile.losses) || 0;
-          ngsCurrent = heroRowsToSourceMap(profile.heroes ?? []);
-          if (ngsCurrent.size === 0) {
-            for (const hero of profile.top_three_heroes ?? []) {
-              ngsCurrent.set(hero, {
-                games: 2,
-                wins: 1,
-                losses: 1,
-                winRate: 0.5,
-                playPct: 0.33,
-              });
-            }
-          }
+          ngsCurrent = ngsCurrentFromProfile(profile);
         } catch (err) {
-          if (err instanceof HeroesProfileError) {
+          if (stop(err)) {
+            /* keep the pools already loaded */
+          } else if (err instanceof HeroesProfileError) {
             warnings.push(err.message);
             if (err.status === 401 || err.status === 403) hpAuthBroken = true;
           }
         }
       }
 
-      if (!hpAuthBroken) {
+      if (!hpAuthBroken && !incomplete) {
         try {
           const prior = await ngsSeasonMap(battletag, leagueConfig.priorSeason);
           if (prior) {
@@ -194,7 +222,9 @@ export async function generateScoutReport(
             returningCount += 1;
           }
         } catch (err) {
-          if (
+          if (stop(err)) {
+            /* keep the pools already loaded */
+          } else if (
             err instanceof HeroesProfileError &&
             (err.status === 401 || err.status === 403)
           ) {
@@ -204,7 +234,7 @@ export async function generateScoutReport(
         }
       }
 
-      if (stormLeagueThin && !hpAuthBroken) {
+      if (stormLeagueThin && !hpAuthBroken && !incomplete) {
         let emptyStreak = ngsPrior.size === 0 ? 1 : 0;
         const floor = Math.max(
           1,
@@ -228,6 +258,7 @@ export async function generateScoutReport(
             ngsPrior = mergeSourceMaps([ngsPrior, older]);
             includePrior = true;
           } catch (err) {
+            if (stop(err)) break;
             if (
               err instanceof HeroesProfileError &&
               (err.status === 401 || err.status === 403)
@@ -248,12 +279,15 @@ export async function generateScoutReport(
       if (
         stormLeagueThin &&
         ngsPool < leagueConfig.minGames.confidentPool &&
-        !hpAuthBroken
+        !hpAuthBroken &&
+        !incomplete
       ) {
         try {
           quickMatch = await loadWindowedMode(battletag, "Quick Match");
         } catch (err) {
-          if (err instanceof HeroesProfileError) {
+          if (stop(err)) {
+            /* keep the pools already loaded */
+          } else if (err instanceof HeroesProfileError) {
             warnings.push(err.message);
             if (err.status === 401 || err.status === 403) hpAuthBroken = true;
           }
@@ -261,6 +295,7 @@ export async function generateScoutReport(
       }
 
       if (
+        !incomplete &&
         stormLeagueThin &&
         ngsPool + sourceMapGames(quickMatch) === 0 &&
         sourceMapGames(slMap) === 0
@@ -270,7 +305,14 @@ export async function generateScoutReport(
         );
       }
 
-      const blizzId = hpAuthBroken ? null : await getPlayerBlizzId(battletag);
+      let blizzId: number | null = null;
+      if (!hpAuthBroken && !incomplete) {
+        try {
+          blizzId = await getPlayerBlizzId(battletag);
+        } catch (err) {
+          if (!stop(err)) throw err;
+        }
+      }
       return buildPlayerComfort({
         battletag,
         preferredRole,
@@ -285,13 +327,14 @@ export async function generateScoutReport(
         heroesProfileUrl: heroesProfilePlayerUrl(battletag, blizzId),
         ngsProfileUrl: ngsHeroesProfileUrl(battletag, blizzId),
       });
-    }),
-  );
+    })());
+  }
 
   // Draft comps: one forever-cached pull per past game (prefers draft/ban APIs).
   const draftInputs: DraftMatchInput[] = [];
   const currentReported = currentMatches.filter((m) => m.reported);
   for (const match of currentReported) {
+    if (incomplete) break;
     let hp = null;
     if (!hpAuthBroken) {
       try {
@@ -302,6 +345,7 @@ export async function generateScoutReport(
           leagueConfig.division,
         );
       } catch (err) {
+        if (stop(err)) break;
         if (err instanceof HeroesProfileError) {
           warnings.push(err.message);
           if (err.status === 401 || err.status === 403) hpAuthBroken = true;
@@ -311,7 +355,7 @@ export async function generateScoutReport(
     draftInputs.push({ ngsMatch: match, hpMatch: hp, weight: 1 });
   }
 
-  if (returningCount >= 3 && !hpAuthBroken) {
+  if (returningCount >= 3 && !hpAuthBroken && !incomplete) {
     for (const match of priorMatches.filter((m) => m.reported).slice(0, 6)) {
       try {
         const hp = await getNgsMatch(
@@ -322,6 +366,7 @@ export async function generateScoutReport(
         );
         draftInputs.push({ ngsMatch: match, hpMatch: hp, weight: 0.25 });
       } catch (err) {
+        if (stop(err)) break;
         if (err instanceof HeroesProfileError) {
           warnings.push(err.message);
           break;
@@ -332,7 +377,14 @@ export async function generateScoutReport(
 
   const threats = buildTeamThreats(players);
   const draft = buildDraftInsights(teamName, draftInputs, players);
-  const meta = await getGlobalHeroStats().catch(() => []);
+  let meta: Awaited<ReturnType<typeof getGlobalHeroStats>> = [];
+  if (!incomplete) {
+    try {
+      meta = await getGlobalHeroStats();
+    } catch (err) {
+      if (!stop(err)) meta = [];
+    }
+  }
   const adapt = buildAdaptPlan(players, threats, draft, meta);
 
   const gamesWithHeroes = draftInputs.reduce((n, d) => {
@@ -344,7 +396,7 @@ export async function generateScoutReport(
       ).length
     );
   }, 0);
-  if (draft.gamesAnalyzed > 0 && gamesWithHeroes === 0) {
+  if (!incomplete && draft.gamesAnalyzed > 0 && gamesWithHeroes === 0) {
     warnings.push(
       "Past-game draft comps were unavailable (quota or empty). Replays/drafts are forever-cached once fetched — retry after weekly reset.",
     );
@@ -367,6 +419,7 @@ export async function generateScoutReport(
       .filter((m) => m.reported)
       .map((m) => m.matchId),
     warnings: [...new Set(warnings)],
+    ...(incomplete ? { incomplete: true as const } : {}),
   };
 }
 

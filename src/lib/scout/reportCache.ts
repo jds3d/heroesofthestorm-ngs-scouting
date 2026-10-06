@@ -16,6 +16,7 @@ import {
 import type { PlayerScout, ScoutReport } from "@/lib/scoring/types";
 import { runWithApiUsage } from "@/lib/apiUsage";
 import { predictScoutCalls } from "@/lib/scout/estimateCalls";
+import { isScoutBudgetExceeded } from "@/lib/scout/budget";
 import { generateScoutReport } from "@/lib/scout/pipeline";
 
 /** Roster from a saved home-team scout, including a lineup-scoped cache key. */
@@ -113,13 +114,14 @@ async function buildScoutReport(
     );
     return report;
   } catch (err) {
-    if (err instanceof HeroesProfileError) {
+    if (isScoutBudgetExceeded(err) || err instanceof HeroesProfileError) {
       throw err;
     }
     if (!fallback) throw err;
     const message = err instanceof Error ? err.message : "Refresh failed";
     return {
       ...fallback,
+      incomplete: undefined,
       warnings: [
         ...fallback.warnings,
         `Refresh failed (${message}); showing the last saved report.`,

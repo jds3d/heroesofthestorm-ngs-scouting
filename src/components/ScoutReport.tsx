@@ -37,6 +37,7 @@ export function ScoutReportView({
   screenOnly = false,
   tournamentMode,
   onTournamentModeChange,
+  onWatchReset,
 }: {
   report: ScoutReport;
   /** Played game to replay into the interactive draft. */
@@ -48,6 +49,7 @@ export function ScoutReportView({
   /** Watch board: on uses this NGS report. Off is Storm League only. */
   tournamentMode?: boolean;
   onTournamentModeChange?: (on: boolean) => void;
+  onWatchReset?: () => void;
 }) {
   const [pickSide, setPickSide] = useState<"theyFirst" | "weFirst" | null>(
     review ? (review.weFirst ? "weFirst" : "theyFirst") : null,
@@ -177,6 +179,7 @@ export function ScoutReportView({
           watchOnly
           tournamentMode={tournamentMode}
           onTournamentModeChange={onTournamentModeChange}
+          onWatchReset={onWatchReset}
         />
       </div>
     );
