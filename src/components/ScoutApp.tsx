@@ -133,6 +133,7 @@ export function ScoutApp() {
   const [review, setReview] = useState<ReviewGame | null>(null);
   const [liveDraft, setLiveDraft] = useState<LiveDraft | null>(null);
   const [sharing, setSharing] = useState(false);
+  const [screenTooSmall, setScreenTooSmall] = useState(false);
   const [lobbyNames, setLobbyNames] = useState<string[]>([]);
   const [screenOurNames, setScreenOurNames] = useState<string[]>([]);
   const [statsNote, setStatsNote] = useState<string | null>(null);
@@ -715,9 +716,11 @@ export function ScoutApp() {
 
   return (
     <div className="flex w-full flex-col">
+    {sharing && screenTooSmall ? (
     <p className="sticky top-0 z-30 border-b border-[#b8860b] bg-[#fff4d6] px-4 py-3 text-center text-sm font-semibold text-[#5c3b00] sm:text-base">
       Move the drafter app to a screen with the same or higher resolution as the game in order to read it.
     </p>
+    ) : null}
     <div className="mx-auto flex w-full max-w-none flex-col gap-8 px-4 py-10 sm:px-6 lg:px-8">
       {!sharing && (
       <header className="space-y-3">
@@ -759,6 +762,7 @@ export function ScoutApp() {
           onOurSide={setScreenOurNames}
           onDraft={setLiveDraft}
           onWatchingChange={setSharing}
+          onScreenTooSmall={setScreenTooSmall}
           resetEpoch={watchReset}
         />
         {!sharing && (

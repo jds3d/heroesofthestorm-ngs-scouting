@@ -142,6 +142,19 @@ export const DRAFT_NAME_COLUMN = {
   right: { x: 800 / 1024, y: 30 / 576, w: 224 / 1024, h: 500 / 576, rotate: 26 },
 } as const;
 
+/**
+ * The drafter is on a smaller screen than the one being shared.
+ * A few pixels of slack covers DPI rounding on the same monitor.
+ */
+export function screenTooSmallForWatch(
+  here: { width: number; height: number },
+  watched: { width: number; height: number },
+): boolean {
+  if (watched.width < 2 || watched.height < 2) return false;
+  const slack = 16;
+  return here.width + slack < watched.width || here.height + slack < watched.height;
+}
+
 export const DRAFT_NAME_PLATES: { left: DraftBox[]; right: DraftBox[] } = {
   left: [0, 1, 2, 3, 4].map((i) => ({
     x: 0,

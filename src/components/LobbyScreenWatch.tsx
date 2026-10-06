@@ -28,6 +28,7 @@ import {
   rememberHeroes,
   shownBanSide,
   sideFromBannerColor,
+  screenTooSmallForWatch,
   snapToRoster,
   takeNewLocks,
   turnFromOcr,
@@ -120,6 +121,7 @@ export function LobbyScreenWatch({
   onOurSide,
   onDraft,
   onWatchingChange,
+  onScreenTooSmall,
   resetEpoch = 0,
 }: {
   ourNames: string[];
@@ -130,6 +132,8 @@ export function LobbyScreenWatch({
   onOurSide?: (names: string[]) => void;
   onDraft: (draft: LiveDraft) => void;
   onWatchingChange?: (watching: boolean) => void;
+  /** The drafter's monitor is smaller than the monitor being shared. */
+  onScreenTooSmall?: (tooSmall: boolean) => void;
   /** Bump to drop the last game and read the current screen from scratch. */
   resetEpoch?: number;
 }) {
@@ -150,6 +154,7 @@ export function LobbyScreenWatch({
   const onOurSideRef = useRef(onOurSide);
   const onDraftRef = useRef(onDraft);
   const onWatchingRef = useRef(onWatchingChange);
+  const onScreenTooSmallRef = useRef(onScreenTooSmall);
   const lastKeyRef = useRef("");
   const lastOursKeyRef = useRef("");
   const announcedPicksRef = useRef<string[]>([]);
@@ -181,6 +186,9 @@ export function LobbyScreenWatch({
     onWatchingRef.current = onWatchingChange;
   }, [onWatchingChange]);
   useEffect(() => {
+    onScreenTooSmallRef.current = onScreenTooSmall;
+  }, [onScreenTooSmall]);
+  useEffect(() => {
     onWatchingRef.current?.(phase !== "idle");
   }, [phase]);
 
@@ -201,6 +209,7 @@ export function LobbyScreenWatch({
     workerRef.current = null;
     void worker?.terminate();
     busyRef.current = false;
+    onScreenTooSmallRef.current?.(false);
     setPhase("idle");
   }
 
@@ -544,6 +553,20 @@ export function LobbyScreenWatch({
       video.srcObject = stream;
       video.muted = true;
       await video.play();
+      const ratio = window.devicePixelRatio || 1;
+      const settings = track.getSettings();
+      onScreenTooSmallRef.current?.(
+        screenTooSmallForWatch(
+          {
+            width: Math.round(window.screen.width * ratio),
+            height: Math.round(window.screen.height * ratio),
+          },
+          {
+            width: video.videoWidth || settings.width || 0,
+            height: video.videoHeight || settings.height || 0,
+          },
+        ),
+      );
       const { createWorker, PSM } = await import("tesseract.js");
       const worker = await createWorker("eng");
       lineMode.current = PSM.SINGLE_LINE;

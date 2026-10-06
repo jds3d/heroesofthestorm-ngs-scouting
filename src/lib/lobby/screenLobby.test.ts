@@ -26,6 +26,7 @@ import {
   rosterTagsForLobby,
   rosterTagsPresent,
   snapToRoster,
+  screenTooSmallForWatch,
   turnFromOcr,
 } from "./screenLobby";
 
@@ -109,6 +110,24 @@ describe("rosterTagsForLobby", () => {
     expect(
       rosterTagsForLobby(["MsBelis27", "Aghs", "Ladro", "Inheritearth", "RoseeDai"], roster),
     ).toEqual(["MsBells27#1234", "Aghs#1", "Ladro#1", "Inheritearth#1", "RoseeDai#1"]);
+  });
+});
+
+describe("watch screen size", () => {
+  it("warns only when the drafter screen is smaller than the shared screen", () => {
+    expect(screenTooSmallForWatch({ width: 1920, height: 1080 }, { width: 2560, height: 1440 })).toBe(
+      true,
+    );
+    expect(screenTooSmallForWatch({ width: 2560, height: 1440 }, { width: 1920, height: 1080 })).toBe(
+      false,
+    );
+    expect(screenTooSmallForWatch({ width: 1920, height: 1080 }, { width: 1920, height: 1080 })).toBe(
+      false,
+    );
+    expect(screenTooSmallForWatch({ width: 1910, height: 1070 }, { width: 1920, height: 1080 })).toBe(
+      false,
+    );
+    expect(screenTooSmallForWatch({ width: 1920, height: 1080 }, { width: 0, height: 0 })).toBe(false);
   });
 });
 
