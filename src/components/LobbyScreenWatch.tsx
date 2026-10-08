@@ -2,15 +2,18 @@
 
 import { useEffect, useRef, useState } from "react";
 import { heroKey } from "@/lib/scoring/heroMeta";
+import { matchBanPixels } from "@/lib/lobby/banFace";
 import type { Worker } from "tesseract.js";
 import {
   DRAFT_BAN_HEXES,
-  DRAFT_NAME_COLUMN,
-  DRAFT_PICK_COLUMNS,
   DRAFT_PLATE_SLOTS,
+  DRAFT_SLOT_NAMES,
   DRAFT_STATUS_BOX,
   DRAFT_TITLE_BOX,
   DRAFT_TURN_BOX,
+  SLOT_LINE_STRIDE,
+  NAMEPLATE_CELL_WIDTH,
+  nameplateCell,
   EMPTY_LIVE_DRAFT,
   bannerTurn,
   banHexFilled,
@@ -21,20 +24,16 @@ import {
   inferFirstPick,
   pickCountsFit,
   PARTY_NAME_ROW,
-  plateFill,
-  platesForLines,
-  dropShownLocks,
+  portraitFilled,
+  readsBySlot,
   draftHeroList,
-  locksFromOcrLines,
   partyNamesFromText,
   mapFromTitle,
-  columnShowsPicking,
   firstPickFromPickingSlots,
-  namesFromOcrLines,
   nextTurn,
-  pickingPhaseFromColumns,
   ocrFold,
   sideFromBannerColor,
+  sideFromStatus,
   sideFromTeamSplash,
   acceptPlatePicks,
   banSideFromSplash,
@@ -47,7 +46,6 @@ import {
   type DraftBox,
   type LiveDraft,
   type OpenTurn,
-  type PlateFill,
   type Rgb,
 } from "@/lib/lobby/screenLobby";
 
@@ -58,7 +56,7 @@ function readHex(
   ctx: CanvasRenderingContext2D,
   frame: HTMLCanvasElement,
   box: DraftBox,
-): { filled: boolean; vector: number[] | null } {
+): { filled: boolean; vector: number[] | null; hero: string | null } {
   const x = Math.max(0, Math.round(box.x * frame.width));
   const y = Math.max(0, Math.round(box.y * frame.height));
   const w = Math.max(1, Math.min(frame.width - x, Math.round(box.w * frame.width)));
@@ -67,13 +65,17 @@ function readHex(
   try {
     data = ctx.getImageData(x, y, w, h).data;
   } catch {
-    return { filled: false, vector: null };
+    return { filled: false, vector: null, hero: null };
   }
   const pixels: Rgb[] = [];
   for (let i = 0; i < data.length; i += 4) {
     pixels.push({ r: data[i] ?? 0, g: data[i + 1] ?? 0, b: data[i + 2] ?? 0 });
   }
-  return { filled: banHexFilled(pixels), vector: portraitVector(pixels, w, h) };
+  return {
+    filled: banHexFilled(pixels),
+    vector: portraitVector(pixels, w, h),
+    hero: banHexFilled(pixels) ? matchBanPixels(pixels, w, h) : null,
+  };
 }
 
 type FaceRow = { hero: string; vector: number[] };
@@ -196,27 +198,6 @@ function sampleBox(
     pixels.push({ r: data[i] ?? 0, g: data[i + 1] ?? 0, b: data[i + 2] ?? 0 });
   }
   return pixels;
-}
-
-/** OCR line `top` is in the scaled pick-column image. Match plates in that space. */
-function slotImageTop(frame: HTMLCanvasElement, column: DraftBox, slot: DraftBox): number {
-  const sw = Math.max(1, Math.round(column.w * frame.width));
-  const sh = Math.max(1, Math.round(column.h * frame.height));
-  const scale = Math.min(4, 1800 / Math.min(sw, sh));
-  const frameY = (slot.y + slot.h / 2) * frame.height;
-  return (frameY - column.y * frame.height) * scale;
-}
-
-function plateSlots(
-  ctx: CanvasRenderingContext2D,
-  frame: HTMLCanvasElement,
-  column: DraftBox,
-  slots: readonly DraftBox[],
-): { top: number; fill: PlateFill }[] {
-  return slots.map((slot) => ({
-    top: slotImageTop(frame, column, slot),
-    fill: plateFill(sampleBox(ctx, frame, slot)),
-  }));
 }
 
 function straightenedPlate(frame: HTMLCanvasElement, box: Box): HTMLCanvasElement | null {
@@ -401,66 +382,106 @@ export function LobbyScreenWatch({
 
   type OcrLine = { text: string; top: number };
 
-/** Names and locked heroes. The pick columns use the same reader as the banners. */
+/** Five nameplates, top to bottom, each in its own cell so line.top maps to a slot. */
+function stackNameplates(frame: HTMLCanvasElement, boxes: readonly DraftBox[]): HTMLCanvasElement | null {
+  const ctx = frame.getContext("2d");
+  if (!ctx || boxes.length === 0) return null;
+  const cellW = NAMEPLATE_CELL_WIDTH;
+  const cellH = SLOT_LINE_STRIDE;
+  const plate = document.createElement("canvas");
+  plate.width = cellW;
+  plate.height = cellH * boxes.length;
+  const out = plate.getContext("2d");
+  if (!out) return null;
+  out.fillStyle = "#000";
+  out.fillRect(0, 0, plate.width, plate.height);
+  boxes.forEach((box, index) => {
+    const { sx, sy, sw, sh, dx, dy, dw, dh } = nameplateCell(
+      frame.width,
+      frame.height,
+      box,
+      index,
+      cellW,
+      cellH,
+    );
+    out.drawImage(frame, sx, sy, sw, sh, dx, dy, dw, dh);
+  });
+  return plate;
+}
+
+function faceFilled(frame: HTMLCanvasElement, box: DraftBox): boolean {
+  const ctx = frame.getContext("2d");
+  if (!ctx) return false;
+  return portraitFilled(sampleBox(ctx, frame, box));
+}
+
+/** Names and locked heroes from the five slots on each side. */
 async function readLobby(
   frame: HTMLCanvasElement,
 ): Promise<{
   left: string[];
   right: string[];
-  leftLocks: { hero: string; player: string | null }[];
-  rightLocks: { hero: string; player: string | null }[];
+  leftLocks: { hero: string; player: string | null; slot: number }[];
+  rightLocks: { hero: string; player: string | null; slot: number }[];
   picksLeft: OcrLine[];
   picksRight: OcrLine[];
   leftPicking: boolean;
   rightPicking: boolean;
   center: OcrLine[];
 } | null> {
-  const leftPlate = deskewedColumn(frame, DRAFT_NAME_COLUMN.left);
-  const rightPlate = deskewedColumn(frame, DRAFT_NAME_COLUMN.right);
-  const picksLeftPlate = deskewedColumn(frame, DRAFT_PICK_COLUMNS.left);
-  const picksRightPlate = deskewedColumn(frame, DRAFT_PICK_COLUMNS.right);
+  const leftPlate = stackNameplates(frame, DRAFT_SLOT_NAMES.left);
+  const rightPlate = stackNameplates(frame, DRAFT_SLOT_NAMES.right);
   const centerPlate = deskewedColumn(frame, DRAFT_TURN_BOX);
   if (!leftPlate || !rightPlate) return null;
-  const [left, right, picksLeft, picksRight, center] = await Promise.all([
+  const [left, right, center] = await Promise.all([
     pictureOf(leftPlate),
     pictureOf(rightPlate),
-    picksLeftPlate ? pictureOf(picksLeftPlate) : Promise.resolve(null),
-    picksRightPlate ? pictureOf(picksRightPlate) : Promise.resolve(null),
     centerPlate ? pictureOf(centerPlate) : Promise.resolve(null),
   ]);
   if (!left || !right) return null;
   const res = await fetch("/api/ocr/names", {
     method: "POST",
     headers: { "content-type": "application/json", ...scoutHeaders() },
-    body: JSON.stringify({ left, right, picksLeft, picksRight, center }),
+    body: JSON.stringify({ left, right, center }),
   });
   if (!res.ok) return null;
   const data = (await res.json()) as {
     left?: OcrLine[];
     right?: OcrLine[];
-    picksLeft?: OcrLine[];
-    picksRight?: OcrLine[];
     center?: OcrLine[];
   };
-  const picksLeftLines = data.picksLeft ?? [];
-  const picksRightLines = data.picksRight ?? [];
-  const leftNames = namesFromOcrLines(data.left ?? []);
-  const rightNames = namesFromOcrLines(data.right ?? []);
+  const leftReads = readsBySlot(data.left ?? []);
+  const rightReads = readsBySlot(data.right ?? []);
+  const leftFaces = DRAFT_PLATE_SLOTS.left.map((box) => faceFilled(frame, box));
+  const rightFaces = DRAFT_PLATE_SLOTS.right.map((box) => faceFilled(frame, box));
+  const players = (reads: { hero: string | null; player: string | null }[]) =>
+    reads.flatMap((read) => (read.player ? [read.player] : []));
+  const leftNames = players(leftReads);
+  const rightNames = players(rightReads);
   const known = [...leftNames, ...rightNames, ...rosterRef.current];
-  const snapLocks = (lines: OcrLine[]) =>
-    locksFromOcrLines(lines).map((lock) => ({
-      hero: lock.hero,
-      player: lock.player ? snapToRoster(lock.player, known) : null,
-    }));
+  const locks = (
+    reads: { hero: string | null; player: string | null }[],
+    faces: boolean[],
+  ) =>
+    reads.flatMap((read, index) => {
+      if (!faces[index] || !read.hero) return [];
+      return [
+        {
+          hero: read.hero,
+          player: read.player ? snapToRoster(read.player, known) : null,
+          slot: index,
+        },
+      ];
+    });
   return {
     left: leftNames,
     right: rightNames,
-    leftLocks: snapLocks(picksLeftLines),
-    rightLocks: snapLocks(picksRightLines),
-    picksLeft: picksLeftLines,
-    picksRight: picksRightLines,
-    leftPicking: columnShowsPicking(picksLeftLines),
-    rightPicking: columnShowsPicking(picksRightLines),
+    leftLocks: locks(leftReads, leftFaces),
+    rightLocks: locks(rightReads, rightFaces),
+    picksLeft: [],
+    picksRight: [],
+    leftPicking: false,
+    rightPicking: false,
     center: data.center ?? [],
   };
 }
@@ -542,8 +563,6 @@ async function readLobby(
       inDraftRef.current = true;
       const lobbyPromise = readLobby(frame);
       const partyText = await readColumn(frame, worker, PARTY_NAME_ROW);
-      const leftPlates = plateSlots(ctx, frame, DRAFT_PICK_COLUMNS.left, DRAFT_PLATE_SLOTS.left);
-      const rightPlates = plateSlots(ctx, frame, DRAFT_PICK_COLUMNS.right, DRAFT_PLATE_SLOTS.right);
       const leftHexes = DRAFT_BAN_HEXES.left.map((hex) => readHex(ctx, frame, hex));
       const rightHexes = DRAFT_BAN_HEXES.right.map((hex) => readHex(ctx, frame, hex));
       const lobby = await lobbyPromise;
@@ -560,67 +579,41 @@ async function readLobby(
       }
       const draft = draftRef.current;
       const knownNames = [...(lobby?.left ?? []), ...(lobby?.right ?? []), ...roster];
-      const snapPlate = (locks: { hero: string; player: string | null }[]) =>
+      const snapPlate = (locks: { hero: string; player: string | null; slot: number }[]) =>
         locks.map((lock) => ({
           hero: lock.hero,
           player: lock.player ? snapToRoster(lock.player, knownNames) : null,
+          slot: lock.slot,
         }));
-      const leftUsable = leftPlates.some((slot) => slot.fill !== "empty");
-      const rightUsable = rightPlates.some((slot) => slot.fill !== "empty");
-      const leftRead =
-        leftUsable && lobby
-          ? platesForLines(lobby.picksLeft, leftPlates)
-          : {
-              locked: (lobby?.leftLocks ?? []).map((lock) => ({ ...lock, slot: null })),
-              shown: [] as string[],
-            };
-      const rightRead =
-        rightUsable && lobby
-          ? platesForLines(lobby.picksRight, rightPlates)
-          : {
-              locked: (lobby?.rightLocks ?? []).map((lock) => ({ ...lock, slot: null })),
-              shown: [] as string[],
-            };
-      const leftLocked = leftUsable && lobby ? snapPlate(leftRead.locked) : (lobby?.leftLocks ?? []);
-      const rightLocked = rightUsable && lobby ? snapPlate(rightRead.locked) : (lobby?.rightLocks ?? []);
+      const leftLocked = snapPlate(lobby?.leftLocks ?? []);
+      const rightLocked = snapPlate(lobby?.rightLocks ?? []);
       const slotted = slotsHoldPicks(leftLocked.length + rightLocked.length);
-      const fromSlots = lobby
-        ? pickingPhaseFromColumns({
-            leftPicking: lobby.leftPicking,
-            rightPicking: lobby.rightPicking,
-            bannerPhase: banner.phase ?? centerRead.phase,
-          })
-        : null;
+      const fromSlots = null;
       const banPhase = banner.phase === "ban" || centerRead.phase === "ban";
+      if (slotted) picksStartedRef.current = true;
       if (!banPhase && (banner.phase === "pick" || fromSlots === "pick")) {
         picksStartedRef.current = true;
       }
-      const allowPicks = acceptPlatePicks({
-        banPhase,
-        picksStarted: picksStartedRef.current,
-      });
-      const ourShown = usOnLeft ? leftRead.shown : rightRead.shown;
-      const theirShown = usOnLeft ? rightRead.shown : leftRead.shown;
+      const allowPicks =
+        slotted ||
+        acceptPlatePicks({
+          banPhase,
+          picksStarted: picksStartedRef.current,
+        });
       const ourLocked = allowPicks
-        ? dropShownLocks(
-            takeNewLocks(
-              draft.ourPicks,
-              usOnLeft ? leftLocked : rightLocked,
-              announcedPicksRef.current,
-              draft.ourPickPlayers,
-            ),
-            ourShown,
+        ? takeNewLocks(
+            draft.ourPicks,
+            usOnLeft ? leftLocked : rightLocked,
+            announcedPicksRef.current,
+            draft.ourPickPlayers,
           )
         : null;
       const theirLocked = allowPicks
-        ? dropShownLocks(
-            takeNewLocks(
-              draft.theirPicks,
-              usOnLeft ? rightLocked : leftLocked,
-              announcedPicksRef.current,
-              draft.theirPickPlayers,
-            ),
-            theirShown,
+        ? takeNewLocks(
+            draft.theirPicks,
+            usOnLeft ? rightLocked : leftLocked,
+            announcedPicksRef.current,
+            draft.theirPickPlayers,
           )
         : null;
       let ourPicks = ourLocked
@@ -658,11 +651,12 @@ async function readLobby(
           : banSideFromSplash(`${centerSource}\n${statusText}`),
       );
       openTurnRef.current = turn.open;
+      const nativeFrame = frame.height >= 1440;
       const learnPlate = (
         lock: { hero: string; slot: number | null },
         slots: readonly DraftBox[],
       ) => {
-        if (lock.slot == null) return;
+        if (!nativeFrame || lock.slot == null) return;
         const box = slots[lock.slot];
         if (!box) return;
         const region = sampleRegion(ctx, frame, box);
@@ -678,9 +672,9 @@ async function readLobby(
           }).catch(() => undefined);
         });
       };
-      for (const lock of leftRead.locked) learnPlate(lock, DRAFT_PLATE_SLOTS.left);
-      for (const lock of rightRead.locked) learnPlate(lock, DRAFT_PLATE_SLOTS.right);
-      if (!frameSavedRef.current) {
+      for (const lock of leftLocked) learnPlate(lock, DRAFT_PLATE_SLOTS.left);
+      for (const lock of rightLocked) learnPlate(lock, DRAFT_PLATE_SLOTS.right);
+      if (nativeFrame && !frameSavedRef.current) {
         frameSavedRef.current = true;
         void new Promise<string | null>((resolve) => {
           frame.toBlob(async (blob) => {
@@ -704,9 +698,10 @@ async function readLobby(
           }).catch(() => undefined);
         });
       }
-      const namedHexes = (hexes: { filled: boolean; vector: number[] | null }[]) =>
+      const namedHexes = (hexes: { filled: boolean; vector: number[] | null; hero: string | null }[]) =>
         hexes.map((hex) =>
-          hex.vector && facesRef.current.length ? matchPortrait(hex.vector, facesRef.current) : null,
+          hex.hero ??
+          (hex.vector && facesRef.current.length ? matchPortrait(hex.vector, facesRef.current) : null),
         );
       const ourHexes = usOnLeft ? leftHexes : rightHexes;
       const theirHexes = usOnLeft ? rightHexes : leftHexes;
@@ -748,6 +743,7 @@ async function readLobby(
       const turnSide =
         turn.open?.side ??
         (banner.color ? sideFromBannerColor(banner.color, usOnLeft) : null) ??
+        sideFromStatus(`${statusText}\n${centerSource}`) ??
         sideFromTeamSplash(`${centerSource}\n${statusText}`);
       if (!firstPick && turn.open?.phase === "ban") {
         firstPick = turn.open.side === "our" ? "us" : "them";
@@ -864,7 +860,11 @@ async function readLobby(
     setStatus("Choose the main screen in the share dialog.");
     try {
       const stream = await navigator.mediaDevices.getDisplayMedia({
-        video: { frameRate: 2 },
+        video: {
+          width: { ideal: 2560 },
+          height: { ideal: 1440 },
+          frameRate: { ideal: 2 },
+        },
         audio: false,
         // Chrome-only hints: ask for a monitor, not this browser tab.
         preferCurrentTab: false,

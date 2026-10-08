@@ -48,6 +48,7 @@ function ensureChild(): ChildProcessWithoutNullStreams {
   if (child && !child.killed && child.exitCode == null) return child;
   const script = path.join(process.cwd(), "scripts", "ocr_names.py");
   const next = spawn(pythonBin(), [script], { stdio: ["pipe", "pipe", "pipe"] });
+  next.stderr.on("data", () => {});
   const lines = readline.createInterface({ input: next.stdout });
   lines.on("line", (line) => {
     let reply: Reply;
@@ -86,6 +87,13 @@ function ensureChild(): ChildProcessWithoutNullStreams {
   return next;
 }
 
+/** Stop the name reader. Tests call this so the process can exit. */
+export function closeNameReader(): void {
+  const current = child;
+  child = null;
+  current?.kill();
+}
+
 /** Deskewed column pictures in, text lines out. Name and pick crops run together. */
 export function readNameColumns(
   left: string,
@@ -114,7 +122,7 @@ function readNameColumnsOnce(
       if (!waiting.has(id)) return;
       waiting.delete(id);
       reject(new Error("name reader timed out"));
-    }, 25000);
+    }, 90000);
     waiting.set(id, {
       picks: Boolean(picks?.left || picks?.right),
       center: Boolean(center),

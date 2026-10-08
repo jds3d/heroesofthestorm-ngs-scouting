@@ -1,26 +1,22 @@
 [
   {
-    "hero": "Valla",
-    "file": "valla-1.png"
+    "hero": "Johanna",
+    "file": "johanna-1.png"
   },
   {
-    "hero": "Valla",
-    "file": "valla-2.png"
+    "hero": "Cassia",
+    "file": "cassia-1.png"
   },
   {
-    "hero": "Chromie",
-    "file": "chromie-1.png"
+    "hero": "Qhira",
+    "file": "qhira-1.png"
   },
   {
-    "hero": "Chromie",
-    "file": "chromie-2.png"
+    "hero": "Tyrael",
+    "file": "tyrael-1.png"
   },
   {
-    "hero": "Thrall",
-    "file": "thrall-1.png"
-  },
-  {
-    "hero": "Thrall",
-    "file": "thrall-2.png"
+    "hero": "E.T.C.",
+    "file": "etc-1.png"
   }
 ]

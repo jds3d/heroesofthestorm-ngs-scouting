@@ -109,6 +109,7 @@ const HERO_DRAFT_SLUG: Record<string, string> = {
   Zeratul: "zeratul",
   Zuljin: "zuljin",
   "Zul'jin": "zuljin",
+  "Xal'atath": "xalatath",
 };
 
 const CDN =
@@ -151,17 +152,32 @@ export function heroDraftPortraitUrl(hero: string): string | null {
 export function heroSelectPortraitUrl(hero: string): string | null {
   const draft = heroDraftSlug(hero);
   if (!draft) return null;
-  // heroselect uses a few different internal names than draft portraits
-  const selectSlug =
-    (
-      {
-        l90etc: "etc",
-        falstad: "gryphon_rider",
-        amazon: "d2amazonf",
-        barbarian: "femalebarbarian",
-        demonhunter: "demonhunter",
-        nexushunter: "nexus2",
-      } as Record<string, string>
-    )[draft] ?? draft;
+  const selectSlug = SELECT_SLUG[draft] ?? draft;
   return `${CDN}/storm_ui_ingame_heroselect_btn_${selectSlug}.png`;
+}
+
+const SELECT_SLUG: Record<string, string> = {
+  l90etc: "etc",
+  falstad: "gryphon_rider",
+  amazon: "d2amazonf",
+  barbarian: "femalebarbarian",
+  demonhunter: "demonhunter",
+  nexushunter: "nexus2",
+};
+
+function preferDraftName(name: string, current: string): boolean {
+  if (name.includes("'") && !current.includes("'")) return true;
+  if (name.includes(".") && !current.includes(".")) return true;
+  return name.length > current.length && !current.includes("'") && !current.includes(".");
+}
+
+/** Display name for a `ui_targetportrait_hero_{slug}` file. */
+export function heroNameForTargetSlug(targetSlug: string): string | null {
+  let best: string | null = null;
+  for (const [name, slug] of Object.entries(HERO_DRAFT_SLUG)) {
+    const select = SELECT_SLUG[slug] ?? slug;
+    if (slug !== targetSlug && select !== targetSlug) continue;
+    if (!best || preferDraftName(name, best)) best = name;
+  }
+  return best;
 }

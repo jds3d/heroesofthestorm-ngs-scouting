@@ -4,7 +4,12 @@ import {
   actionsFromObserved,
   inferFirstPick,
   bannerTurn,
+  colorfulFraction,
   firstBanSideFromStatus,
+  portraitFilled,
+  readSlotPlate,
+  readsBySlot,
+  sideFromStatus,
   nextBanSide,
   banSideFromSplash,
   acceptPlatePicks,
@@ -139,9 +144,9 @@ describe("rosterTagsForLobby", () => {
 });
 
 describe("draft locks from the screen", () => {
-  it("reads hero labels, including Alarak's Xal'atath title", () => {
+  it("reads hero labels from the side plates", () => {
     const text = "GARROSH\nBeachyman\nXAL'ATATH\nTopgun707\nTHE LOST VIKINGS\nMarcy";
-    expect(heroesFromColumn(text)).toEqual(["Garrosh", "Alarak", "The Lost Vikings"]);
+    expect(heroesFromColumn(text)).toEqual(["Garrosh", "Xal'atath", "The Lost Vikings"]);
     expect(namesFromColumn(text)).toEqual(["Beachyman", "Topgun707", "Marcy"]);
     expect(playerFromSlotText("LI-MING\nThomas")).toBe("Thomas");
     expect(playerFromSlotText("Li-Ming Thomas")).toBe("Thomas");
@@ -210,6 +215,28 @@ describe("draft locks from the screen", () => {
     ).toEqual({
       heroes: ["Varian", "Li-Ming"],
       players: ["Nubcake", "Thomas"],
+    });
+    expect(
+      takeNewLocks(
+        ["Anub'arak"],
+        [{ hero: "Anub'arak", player: "MaXiMus" }],
+        [],
+        ["HanFOTS"],
+      ).players,
+    ).toEqual(["MaXiMus"]);
+    expect(
+      takeNewLocks(
+        ["Whitemane", "Anub'arak"],
+        [
+          { hero: "Whitemane", player: "HuckIt" },
+          { hero: "Anub'arak", player: "MaXiMus" },
+        ],
+        [],
+        ["HuckIt", "HuckIt"],
+      ),
+    ).toEqual({
+      heroes: ["Whitemane", "Anub'arak"],
+      players: ["HuckIt", "MaXiMus"],
     });
   });
 
@@ -473,8 +500,13 @@ describe("draft locks from the screen", () => {
       color: null,
     });
     expect(bannerTurn("Waiting for Enemy Ban...")).toEqual({ phase: "ban", color: null });
+    expect(bannerTurn("Waiting for Team Ban...")).toEqual({ phase: "ban", color: null });
+    expect(bannerTurn("《Waiting for Team Banv")).toEqual({ phase: "ban", color: null });
     expect(firstBanSideFromStatus("Waiting for Enemy Ban...")).toBe("them");
+    expect(firstBanSideFromStatus("Waiting for Team Ban...")).toBe("us");
     expect(firstBanSideFromStatus("SKY TEMPLE")).toBe(null);
+    expect(sideFromStatus("Waiting for Enemy...")).toBe("their");
+    expect(sideFromStatus("Waiting for Team Ban...")).toBe("our");
     expect(banSideFromSplash("TheScrub\nBanning\nWaiting for Enemy Ban...")).toBe("their");
     expect(banSideFromSplash("SYLVANAS\nBanned\nWaiting for Enemy Ban...")).toBe("our");
     expect(acceptPlatePicks({ banPhase: true, picksStarted: false })).toBe(false);
@@ -554,8 +586,45 @@ describe("draft locks from the screen", () => {
   it("counts a ban hex only when a face is in it", () => {
     const face = Array.from({ length: 40 }, () => ({ r: 180, g: 40, b: 36 }));
     const empty = Array.from({ length: 40 }, () => ({ r: 12, g: 8, b: 22 }));
+    const glyph = [
+      ...Array.from({ length: 27 }, () => ({ r: 180, g: 40, b: 200 })),
+      ...Array.from({ length: 73 }, () => ({ r: 12, g: 8, b: 22 })),
+    ];
     expect(banHexFilled(face)).toBe(true);
     expect(banHexFilled(empty)).toBe(false);
+    expect(colorfulFraction(glyph)).toBeCloseTo(0.27);
+    expect(banHexFilled(glyph)).toBe(false);
+    expect(portraitFilled(face)).toBe(true);
+    expect(portraitFilled(empty)).toBe(false);
+  });
+
+  it("reads a slot nameplate and keeps each stacked plate on its own slot", () => {
+    expect(readSlotPlate(["ABATHUR", "L337"])).toEqual({ hero: "Abathur", player: "L337" });
+    expect(readSlotPlate(["EORIC", "Magic"]).hero).toBe("Leoric");
+    expect(readSlotPlate(["ASSIA", "ArcKane"]).hero).toBe("Cassia");
+    expect(readSlotPlate(["DBIUS", "Answered"])).toEqual({ hero: null, player: "Answered" });
+    expect(readSlotPlate(["hiimrick"])).toEqual({ hero: null, player: "hiimrick" });
+    expect(readSlotPlate(["STITCHES", "Silver"])).toEqual({ hero: "Stitches", player: "Silver" });
+    expect(readSlotPlate(["HanFOTS", "ANUB'ARAK", "MaXiMus"])).toEqual({
+      hero: "Anub'arak",
+      player: "MaXiMus",
+    });
+    expect(readSlotPlate(["ANUB'ARAK", "MaXiMus", "HanFOTS"])).toEqual({
+      hero: "Anub'arak",
+      player: "MaXiMus",
+    });
+    const slots = readsBySlot(
+      [
+        { text: "ABATHUR", top: 20 },
+        { text: "L337", top: 60 },
+        { text: "hiimrick", top: 180 * 3 + 40 },
+      ],
+      5,
+      180,
+    );
+    expect(slots[0]).toEqual({ hero: "Abathur", player: "L337" });
+    expect(slots[3]).toEqual({ hero: null, player: "hiimrick" });
+    expect(slots[1]).toEqual({ hero: null, player: null });
   });
 
   it("names a ban hex from the face and keeps that name when a later frame is blank", () => {

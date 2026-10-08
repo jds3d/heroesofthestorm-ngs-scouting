@@ -198,11 +198,30 @@ export const DRAFT_PICK_SLOTS: { left: DraftBox[]; right: DraftBox[] } = {
  */
 export const DRAFT_TURN_BOX = { x: 0.32, y: 0.16, w: 0.36, h: 0.52, rotate: 0 } as const;
 
-/** Bottom pill, such as "Waiting for Enemy Ban...". */
-export const DRAFT_STATUS_BOX = { x: 0.28, y: 0.78, w: 0.44, h: 0.08, rotate: 0 } as const;
+/**
+ * 16:9 draft the boxes below were measured on.
+ * Both files in examples/drafts ("draft lobby shrines.png", "draft lobby volskaya.png") are 2560x1440.
+ */
+const DRAFT_FRAME = { w: 2560, h: 1440 };
 
-/** Map title along the top of a 16:9 draft. */
-export const DRAFT_TITLE_BOX = { x: 0.28, y: 0, w: 0.44, h: 0.1, rotate: 0 } as const;
+function refBox(x0: number, y0: number, x1: number, y1: number): DraftBox {
+  return {
+    x: x0 / DRAFT_FRAME.w,
+    y: y0 / DRAFT_FRAME.h,
+    w: (x1 - x0) / DRAFT_FRAME.w,
+    h: (y1 - y0) / DRAFT_FRAME.h,
+    rotate: 0,
+  };
+}
+
+/**
+ * Bottom pill, under the hero row. "Waiting for Team Ban..." or "Waiting for Enemy...".
+ * Tight on the pill so the rank medals and chat beside it are not part of the read.
+ */
+export const DRAFT_STATUS_BOX = refBox(1000, 1255, 1560, 1305);
+
+/** Map title along the top of a 16:9 draft. Measured on the Volskaya lobby. */
+export const DRAFT_TITLE_BOX = refBox(900, 0, 1660, 80);
 
 /**
  * The five names above the rank medals on the Storm League party screen,
@@ -219,54 +238,93 @@ export const DRAFT_BAN_STRIPS = {
   right: { x: 0.66, y: 0, w: 0.28, h: 0.09, rotate: 0 },
 } as const;
 
-/** 16:9 draft the ban hexes and plate interiors were measured on. */
-const DRAFT_FRAME = { w: 1024, h: 576 };
-
-function refBox(x0: number, y0: number, x1: number, y1: number): DraftBox {
-  return {
-    x: x0 / DRAFT_FRAME.w,
-    y: y0 / DRAFT_FRAME.h,
-    w: (x1 - x0) / DRAFT_FRAME.w,
-    h: (y1 - y0) / DRAFT_FRAME.h,
-    rotate: 0,
-  };
-}
-
 /**
  * The six ban hexes under the map title, left to right on each side.
- * They have a face and no printed name. A filled hex is a locked ban.
+ * Interiors only: the padlock under each hex is not part of the face.
+ * Measured on examples/drafts/draft lobby volskaya.png. A filled hex is a locked ban.
+ * The glowing arrow in the active ban slot (draft lobby shrines.png) is not a face.
  */
 export const DRAFT_BAN_HEXES: { left: DraftBox[]; right: DraftBox[] } = {
-  left: [refBox(148, 10, 182, 52), refBox(204, 10, 232, 52), refBox(258, 10, 292, 52)],
-  right: [refBox(736, 10, 768, 52), refBox(790, 10, 820, 52), refBox(840, 10, 874, 52)],
+  left: [refBox(378, 22, 452, 118), refBox(510, 22, 584, 118), refBox(642, 22, 716, 118)],
+  right: [refBox(1840, 22, 1914, 118), refBox(1972, 22, 2046, 118), refBox(2104, 22, 2178, 118)],
 };
 
 /**
- * Portrait interiors, top to bottom. The sample stays inside the plate so the
- * team-colored hex rim does not decide whether the hero is locked.
- * Whitish fill is a lock. A blue fill is only being shown.
+ * Portrait interiors, top to bottom. Even slots sit toward the outer edge;
+ * odd slots step inward. A face here is a locked pick. An empty slot is the
+ * dark honeycomb, including the player whose turn is glowing around it.
+ * Measured on both examples/drafts lobbies.
  */
 export const DRAFT_PLATE_SLOTS: { left: DraftBox[]; right: DraftBox[] } = {
-  left: [
-    refBox(35, 30, 105, 100),
-    refBox(40, 145, 115, 215),
-    refBox(35, 250, 115, 325),
-    refBox(50, 335, 135, 415),
-    refBox(30, 440, 120, 515),
-  ],
-  right: [
-    refBox(860, 30, 980, 110),
-    refBox(860, 120, 980, 200),
-    refBox(860, 210, 980, 290),
-    refBox(860, 300, 980, 380),
-    refBox(860, 390, 980, 470),
-  ],
+  left: [0, 1, 2, 3, 4].map((i) => {
+    const x = i % 2 === 0 ? 70 : 200;
+    const y = 200 + i * 226;
+    return refBox(x, y, x + 150, y + 110);
+  }),
+  right: [0, 1, 2, 3, 4].map((i) => {
+    const x = i % 2 === 0 ? 2340 : 2200;
+    const y = 200 + i * 226;
+    return refBox(x, y, x + 150, y + 110);
+  }),
 };
 
-/** In-client titles that are not the hero's draft name. */
-const PLATE_TITLES: Record<string, string> = {
-  xalatath: "Alarak",
+/**
+ * Hero and player text for one slot, top to bottom. The letters are horizontal.
+ * Stacked in this order for OCR; each cell is `SLOT_LINE_STRIDE` pixels tall.
+ */
+export const DRAFT_SLOT_NAMES: { left: DraftBox[]; right: DraftBox[] } = {
+  left: [0, 1, 2, 3, 4].map((i) => {
+    const x = i % 2 === 0 ? 0 : 70;
+    const y = 220 + i * 226;
+    return refBox(x, y, x + 320, y + 140);
+  }),
+  right: [0, 1, 2, 3, 4].map((i) => {
+    const x = i % 2 === 0 ? 2140 : 2000;
+    const y = 210 + i * 226;
+    return refBox(x, y, 2560, y + 150);
+  }),
 };
+
+/**
+ * One nameplate per cell when the five plates are stacked for the reader.
+ * Tall enough that a detection box stays inside its slot. The plate scales to
+ * at most 2x, leaving room above and below the glyphs. A short cell let the
+ * next plate's hero line count as the slot above it.
+ */
+export const SLOT_LINE_STRIDE = 400;
+
+/** Stacked nameplate width. Wide enough for a 420px right plate to scale to 2x. */
+export const NAMEPLATE_CELL_WIDTH = 880;
+
+/** Where one nameplate lands in the stacked OCR image. Same numbers the screen watch draws. */
+export function nameplateCell(
+  frameWidth: number,
+  frameHeight: number,
+  box: DraftBox,
+  index: number,
+  cellW = NAMEPLATE_CELL_WIDTH,
+  cellH = SLOT_LINE_STRIDE,
+): {
+  sx: number;
+  sy: number;
+  sw: number;
+  sh: number;
+  dx: number;
+  dy: number;
+  dw: number;
+  dh: number;
+} {
+  const sx = Math.max(0, Math.round(box.x * frameWidth));
+  const sy = Math.max(0, Math.round(box.y * frameHeight));
+  const sw = Math.max(1, Math.min(frameWidth - sx, Math.round(box.w * frameWidth)));
+  const sh = Math.max(1, Math.min(frameHeight - sy, Math.round(box.h * frameHeight)));
+  const scale = Math.min(2, cellW / sw, (cellH - 16) / sh);
+  const dw = Math.round(sw * scale);
+  const dh = Math.round(sh * scale);
+  const dx = Math.round((cellW - dw) / 2);
+  const dy = index * cellH + Math.round((cellH - dh) / 2);
+  return { sx, sy, sw, sh, dx, dy, dw, dh };
+}
 
 /** A ban that already locked before it could be read. It advances the board and removes no hero. */
 export const UNSEEN_BAN = "__unseen__";
@@ -344,6 +402,24 @@ function plateLines(text: string): string[] {
     .filter(Boolean);
 }
 
+const RANK_TAGS = new Set([
+  "bronze",
+  "silver",
+  "gold",
+  "platinum",
+  "diamond",
+  "master",
+  "grandmaster",
+]);
+
+/** A rank label that is also someone's battletag, once the hero on that plate is known. */
+function rankTag(line: string): string | null {
+  const token = line.trim();
+  if (!/^[A-Za-z]{3,17}$/.test(token)) return null;
+  if (!RANK_TAGS.has(token.toLowerCase())) return null;
+  return token;
+}
+
 function playerToken(line: string, allowShort = false): string | null {
   if (isUiFragment(line)) return null;
   const ranked = line
@@ -355,10 +431,51 @@ function playerToken(line: string, allowShort = false): string | null {
 }
 
 /**
- * The player on a nameplate. The top line is the hero (Valla, Mal'Ganis).
- * The bottom line is who locked it (Topgun707, PeterWiggin). A hero line
- * alone is not a player.
+ * Hero and player printed on one slot's nameplate.
+ * The name under the hero is who locked it. A name above the hero, or a
+ * second name below it, is the neighboring plate leaking into the crop.
  */
+export function readSlotPlate(lines: readonly string[]): {
+  hero: string | null;
+  player: string | null;
+} {
+  let hero: string | null = null;
+  let player: string | null = null;
+  let heroSeen = false;
+  for (const line of lines) {
+    const asHero = heroFromPlateText(line);
+    if (asHero) {
+      hero = asHero;
+      if (!heroSeen) player = null;
+      heroSeen = true;
+      continue;
+    }
+    const asPlayer = nameFromPlate(line, true) ?? (heroSeen ? rankTag(line) : null);
+    if (!asPlayer) continue;
+    if (!heroSeen || !player) player = asPlayer;
+  }
+  if (!hero) hero = heroFromPlateText(lines.join(" "));
+  return { hero, player };
+}
+
+/**
+ * Lines from five nameplates stacked top to bottom, one cell per slot.
+ * `top` is the line's y in that stacked image.
+ */
+export function readsBySlot(
+  lines: readonly { text: string; top: number }[],
+  count = 5,
+  stride = SLOT_LINE_STRIDE,
+): { hero: string | null; player: string | null }[] {
+  const buckets: string[][] = Array.from({ length: count }, () => []);
+  for (const line of lines) {
+    const index = Math.floor(line.top / stride);
+    if (index < 0 || index >= count) continue;
+    buckets[index].push(line.text);
+  }
+  return buckets.map((bucket) => readSlotPlate(bucket));
+}
+
 export function nameFromPlate(text: string, allowShort = false): string | null {
   const lines = plateLines(text);
   if (!lines.length) return null;
@@ -575,9 +692,9 @@ export function plateFill(pixels: readonly Rgb[]): PlateFill {
   return median >= 50 ? "shown" : "locked";
 }
 
-/** A ban hex with a face in it. An empty hex is the dark frame only. */
-export function banHexFilled(pixels: readonly Rgb[]): boolean {
-  if (pixels.length < 20) return false;
+/** Share of pixels that are a lit, saturated color. Dark honeycomb scores near 0. */
+export function colorfulFraction(pixels: readonly Rgb[]): number {
+  if (pixels.length === 0) return 0;
   let colorful = 0;
   for (const pixel of pixels) {
     const max = Math.max(pixel.r, pixel.g, pixel.b);
@@ -585,7 +702,26 @@ export function banHexFilled(pixels: readonly Rgb[]): boolean {
     const sat = max === 0 ? 0 : (max - min) / max;
     if (lumaOf(pixel) > 35 && sat > 0.18) colorful += 1;
   }
-  return colorful / pixels.length > 0.28;
+  return colorful / pixels.length;
+}
+
+/**
+ * A ban hex with a hero face in it. An empty hex is the dark frame only.
+ * The magenta "banning" arrow on draft lobby shrines.png scores about 0.28, so it
+ * stays under this cut. Real ban faces on draft lobby volskaya.png score 0.36 and up.
+ */
+export function banHexFilled(pixels: readonly Rgb[]): boolean {
+  if (pixels.length < 20) return false;
+  return colorfulFraction(pixels) > 0.33;
+}
+
+/**
+ * A side slot with a locked portrait. Empty honeycomb on both reference lobbies
+ * stays under 0.20. Locked faces, including the cooler enemy portraits, clear 0.30.
+ */
+export function portraitFilled(pixels: readonly Rgb[]): boolean {
+  if (pixels.length < 20) return false;
+  return colorfulFraction(pixels) >= 0.3;
 }
 
 const FACE_GRID = 4;
@@ -943,6 +1079,10 @@ function asSlotLocks(
  * Slot order is only a fallback for a hero the center never named.
  * Each hero keeps the name printed under its portrait.
  */
+function platePlayerKey(name: string): string {
+  return name.trim().toLowerCase();
+}
+
 export function takeNewLocks(
   prev: readonly string[],
   brightInSlotOrder: readonly (string | SlotLock)[],
@@ -954,11 +1094,27 @@ export function takeNewLocks(
   prev.forEach((hero, index) => {
     playerByHero.set(heroKey(hero), prevPlayers[index] ?? null);
   });
+  // This frame's plate is the name under that hero. The same player cannot
+  // stay on a second hero, and a later read replaces an earlier miss.
+  const claimed = new Map<string, string>();
+  for (const lock of bright) {
+    if (!lock.player) continue;
+    const pk = platePlayerKey(lock.player);
+    if (!claimed.has(pk)) claimed.set(pk, heroKey(lock.hero));
+  }
+  for (const [hero, player] of playerByHero) {
+    if (!player) continue;
+    const owner = claimed.get(platePlayerKey(player));
+    if (owner && owner !== hero) playerByHero.set(hero, null);
+  }
   for (const lock of bright) {
     const key = heroKey(lock.hero);
-    const have = playerByHero.get(key);
-    if (lock.player && !have) playerByHero.set(key, lock.player);
-    else if (!playerByHero.has(key)) playerByHero.set(key, lock.player);
+    if (!lock.player) {
+      if (!playerByHero.has(key)) playerByHero.set(key, null);
+      continue;
+    }
+    if (claimed.get(platePlayerKey(lock.player)) !== key) continue;
+    playerByHero.set(key, lock.player);
   }
   const have = new Set(prev.map((hero) => heroKey(hero)));
   const fresh = bright.filter((lock) => !have.has(heroKey(lock.hero)));
@@ -998,10 +1154,6 @@ function plateHeroList(): { norm: string; hero: string }[] {
     const slug = heroDraftSlug(hero);
     if (slug) byNorm.set(plateNorm(slug), hero);
   }
-  for (const [alias, hero] of Object.entries(PLATE_TITLES)) {
-    const known = byNorm.get(plateNorm(hero));
-    byNorm.set(alias, known ?? hero);
-  }
   plateHeroes = [...byNorm.entries()].map(([norm, hero]) => ({ norm, hero }));
   return plateHeroes;
 }
@@ -1029,6 +1181,22 @@ export function heroFromPlateText(text: string): string | null {
     if (token.length < 3) continue;
     const hit = list.find((hero) => hero.norm === plateNorm(token));
     if (hit) return hit.hero;
+  }
+  // The slot crop clips the first letter: EORIC, ASSIA, DBIUS.
+  const clipped = (token: string) => {
+    const norm = plateNorm(token);
+    if (norm.length < 5) return null;
+    const hits = list.filter((hero) => {
+      const extra = hero.norm.length - norm.length;
+      return extra >= 1 && extra <= 2 && hero.norm.endsWith(norm);
+    });
+    return hits.length === 1 ? hits[0].hero : null;
+  };
+  const fromJoined = clipped(joined);
+  if (fromJoined) return fromJoined;
+  for (const token of text.split(/[^A-Za-z0-9']+/)) {
+    const hit = clipped(token);
+    if (hit) return hit;
   }
   return null;
 }
@@ -1107,6 +1275,7 @@ export function bannerTurn(text: string): {
     tight.includes("banned") ||
     /\bbanned\b/.test(lower) ||
     tight.includes("enemyban") ||
+    tight.includes("teamban") ||
     tight.includes("waitingforenemyban");
   const picking = /\bpicking\b/.test(lower) || tight.includes("picking");
   let phase: "ban" | "pick" | null = null;
@@ -1182,6 +1351,19 @@ export function shownBanSide(args: {
 export function firstBanSideFromStatus(text: string): "us" | "them" | null {
   const tight = text.toLowerCase().replace(/[^a-z]/g, "");
   if (tight.includes("waitingforenemyban")) return "them";
+  if (tight.includes("waitingforteamban")) return "us";
+  return null;
+}
+
+/**
+ * Whose turn the bottom pill is describing, bans or picks.
+ * "Waiting for Team Ban..." and "Waiting for Teammates..." are us.
+ * "Waiting for Enemy..." is them.
+ */
+export function sideFromStatus(text: string): "our" | "their" | null {
+  const tight = text.toLowerCase().replace(/[^a-z]/g, "");
+  if (tight.includes("waitingforenemy")) return "their";
+  if (tight.includes("waitingforteam")) return "our";
   return null;
 }
 
@@ -1507,6 +1689,21 @@ export function actionsFromObserved(
     actions.push({ side, kind: "ban", hero: UNSEEN_BAN });
   }
   return actions;
+}
+
+/**
+ * Completed bans and picks in draft order, plus the step the lobby is on.
+ * An unfinished draft has one sequence that can produce the locks already
+ * on screen, so the order stops at the first hero the lobby has not locked.
+ */
+export function progressFromObserved(draft: LiveDraft & { weFirst: boolean }): {
+  actions: ReplayAction[];
+  next: { side: "our" | "their"; kind: "ban" | "pick" } | null;
+} {
+  const actions = actionsFromObserved(draft);
+  const step = DRAFT_ORDER[actions.length];
+  if (!step) return { actions, next: null };
+  return { actions, next: { side: draftSide(step, draft.weFirst), kind: step.kind } };
 }
 
 /**

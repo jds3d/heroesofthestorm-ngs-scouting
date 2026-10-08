@@ -59,7 +59,7 @@ export async function GET() {
 export async function POST(request: Request) {
   const body = (await request.json()) as { kind?: unknown; hero?: unknown; image?: unknown };
   if (body.kind === "frame") {
-    const image = asBase64(body.image, 2_000_000);
+    const image = asBase64(body.image, 8_000_000);
     if (!image) return NextResponse.json({ error: "Expected a frame" }, { status: 400 });
     const bytes = Buffer.from(image, "base64");
     if (bytes[0] !== 0xff || bytes[1] !== 0xd8) {
