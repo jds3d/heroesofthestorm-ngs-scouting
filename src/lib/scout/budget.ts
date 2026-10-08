@@ -35,3 +35,17 @@ export function runWithScoutBudget<T>(
 ): Promise<T> {
   return budget.run({ deadline: Date.now() + budgetMs }, fn);
 }
+
+/**
+ * Run `fn` under the sooner of the current scout deadline and `maxMs` from
+ * now. The outer deadline is unchanged when `fn` returns, so a slow side
+ * task (hero matchups) can yield the response without eating the whole request.
+ */
+export function withTighterBudget<T>(
+  maxMs: number,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const parent = budget.getStore();
+  const deadline = Math.min(parent?.deadline ?? Infinity, Date.now() + maxMs);
+  return budget.run({ deadline }, fn);
+}

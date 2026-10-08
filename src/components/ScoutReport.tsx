@@ -98,17 +98,17 @@ export function ScoutReportView({
     if (review || !liveDraft) return null;
     const side =
       pickSide ??
-      (screenOnly
-        ? liveDraft.firstPick === "us"
-          ? "weFirst"
-          : "theyFirst"
-        : null);
+      (liveDraft.firstPick === "us"
+        ? "weFirst"
+        : liveDraft.firstPick === "them"
+          ? "theyFirst"
+          : null);
     if (!side) return null;
     return actionsFromObserved({
       ...liveDraft,
       weFirst: side === "weFirst",
     });
-  }, [review, liveDraft, pickSide, screenOnly]);
+  }, [review, liveDraft, pickSide]);
   const toc = [
     { id: "know-them", label: `1. ${report.teamName} Team` },
     { id: "preferred-heroes", label: `2. ${report.teamName} - Individual` },
@@ -425,8 +425,11 @@ export function ScoutReportView({
           2. {report.teamName} - Individual
         </h3>
         <p className="max-w-2xl text-sm text-[var(--muted)]">
-          Per-player comfort — NGS is this season&apos;s league games; SL is Storm
-          League in the same window. Both win rates shown when we have a sample.
+          Per-player comfort is 50% this NGS season, 20% earlier NGS seasons,
+          and 30% Storm League. This season&apos;s games are not included in the
+          earlier-season count. Storm League games from the last 6 months count
+          fully; older games in the two-year window count half. SL none means
+          that hero is not in their Storm League sample.
         </p>
         <div className="grid gap-4 md:grid-cols-2">
           {report.roster.map((p) => (
@@ -587,8 +590,13 @@ export function ScoutReportView({
                   : null
               }
               screen={screenActions}
+              observedPicks={review ? null : liveDraft}
               tree={side?.tree ?? plan.tree}
-              weFirst={pickSide === "weFirst"}
+              weFirst={
+                (pickSide ??
+                  (liveDraft?.firstPick === "us" ? "weFirst" : "theyFirst")) ===
+                "weFirst"
+              }
               banPriority={shown.adapt.banPriority}
               theirCommonBans={report.draft.theirBans}
               ourLikely={ourPicks}

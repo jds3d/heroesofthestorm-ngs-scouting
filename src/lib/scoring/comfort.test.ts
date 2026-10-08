@@ -11,6 +11,7 @@ import {
   overlayStormLeague,
   playerComfortOn,
   playerFromStormLeague,
+  playerWithoutHistory,
   playersMeetingSuggestBar,
   slHeroSuggestions,
   sourceMapGames,
@@ -65,6 +66,55 @@ describe("comfortFromSources", () => {
   it("lets Storm League history carry a hero with no NGS games", () => {
     const c = comfortFromSources("Xul", undefined, sl(89, 64, [5, 3], 0.07));
     expect(c.comfort).toBeGreaterThan(0.2);
+  });
+
+  it("keeps a missing Storm League sample from inflating a short NGS season", () => {
+    const current = {
+      games: 4,
+      wins: 3,
+      losses: 1,
+      winRate: 0.75,
+      playPct: 0.8,
+    };
+    const prior = {
+      games: 7,
+      wins: 5,
+      losses: 2,
+      winRate: 5 / 7,
+      playPct: 0.35,
+    };
+    const held = comfortFromSources(
+      "Kharazim",
+      current,
+      undefined,
+      prior,
+      true,
+      true,
+    );
+    const donated = comfortFromSources(
+      "Kharazim",
+      current,
+      undefined,
+      prior,
+      true,
+      false,
+    );
+    // 50% of this season + 20% of earlier seasons. The 30% Storm League
+    // share stays empty, so 4g and 7g are not treated as the whole blend.
+    expect(held.comfort).toBeCloseTo(0.5 * 0.68 + 0.2 * 0.29, 2);
+    expect(held.comfort).toBeLessThan(donated.comfort);
+  });
+
+  it("counts a Storm League sample under five games", () => {
+    const slOnly = comfortFromSources(
+      "Kael'thas",
+      undefined,
+      sl(1, 2, [0, 0], 0.09),
+      undefined,
+      false,
+    );
+    expect(slOnly.comfort).toBeGreaterThan(0);
+    expect(slOnly.sources.stormLeague?.games).toBe(3);
   });
 });
 
@@ -214,6 +264,36 @@ describe("thin Storm League fallback", () => {
     );
   });
 
+  it("blends a short Storm League sample and does not treat NGS history as including this season", () => {
+    const player = buildPlayerComfort({
+      battletag: "MillerCoffee#1690",
+      ngsCurrent: new Map([
+        ["Kharazim", { games: 4, wins: 3, losses: 1, winRate: 0.75, playPct: 0.8 }],
+      ]),
+      stormLeague: new Map([
+        ["Kael'thas", sl(1, 2, [0, 0], 0.09)],
+        ["Rehgar", sl(2, 3, [0, 0], 0.15)],
+      ]),
+      ngsPrior: new Map([
+        ["Kharazim", { games: 7, wins: 5, losses: 2, winRate: 5 / 7, playPct: 0.35 }],
+        ["Kael'thas", { games: 3, wins: 2, losses: 1, winRate: 2 / 3, playPct: 0.15 }],
+      ]),
+      includePrior: true,
+      ngsWins: 4,
+      ngsLosses: 1,
+      heroesProfileUrl: "",
+      ngsProfileUrl: "",
+    });
+    const monk = player.topHeroes.find((h) => h.hero === "Kharazim");
+    const kael = player.topHeroes.find((h) => h.hero === "Kael'thas");
+    expect(monk?.sources.stormLeague).toBeUndefined();
+    expect(monk?.sources.ngsCurrent?.games).toBe(4);
+    expect(monk?.sources.ngsPrior?.games).toBe(7);
+    expect(kael?.sources.stormLeague?.games).toBe(3);
+    expect(kael?.comfort).toBeGreaterThan(0);
+    expect(monk && kael && monk.comfort).toBeGreaterThan(kael?.comfort ?? 0);
+  });
+
   it("keeps a deep Storm League pool and leaves Quick Match out", () => {
     const player = buildPlayerComfort({
       battletag: "Beachyman#11746",
@@ -306,6 +386,18 @@ describe("slHeroSuggestions", () => {
       takenPlayers: new Set(["huckit"]),
     });
     expect(picks.map((pick) => pick.player)).toEqual(["MoJoE"]);
+  });
+
+  it("leaves a player with no history unassigned", () => {
+    const picks = slHeroSuggestions({
+      roster: [
+        scout("Trinity#12547", [["Whitemane", sl(40, 10)]]),
+        playerWithoutHistory("Answered"),
+      ],
+      gone: new Set(),
+    });
+    expect(picks.map((pick) => pick.player)).toEqual(["Trinity"]);
+    expect(playerWithoutHistory("Answered").topHeroes).toEqual([]);
   });
 
   it("keeps a short Storm League history that the blended pool would drop", () => {

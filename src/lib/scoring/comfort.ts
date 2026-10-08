@@ -247,6 +247,11 @@ export function comfortFromSources(
   stormLeague?: SourceHeroStat,
   ngsPrior?: SourceHeroStat,
   includePrior = true,
+  /**
+   * The player has a Storm League pool, and this hero is not in it. That 30%
+   * stays zero instead of being handed to the NGS samples.
+   */
+  holdMissingStormLeague = false,
 ): ComfortHero {
   const { weights, minGames } = leagueConfig;
 
@@ -255,29 +260,45 @@ export function comfortFromSources(
   let wPrior: number = includePrior ? weights.ngsPrior : 0;
 
   const ngsOk = ngsCurrent && ngsCurrent.games >= minGames.ngs;
-  const slOk = stormLeague && stormLeague.games >= minGames.stormLeague;
+  // Any Storm League games count. Volume inside stormLeagueScore shrinks a
+  // short sample; the old 5-game floor was dropping 3–4 game heroes entirely.
+  const slOk = Boolean(stormLeague && stormLeague.games > 0);
   const priorOk = includePrior && ngsPrior && ngsPrior.games >= minGames.ngs;
+  const slHole = holdMissingStormLeague && !slOk;
+
+  // A hero they do not play in Storm League does not get that weight moved
+  // onto a handful of NGS games. Do this before NGS redistribution so the
+  // current-season share can still land on history.
+  if (slHole) wSl = 0;
 
   if (!ngsOk) {
-    wSl += wNgs * 0.6;
-    wPrior += wNgs * 0.4;
+    const rest = wSl + wPrior;
+    if (rest > 0) {
+      wSl += wNgs * (wSl / rest);
+      wPrior += wNgs * (wPrior / rest);
+    }
     wNgs = 0;
   }
-  if (!slOk) {
-    wNgs += wSl * 0.7;
-    wPrior += wSl * 0.3;
-    wSl = 0;
-  }
   if (!priorOk) {
-    const total = wNgs + wSl;
-    if (total > 0) {
-      wNgs = wNgs / total;
-      wSl = wSl / total;
+    const rest = wNgs + wSl;
+    if (rest > 0) {
+      wNgs += wPrior * (wNgs / rest);
+      wSl += wPrior * (wSl / rest);
     }
     wPrior = 0;
   }
+  if (!slOk && !slHole) {
+    const rest = wNgs + wPrior;
+    if (rest > 0) {
+      wNgs += wSl * (wNgs / rest);
+      wPrior += wSl * (wPrior / rest);
+    }
+    wSl = 0;
+  }
 
-  const weightSum = wNgs + wSl + wPrior || 1;
+  // The SL hole is a real 30% of the blend, so the remaining weights are not
+  // scaled back up to 100%.
+  const weightSum = slHole ? 1 : wNgs + wSl + wPrior || 1;
   const comfort =
     (wNgs * rawScore(ngsOk ? ngsCurrent : undefined) +
       wSl * stormLeagueScore(slOk ? stormLeague : undefined) +
@@ -439,6 +460,7 @@ export function buildPlayerComfort(args: {
   ngsProfileUrl: string;
   blizzId?: number | null;
 }): PlayerScout {
+  const slKnown = sourceMapGames(args.stormLeague) > 0;
   const stormLeagueThin =
     sourceMapGames(args.stormLeague) < leagueConfig.minGames.confidentPool;
   const quickMatch = stormLeagueThin
@@ -447,27 +469,30 @@ export function buildPlayerComfort(args: {
 
   const heroes = new Set<string>([
     ...args.ngsCurrent.keys(),
-    ...(stormLeagueThin ? [] : args.stormLeague.keys()),
+    ...args.stormLeague.keys(),
     ...(args.includePrior ? args.ngsPrior.keys() : []),
     ...quickMatch.keys(),
   ]);
 
   const scored: ComfortHero[] = [];
   for (const hero of heroes) {
+    const ngsCurrent = args.ngsCurrent.get(hero);
+    const stormLeague = args.stormLeague.get(hero);
+    const ngsPrior = args.includePrior ? args.ngsPrior.get(hero) : undefined;
+    const qm = quickMatch.get(hero);
+    // Quick Match only fills a hero Storm League and NGS do not cover, and
+    // only when there is no Storm League pool to blend.
+    const qmOnly = !slKnown || (!stormLeague && !ngsCurrent && !ngsPrior && Boolean(qm));
     scored.push(
-      stormLeagueThin
-        ? comfortFromFallback(
-            hero,
-            args.ngsCurrent.get(hero),
-            args.includePrior ? args.ngsPrior.get(hero) : undefined,
-            quickMatch.get(hero),
-          )
+      qmOnly
+        ? comfortFromFallback(hero, ngsCurrent, ngsPrior, qm)
         : comfortFromSources(
             hero,
-            args.ngsCurrent.get(hero),
-            args.stormLeague.get(hero),
+            ngsCurrent,
+            stormLeague,
             args.ngsPrior.get(hero),
             args.includePrior,
+            !stormLeague,
           ),
     );
   }
@@ -500,6 +525,11 @@ export function buildPlayerComfort(args: {
     ngsProfileUrl: args.ngsProfileUrl,
     returningFromPrior: args.includePrior,
   };
+}
+
+/** Screen name with no saved Storm League history. Comfort on every hero is zero. */
+export function playerWithoutHistory(name: string): PlayerScout {
+  return playerFromStormLeague(name, new Map());
 }
 
 /** A player card built only from Storm League hero history. */
@@ -558,6 +588,7 @@ function slRank(hero: ComfortHero): { sl: number; games: number } {
 /**
  * One still-available hero per player, chosen from Storm League comfort.
  * Stronger Storm League comfort keeps its hero when two players share a best pick.
+ * A player with no history is left unassigned; the draft scores that seat with comfort 0.
  * Results stay in roster order.
  */
 export function slHeroSuggestions(args: {

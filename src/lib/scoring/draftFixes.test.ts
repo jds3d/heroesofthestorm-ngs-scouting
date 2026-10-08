@@ -4,8 +4,11 @@ import {
   explainTheirArchetypeRead,
   explainTheirLikelyBan,
   expectTheirNext,
+  applyPlanSeatsToSlSuggestions,
+  collectReportSteps,
   findSeatForCandidate,
   isLockedPlanSeat,
+  openPlanHeroForPlayer,
   planPickLabel,
   showSuggestionOnPlan,
 } from "@/components/InteractiveDraft";
@@ -27,7 +30,9 @@ import {
 } from "@/lib/scoring/draftGrade";
 import { heroKey } from "@/lib/scoring/heroMeta";
 import { solveSeatAssignments } from "@/lib/scoring/draftPlan";
-import { assignUniqueOwners, displacedComfort, nextSeatLabels } from "@/lib/scoring/draftSwap";
+import { assignUniqueOwners, displacedComfort, nextSeatLabels, playersSeatedOnLocks } from "@/lib/scoring/draftSwap";
+import { slHeroSuggestions } from "@/lib/scoring/comfort";
+import type { PlayerScout } from "@/lib/scoring/types";
 import { pairDuoSynergy, pairRoleCheck } from "@/lib/scoring/pickPairs";
 import {
   HeroesProfileError,
@@ -895,6 +900,95 @@ describe("opponent draft explanations", () => {
       ),
     ).toBeNull();
   });
+
+  it("does not expect a hero from a player who already locked", () => {
+    expect(
+      expectTheirNext(
+        [],
+        0,
+        new Set(),
+        [
+          {
+            hero: "Valla",
+            role: "Ranged Assassin",
+            player: "SuperGoBu",
+            note: null,
+          },
+          {
+            hero: "Reghar",
+            role: "Healer",
+            player: "Frijolito",
+            note: null,
+          },
+        ],
+        false,
+        new Set(["supergobu"]),
+      ),
+    ).toBe("Expect them toward Reghar (Frijolito) from their likely five.");
+  });
+});
+
+describe("a locked player cannot be suggested another hero", () => {
+  function pocket(tag: string, heroes: [string, number][]): PlayerScout {
+    return {
+      battletag: tag,
+      preferredRole: null,
+      topHeroes: heroes.map(([hero, comfort]) => ({
+        hero,
+        comfort,
+        playPct: 0,
+        winRate: 0,
+        games: 10,
+        sources: {
+          stormLeague: { games: 10, wins: 6, losses: 4, winRate: 0.6, playPct: 0.2 },
+        },
+      })),
+      ngsWins: 0,
+      ngsLosses: 0,
+      confidence: "low",
+      heroesProfileUrl: "",
+      ngsProfileUrl: "",
+      returningFromPrior: false,
+    };
+  }
+
+  it("seats SuperGoBu on an unnamed Dehaka lock and will not offer him Valla", () => {
+    const roster = [
+      pocket("SuperGoBu#1", [
+        ["Valla", 0.9],
+        ["Dehaka", 0.7],
+      ]),
+      pocket("Frijolito#2", [
+        ["Reghar", 0.8],
+        ["Dehaka", 0.2],
+      ]),
+    ];
+    const seated = playersSeatedOnLocks({
+      locks: [{ hero: "Dehaka", player: null }],
+      roster,
+      claimUnnamed: true,
+    });
+    expect(seated.has("supergobu")).toBe(true);
+    const next = slHeroSuggestions({
+      roster,
+      gone: new Set(["dehaka"]),
+      takenPlayers: seated,
+    });
+    expect(next.map((pick) => pick.player)).toEqual(["Frijolito"]);
+    expect(next.some((pick) => pick.hero === "Valla")).toBe(false);
+  });
+
+  it("keeps a named lock without guessing a second owner", () => {
+    expect(
+      [
+        ...playersSeatedOnLocks({
+          locks: [{ hero: "Dehaka", player: "SuperGoBu#1" }],
+          roster: [],
+          claimUnnamed: true,
+        }),
+      ],
+    ).toEqual(["supergobu"]);
+  });
 });
 
 describe("seat suggestion text stays aligned with the live plan", () => {
@@ -925,6 +1019,165 @@ describe("seat suggestion text stays aligned with the live plan", () => {
     expect(
       planSeatJob({ hero: "Qhira", role: "4-man", player: null, note: null }),
     ).toBe("Flex");
+  });
+
+  it("keeps an unscored final double on the report card as picks 4 and 5", () => {
+    const order: { side: "fp" | "sp"; kind: "ban" | "pick" }[] = [
+      { side: "fp", kind: "ban" },
+      { side: "sp", kind: "ban" },
+      { side: "fp", kind: "ban" },
+      { side: "sp", kind: "ban" },
+      { side: "fp", kind: "pick" },
+      { side: "sp", kind: "pick" },
+      { side: "sp", kind: "pick" },
+      { side: "fp", kind: "pick" },
+      { side: "fp", kind: "pick" },
+      { side: "sp", kind: "ban" },
+      { side: "fp", kind: "ban" },
+      { side: "sp", kind: "pick" },
+      { side: "sp", kind: "pick" },
+      { side: "fp", kind: "pick" },
+      { side: "fp", kind: "pick" },
+      { side: "sp", kind: "pick" },
+    ];
+    const counts = { fp: { ban: 0, pick: 0 }, sp: { ban: 0, pick: 0 } };
+    const history = order.map((step, index) => {
+      counts[step.side][step.kind] += 1;
+      const unscored = index === 13 || index === 14;
+      return {
+        side: (step.side === "fp" ? "their" : "our") as "our" | "their",
+        kind: step.kind,
+        ordinal: counts[step.side][step.kind],
+        hero: index === 13 ? "Yrel" : index === 14 ? "Diablo" : `H${index}`,
+        score: unscored
+          ? undefined
+          : {
+              best: 10,
+              achieved: 10,
+              bestLabel: `H${index}`,
+              percentile: 90,
+              fieldSize: 4,
+            },
+      };
+    });
+    const steps = collectReportSteps(history, () => ({
+      best: 40,
+      achieved: 8,
+      bestLabel: "Rehgar + Sylvanas",
+      percentile: 12,
+      fieldSize: 20,
+    }));
+    const theirs = steps.filter((step) => step.side === "their");
+    expect(theirs.map((step) => step.label)).toEqual([
+      "Ban 1",
+      "Ban 2",
+      "Pick 1",
+      "Picks 2 + 3",
+      "Ban 3",
+      "Picks 4 + 5",
+    ]);
+    expect(theirs.find((step) => step.label === "Picks 4 + 5")).toMatchObject({
+      locked: "Yrel + Diablo",
+      bestLabel: "Rehgar + Sylvanas",
+      percentile: 12,
+    });
+  });
+
+  it("suggests the open plan hero instead of that player's highest-volume Storm League pick", () => {
+    const roster = [
+      {
+        battletag: "MrHustler#1686",
+        preferredRole: "Assassin",
+        topHeroes: [
+          {
+            hero: "Qhira",
+            comfort: 0.9,
+            playPct: 0,
+            winRate: 60,
+            games: 64,
+            sources: {
+              stormLeague: {
+                games: 64,
+                wins: 38,
+                losses: 26,
+                winRate: 59,
+                playPct: 0,
+              },
+            },
+          },
+          {
+            hero: "Illidan",
+            comfort: 0.2,
+            playPct: 0,
+            winRate: 50,
+            games: 8,
+            sources: {
+              stormLeague: {
+                games: 8,
+                wins: 4,
+                losses: 4,
+                winRate: 50,
+                playPct: 0,
+              },
+            },
+          },
+        ],
+        ngsWins: 0,
+        ngsLosses: 0,
+        confidence: "high" as const,
+        heroesProfileUrl: "",
+        ngsProfileUrl: "",
+        returningFromPrior: false,
+      },
+    ];
+    const plan = [
+      {
+        hero: "Stitches",
+        role: "Tank",
+        player: "Beachyman",
+        note: "locked",
+      },
+      {
+        hero: "Illidan",
+        role: "Assassin",
+        player: "MrHustler",
+        note: "need",
+      },
+    ];
+    const next = applyPlanSeatsToSlSuggestions(
+      [
+        {
+          player: "MrHustler",
+          hero: "Qhira",
+          sl: 0.9,
+          comfort: 0.9,
+          games: 64,
+        },
+      ],
+      plan,
+      new Set(),
+      roster,
+    );
+    expect(next.map((pick) => pick.hero)).toEqual(["Illidan"]);
+    expect(next[0].games).toBe(8);
+    expect(openPlanHeroForPlayer("MrHustler", plan, new Set(["illidan"]))).toBe(
+      null,
+    );
+  });
+
+  it("uses the seat alternative when the planned hero is already gone", () => {
+    const plan = [
+      {
+        hero: "Illidan",
+        role: "Assassin",
+        player: "MrHustler",
+        note: "need",
+        alternatives: [{ hero: "Valla", player: "MrHustler" }],
+      },
+    ];
+    expect(
+      openPlanHeroForPlayer("MrHustler", plan, new Set(["illidan"])),
+    ).toBe("Valla");
   });
 
   it("allows a same-role swap only when the suggestion is for the same player on that seat", () => {

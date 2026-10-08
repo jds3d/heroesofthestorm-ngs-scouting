@@ -66,16 +66,44 @@ function authHeaders(): HeadersInit {
   };
 }
 
+async function heroesProfileFetch(
+  url: string,
+  headers: HeadersInit,
+): Promise<Response> {
+  try {
+    return await fetch(url, {
+      headers,
+      signal: AbortSignal.timeout(HP_FETCH_TIMEOUT_MS),
+    });
+  } catch (err) {
+    const timedOut =
+      err instanceof Error &&
+      (err.name === "TimeoutError" || err.name === "AbortError");
+    throw new HeroesProfileError(
+      timedOut
+        ? "HeroesProfile request timed out"
+        : "HeroesProfile request failed",
+      504,
+    );
+  }
+}
+
 async function sleep(ms: number) {
   await new Promise((r) => setTimeout(r, ms));
 }
 
 const HP_MIN_REQUEST_INTERVAL_MS = 1_250;
 const HP_MAX_RATE_LIMIT_RETRIES = 3;
+/** Live draft history. These overlap; matchup and replay calls stay one at a time. */
+const HP_PLAYER_CONCURRENCY = 20;
+/** One HeroesProfile call must not sit open until Cloudflare drops the request. */
+const HP_FETCH_TIMEOUT_MS = 20_000;
 const HEROESPROFILE_ORIGIN = "https://www.heroesprofile.com";
 let hpRequestTail: Promise<void> = Promise.resolve();
 let hpNextRequestAt = 0;
 let hpAuthRejected = false;
+let playerInFlight = 0;
+const playerWaiters: Array<() => void> = [];
 
 /** Stop the shared queue from spending more calls after a 401/403. */
 export function resetHeroesProfileAuthRejectionForTests(): void {
@@ -120,11 +148,52 @@ export function heroesProfileRetryDelayMs(
   return 8_000 * 2 ** retryNumber;
 }
 
+async function acquirePlayerSlot(): Promise<void> {
+  if (playerInFlight >= HP_PLAYER_CONCURRENCY) {
+    await new Promise<void>((resolve) => {
+      playerWaiters.push(resolve);
+    });
+    return;
+  }
+  playerInFlight += 1;
+}
+
+function releasePlayerSlot(): void {
+  const next = playerWaiters.shift();
+  if (next) next();
+  else playerInFlight -= 1;
+}
+
+/** Player hero history overlaps. A 401 still stops every lane. */
+async function hpFetchParallel(url: string, headers: HeadersInit): Promise<Response> {
+  await acquirePlayerSlot();
+  try {
+    if (hpAuthRejected) {
+      throw new HeroesProfileError(
+        "HeroesProfile API rejected the token (401/403). Confirm the v1 Bearer key in .env.local and Developer access.",
+        401,
+      );
+    }
+    assertScoutBudget();
+    const res = await heroesProfileFetch(url, headers);
+    if (res.status === 401 || res.status === 403) hpAuthRejected = true;
+    return res;
+  } finally {
+    releasePlayerSlot();
+  }
+}
+
 /**
  * Serialize quota-consuming API requests and leave a gap between them. This
  * protects global stats from concurrent matchup/replay calls in one scout run.
+ * Player hero history uses `parallel` and does not take this lock.
  */
-async function hpFetch(url: string, headers: HeadersInit): Promise<Response> {
+async function hpFetch(
+  url: string,
+  headers: HeadersInit,
+  opts?: { parallel?: boolean },
+): Promise<Response> {
+  if (opts?.parallel) return hpFetchParallel(url, headers);
   let release!: () => void;
   const previous = hpRequestTail;
   hpRequestTail = new Promise<void>((resolve) => {
@@ -142,7 +211,7 @@ async function hpFetch(url: string, headers: HeadersInit): Promise<Response> {
         401,
       );
     }
-    const res = await fetch(url, { headers });
+    const res = await heroesProfileFetch(url, headers);
     if (res.status === 401 || res.status === 403) hpAuthRejected = true;
     return res;
   } finally {
@@ -162,7 +231,7 @@ async function hpFetch(url: string, headers: HeadersInit): Promise<Response> {
 async function hpGet<T>(
   endpoint: string,
   params: Record<string, string | number | undefined> = {},
-  opts?: { maxPolls?: number },
+  opts?: { maxPolls?: number; parallel?: boolean },
 ): Promise<T> {
   const url = new URL(
     `${leagueConfig.heroesProfileBaseUrl}/${endpoint.replace(/^\//, "")}`,
@@ -180,7 +249,7 @@ async function hpGet<T>(
   const kind = classifyHeroesProfile(endpoint);
   if (kind) noteApiCall(kind);
   const headers = authHeaders();
-  let res = await hpFetch(url.toString(), headers);
+  let res = await hpFetch(url.toString(), headers, opts);
   let rateLimitRetries = 0;
   while (res.status === 429 && rateLimitRetries < HP_MAX_RATE_LIMIT_RETRIES) {
     const retryMs = heroesProfileRetryDelayMs(
@@ -191,7 +260,7 @@ async function hpGet<T>(
     // Extend the shared cooldown before waiting so queued requests also slow down.
     hpNextRequestAt = Math.max(hpNextRequestAt, Date.now() + retryMs);
     await sleep(retryMs);
-    res = await hpFetch(url.toString(), headers);
+    res = await hpFetch(url.toString(), headers, opts);
     rateLimitRetries += 1;
   }
   let polls = 0;
@@ -210,7 +279,7 @@ async function hpGet<T>(
     }
     await sleep(Math.max(retryAfter, 2) * 1000);
     const jobUrl = heroesProfileJobUrl(location);
-    res = await fetch(jobUrl, { headers });
+    res = await heroesProfileFetch(jobUrl, headers);
     if (res.status === 401 || res.status === 403) hpAuthRejected = true;
     polls += 1;
   }
@@ -344,13 +413,17 @@ export async function getPlayerHeroAll(
   return cachedFetch(
     key,
     async () => {
-      const rows = await hpGet<V1PlayerHeroRow[]>("players/heroes", {
-        battletag,
-        region: leagueConfig.regionName,
-        game_type: gameType,
-        start_date: startDate ?? undefined,
-        end_date: options?.endDate,
-      });
+      const rows = await hpGet<V1PlayerHeroRow[]>(
+        "players/heroes",
+        {
+          battletag,
+          region: leagueConfig.regionName,
+          game_type: gameType,
+          start_date: startDate ?? undefined,
+          end_date: options?.endDate,
+        },
+        { parallel: true },
+      );
       const list = Array.isArray(rows) ? rows : [];
       const blizzId = list.find((row) => typeof row.blizz_id === "number")?.blizz_id;
       if (blizzId) await setCached(blizzIdKey(battletag), blizzId, FOREVER);

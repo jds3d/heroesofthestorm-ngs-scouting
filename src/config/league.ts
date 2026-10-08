@@ -16,11 +16,16 @@ export const leagueConfig = {
   stormLeagueRecentMonths: 6,
   stormLeagueOlderWeight: 0.5,
   region: 1 as const,
-  /** Storm League is the real comfort read; NGS shows what they bring to league night. */
+  /**
+   * Comfort blend when a hero has all three samples. NGS current is this
+   * season's league games. Storm League's 30% is itself weighted toward the
+   * recent window (`stormLeagueRecentMonths` at full credit, older games in
+   * the history window at `stormLeagueOlderWeight`).
+   */
   weights: {
-    ngsCurrent: 0.35,
-    stormLeague: 0.55,
-    ngsPrior: 0.1,
+    ngsCurrent: 0.5,
+    stormLeague: 0.3,
+    ngsPrior: 0.2,
   },
   minGames: {
     ngs: 2,

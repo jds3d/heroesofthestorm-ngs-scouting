@@ -436,3 +436,30 @@ export function lockedPlayerIds(locked: LockedPick[]): Set<string> {
   }
   return s;
 }
+
+/**
+ * Players who already hold a hero.
+ * A named lock keeps that player. When the draft cannot swap, a lock with no
+ * name still claims the best free owner so that player is not suggested a
+ * second hero.
+ */
+export function playersSeatedOnLocks(args: {
+  locks: readonly { hero: string; player: string | null }[];
+  roster: PlayerScout[];
+  claimUnnamed: boolean;
+}): Set<string> {
+  const taken = new Set<string>();
+  const unnamed: string[] = [];
+  for (const lock of args.locks) {
+    if (!lock.hero) continue;
+    const named = lock.player ? playerId(lock.player) : "";
+    if (named) taken.add(named);
+    else unnamed.push(lock.hero);
+  }
+  if (!args.claimUnnamed || !args.roster.length) return taken;
+  for (const hero of unnamed) {
+    const owner = bestFreeOwner(args.roster, hero, taken);
+    if (owner) taken.add(playerId(owner));
+  }
+  return taken;
+}

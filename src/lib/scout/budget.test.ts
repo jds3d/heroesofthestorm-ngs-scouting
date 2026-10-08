@@ -4,6 +4,7 @@ import {
   assertScoutBudget,
   isScoutBudgetExceeded,
   runWithScoutBudget,
+  withTighterBudget,
 } from "@/lib/scout/budget";
 
 describe("scout request budget", () => {
@@ -21,6 +22,17 @@ describe("scout request budget", () => {
         assertScoutBudget(5_000);
       }, 1_000),
     ).rejects.toBeInstanceOf(ScoutBudgetExceeded);
+  });
+
+  it("tightens the deadline without shortening the rest of the request", async () => {
+    await runWithScoutBudget(async () => {
+      await expect(
+        withTighterBudget(1_000, async () => {
+          assertScoutBudget(5_000);
+        }),
+      ).rejects.toBeInstanceOf(ScoutBudgetExceeded);
+      expect(() => assertScoutBudget(5_000)).not.toThrow();
+    }, 60_000);
   });
 
   it("does nothing outside a scout request", () => {

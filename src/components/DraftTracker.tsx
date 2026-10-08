@@ -1,4 +1,4 @@
-export type SlTrackStatus = "queued" | "pulling" | "found" | "miss";
+export type SlTrackStatus = "queued" | "pulling" | "found" | "miss" | "error";
 
 export type SlTrackRow = {
   name: string;
@@ -23,6 +23,7 @@ function statusLine(row: SlTrackRow): string {
   if (row.status === "queued") return "Waiting";
   if (row.status === "pulling") return "Pulling history";
   if (row.status === "miss") return "No Storm League history";
+  if (row.status === "error") return "Lookup refused";
   const games = Math.round(row.games);
   return games === 1 ? "1 game" : `${games} games`;
 }
@@ -37,7 +38,9 @@ export function DraftTracker({
 }) {
   const stage = stageAt(rows);
   const found = rows.filter((row) => row.status === "found").length;
-  const settled = rows.length > 0 && rows.every((row) => row.status === "found" || row.status === "miss");
+  const settled =
+    rows.length > 0 &&
+    rows.every((row) => row.status === "found" || row.status === "miss" || row.status === "error");
 
   return (
     <div className="rounded-md border border-[#2a3a48] bg-[#0f1821] px-4 py-3 text-[#e8eef2]">
@@ -85,7 +88,7 @@ export function DraftTracker({
                     ? settled
                       ? `${found} of ${rows.length} found`
                       : current
-                        ? "One player at a time"
+                        ? "All players at once"
                         : "After the names"
                     : settled
                       ? "Ready"
@@ -112,7 +115,7 @@ export function DraftTracker({
                 className={`shrink-0 text-xs ${
                   row.status === "found"
                     ? "text-[#9dceb0]"
-                    : row.status === "miss"
+                    : row.status === "miss" || row.status === "error"
                       ? "text-amber-200/90"
                       : row.status === "pulling"
                         ? "text-[#72d1b1]"

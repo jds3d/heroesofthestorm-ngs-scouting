@@ -1,0 +1,26 @@
+[
+  {
+    "hero": "Valla",
+    "file": "valla-1.png"
+  },
+  {
+    "hero": "Valla",
+    "file": "valla-2.png"
+  },
+  {
+    "hero": "Chromie",
+    "file": "chromie-1.png"
+  },
+  {
+    "hero": "Chromie",
+    "file": "chromie-2.png"
+  },
+  {
+    "hero": "Thrall",
+    "file": "thrall-1.png"
+  },
+  {
+    "hero": "Thrall",
+    "file": "thrall-2.png"
+  }
+]

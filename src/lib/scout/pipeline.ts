@@ -22,8 +22,10 @@ import {
   heroStatsFromMap,
   mergeSourceMaps,
   playerFromStormLeague,
+  playerWithoutHistory,
   sourceMapGames,
 } from "@/lib/scoring/comfort";
+import { replayBattletag } from "@/lib/replay/battletags";
 import type { PlayerScout, ScoutReport, SourceHeroStat } from "@/lib/scoring/types";
 
 function heroAllMap(
@@ -86,21 +88,20 @@ async function loadWindowedMode(
   gameType: string,
 ): Promise<Map<string, SourceHeroStat>> {
   const windows = stormLeagueWindows();
-  const history = heroAllMap(
-    await getPlayerHeroAll(battletag, {
+  const [historyRaw, recentRaw] = await Promise.all([
+    getPlayerHeroAll(battletag, {
       gameType,
       startDate: windows.historyStart,
     }),
-    gameType,
-  );
-  const recent = heroAllMap(
-    await getPlayerHeroAll(battletag, {
+    getPlayerHeroAll(battletag, {
       gameType,
       startDate: windows.recentStart,
     }),
-    gameType,
+  ]);
+  return withRecent(
+    heroAllMap(historyRaw, gameType),
+    heroAllMap(recentRaw, gameType),
   );
-  return withRecent(history, recent);
 }
 
 async function ngsSeasonMap(
@@ -423,31 +424,41 @@ export async function generateScoutReport(
   };
 }
 
-/** Storm League hero pools for battletags or display names. Skips players the API cannot resolve. */
+/**
+ * Storm League hero pools for battletags or display names.
+ * A bare name uses the most recent shared replay. No history comes back with comfort 0.
+ */
+async function loadOneStormLeaguePlayer(shown: string): Promise<PlayerScout> {
+  const tag = shown.includes("#") ? shown : replayBattletag(shown);
+  if (!tag) return playerWithoutHistory(shown);
+  try {
+    const storm = await loadWindowedMode(tag, "Storm League");
+    if (sourceMapGames(storm) <= 0) return playerWithoutHistory(shown);
+    const player = playerFromStormLeague(tag, storm);
+    player.heroesProfileUrl = heroesProfilePlayerUrl(tag);
+    return player;
+  } catch (err) {
+    if (
+      err instanceof HeroesProfileError &&
+      (err.status === 401 || err.status === 403)
+    ) {
+      throw err;
+    }
+    return playerWithoutHistory(shown);
+  }
+}
+
 export async function loadStormLeaguePlayers(
   tags: string[],
 ): Promise<PlayerScout[]> {
-  const players: PlayerScout[] = [];
   const seen = new Set<string>();
+  const jobs: Promise<PlayerScout>[] = [];
   for (const raw of tags) {
-    const tag = raw.trim();
-    const name = tag.split("#")[0]?.trim().toLowerCase() ?? "";
+    const shown = raw.trim();
+    const name = shown.split("#")[0]?.trim().toLowerCase() ?? "";
     if (!name || seen.has(name)) continue;
     seen.add(name);
-    try {
-      const storm = await loadWindowedMode(tag, "Storm League");
-      if (sourceMapGames(storm) <= 0) continue;
-      const player = playerFromStormLeague(tag, storm);
-      player.heroesProfileUrl = heroesProfilePlayerUrl(tag);
-      players.push(player);
-    } catch (err) {
-      if (
-        err instanceof HeroesProfileError &&
-        (err.status === 401 || err.status === 403)
-      ) {
-        throw err;
-      }
-    }
+    jobs.push(loadOneStormLeaguePlayer(shown));
   }
-  return players;
+  return Promise.all(jobs);
 }

@@ -4,40 +4,220 @@ import { useEffect, useRef, useState } from "react";
 import { heroKey } from "@/lib/scoring/heroMeta";
 import type { Worker } from "tesseract.js";
 import {
-  DRAFT_BAN_STRIPS,
-  DRAFT_NAME_PLATES,
+  DRAFT_BAN_HEXES,
+  DRAFT_NAME_COLUMN,
+  DRAFT_PICK_COLUMNS,
+  DRAFT_PLATE_SLOTS,
   DRAFT_STATUS_BOX,
   DRAFT_TITLE_BOX,
   DRAFT_TURN_BOX,
   EMPTY_LIVE_DRAFT,
   bannerTurn,
-  bansFromStrip,
+  banHexFilled,
+  bansFromHexFaces,
+  acceptPortraitExample,
+  matchPortrait,
+  portraitVector,
   inferFirstPick,
   pickCountsFit,
-  borderLooksLockedSamples,
-  DRAFT_PICK_SLOTS,
   PARTY_NAME_ROW,
-  heroesFromColumn,
-  heroOnPlate,
+  plateFill,
+  platesForLines,
+  dropShownLocks,
+  draftHeroList,
+  locksFromOcrLines,
   partyNamesFromText,
   mapFromTitle,
-  nameFromPlate,
-  playerFromSlotText,
+  columnShowsPicking,
+  firstPickFromPickingSlots,
+  namesFromOcrLines,
   nextTurn,
+  pickingPhaseFromColumns,
   ocrFold,
-  rememberHeroes,
-  shownBanSide,
   sideFromBannerColor,
-  screenTooSmallForWatch,
+  sideFromTeamSplash,
+  acceptPlatePicks,
+  banSideFromSplash,
+  firstBanSideFromStatus,
+  slotsHoldPicks,
   snapToRoster,
   takeNewLocks,
   turnFromOcr,
+  watchPhase,
+  type DraftBox,
   type LiveDraft,
   type OpenTurn,
+  type PlateFill,
+  type Rgb,
 } from "@/lib/lobby/screenLobby";
 
 type Phase = "idle" | "watching" | "reading";
 type Box = { x: number; y: number; w: number; h: number; rotate: number };
+
+function readHex(
+  ctx: CanvasRenderingContext2D,
+  frame: HTMLCanvasElement,
+  box: DraftBox,
+): { filled: boolean; vector: number[] | null } {
+  const x = Math.max(0, Math.round(box.x * frame.width));
+  const y = Math.max(0, Math.round(box.y * frame.height));
+  const w = Math.max(1, Math.min(frame.width - x, Math.round(box.w * frame.width)));
+  const h = Math.max(1, Math.min(frame.height - y, Math.round(box.h * frame.height)));
+  let data: Uint8ClampedArray;
+  try {
+    data = ctx.getImageData(x, y, w, h).data;
+  } catch {
+    return { filled: false, vector: null };
+  }
+  const pixels: Rgb[] = [];
+  for (let i = 0; i < data.length; i += 4) {
+    pixels.push({ r: data[i] ?? 0, g: data[i + 1] ?? 0, b: data[i + 2] ?? 0 });
+  }
+  return { filled: banHexFilled(pixels), vector: portraitVector(pixels, w, h) };
+}
+
+type FaceRow = { hero: string; vector: number[] };
+let faceCatalog: Promise<FaceRow[]> | null = null;
+
+function loadImage(url: string): Promise<HTMLImageElement> {
+  return new Promise((resolve, reject) => {
+    const image = new Image();
+    image.onload = () => resolve(image);
+    image.onerror = () => reject(new Error(url));
+    image.src = url;
+  });
+}
+
+/** In-game portraits saved from watched drafts. */
+function loadFaceCatalog(): Promise<FaceRow[]> {
+  if (faceCatalog) return faceCatalog;
+  faceCatalog = (async () => {
+    const res = await fetch("/api/draft-examples");
+    if (!res.ok) return [];
+    const data = (await res.json()) as { examples?: { hero?: string; image?: string }[] };
+    const rows: FaceRow[] = [];
+    for (const example of data.examples ?? []) {
+      if (!example.hero || !example.image) continue;
+      try {
+        const image = await loadImage(`data:image/png;base64,${example.image}`);
+        const canvas = document.createElement("canvas");
+        canvas.width = image.naturalWidth;
+        canvas.height = image.naturalHeight;
+        const context = canvas.getContext("2d", { willReadFrequently: true });
+        if (!context) continue;
+        context.drawImage(image, 0, 0);
+        const data = context.getImageData(0, 0, canvas.width, canvas.height).data;
+        const pixels: Rgb[] = [];
+        for (let i = 0; i < data.length; i += 4) {
+          pixels.push({ r: data[i] ?? 0, g: data[i + 1] ?? 0, b: data[i + 2] ?? 0 });
+        }
+        const vector = portraitVector(pixels, canvas.width, canvas.height);
+        if (vector) rows.push({ hero: example.hero, vector });
+      } catch {
+        // One unreadable example does not drop the rest.
+      }
+    }
+    return rows;
+  })();
+  return faceCatalog;
+}
+
+function pngOf(pixels: Rgb[], width: number, height: number): Promise<string | null> {
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const context = canvas.getContext("2d");
+  if (!context) return Promise.resolve(null);
+  const image = context.createImageData(width, height);
+  for (let i = 0; i < pixels.length; i++) {
+    const pixel = pixels[i];
+    if (!pixel) continue;
+    image.data[i * 4] = pixel.r;
+    image.data[i * 4 + 1] = pixel.g;
+    image.data[i * 4 + 2] = pixel.b;
+    image.data[i * 4 + 3] = 255;
+  }
+  context.putImageData(image, 0, 0);
+  return new Promise((resolve) => {
+    canvas.toBlob(async (blob) => {
+      if (!blob) {
+        resolve(null);
+        return;
+      }
+      const bytes = new Uint8Array(await blob.arrayBuffer());
+      let binary = "";
+      for (let i = 0; i < bytes.length; i += 0x8000) {
+        binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+      }
+      resolve(btoa(binary));
+    }, "image/png");
+  });
+}
+
+function sampleRegion(
+  ctx: CanvasRenderingContext2D,
+  frame: HTMLCanvasElement,
+  box: DraftBox,
+): { pixels: Rgb[]; width: number; height: number } {
+  const x = Math.max(0, Math.round(box.x * frame.width));
+  const y = Math.max(0, Math.round(box.y * frame.height));
+  const width = Math.max(1, Math.min(frame.width - x, Math.round(box.w * frame.width)));
+  const height = Math.max(1, Math.min(frame.height - y, Math.round(box.h * frame.height)));
+  let data: Uint8ClampedArray;
+  try {
+    data = ctx.getImageData(x, y, width, height).data;
+  } catch {
+    return { pixels: [], width: 0, height: 0 };
+  }
+  const pixels: Rgb[] = [];
+  for (let i = 0; i < data.length; i += 4) {
+    pixels.push({ r: data[i] ?? 0, g: data[i + 1] ?? 0, b: data[i + 2] ?? 0 });
+  }
+  return { pixels, width, height };
+}
+
+function sampleBox(
+  ctx: CanvasRenderingContext2D,
+  frame: HTMLCanvasElement,
+  box: DraftBox,
+): Rgb[] {
+  const x = Math.max(0, Math.round(box.x * frame.width));
+  const y = Math.max(0, Math.round(box.y * frame.height));
+  const w = Math.max(1, Math.min(frame.width - x, Math.round(box.w * frame.width)));
+  const h = Math.max(1, Math.min(frame.height - y, Math.round(box.h * frame.height)));
+  let data: Uint8ClampedArray;
+  try {
+    data = ctx.getImageData(x, y, w, h).data;
+  } catch {
+    return [];
+  }
+  const pixels: Rgb[] = [];
+  for (let i = 0; i < data.length; i += 4) {
+    pixels.push({ r: data[i] ?? 0, g: data[i + 1] ?? 0, b: data[i + 2] ?? 0 });
+  }
+  return pixels;
+}
+
+/** OCR line `top` is in the scaled pick-column image. Match plates in that space. */
+function slotImageTop(frame: HTMLCanvasElement, column: DraftBox, slot: DraftBox): number {
+  const sw = Math.max(1, Math.round(column.w * frame.width));
+  const sh = Math.max(1, Math.round(column.h * frame.height));
+  const scale = Math.min(4, 1800 / Math.min(sw, sh));
+  const frameY = (slot.y + slot.h / 2) * frame.height;
+  return (frameY - column.y * frame.height) * scale;
+}
+
+function plateSlots(
+  ctx: CanvasRenderingContext2D,
+  frame: HTMLCanvasElement,
+  column: DraftBox,
+  slots: readonly DraftBox[],
+): { top: number; fill: PlateFill }[] {
+  return slots.map((slot) => ({
+    top: slotImageTop(frame, column, slot),
+    fill: plateFill(sampleBox(ctx, frame, slot)),
+  }));
+}
 
 function straightenedPlate(frame: HTMLCanvasElement, box: Box): HTMLCanvasElement | null {
   const sx = Math.round(box.x * frame.width);
@@ -64,56 +244,6 @@ function straightenedPlate(frame: HTMLCanvasElement, box: Box): HTMLCanvasElemen
   return plate;
 }
 
-function foregroundBounds(plate: HTMLCanvasElement): { x: number; y: number; w: number; h: number } | null {
-  const ctx = plate.getContext("2d");
-  if (!ctx || plate.width < 2 || plate.height < 2) return null;
-  const data = ctx.getImageData(0, 0, plate.width, plate.height).data;
-  let minX = plate.width;
-  let minY = plate.height;
-  let maxX = 0;
-  let maxY = 0;
-  const step = 2;
-  for (let y = 0; y < plate.height; y += step) {
-    for (let x = 0; x < plate.width; x += step) {
-      const i = (y * plate.width + x) * 4;
-      if (data[i] < 12 && data[i + 1] < 8 && data[i + 2] < 20) continue;
-      if (x < minX) minX = x;
-      if (y < minY) minY = y;
-      if (x > maxX) maxX = x;
-      if (y > maxY) maxY = y;
-    }
-  }
-  if (maxX <= minX || maxY <= minY) return null;
-  return { x: minX, y: minY, w: maxX - minX + 1, h: maxY - minY + 1 };
-}
-
-function edgeSamples(plate: HTMLCanvasElement): { luma: number; sat: number }[] {
-  const ctx = plate.getContext("2d");
-  if (!ctx) return [];
-  const bounds = foregroundBounds(plate) ?? { x: 0, y: 0, w: plate.width, h: plate.height };
-  const data = ctx.getImageData(bounds.x, bounds.y, bounds.w, bounds.h).data;
-  const band = Math.max(2, Math.round(Math.min(bounds.w, bounds.h) * 0.18));
-  const samples: { luma: number; sat: number }[] = [];
-  const step = 2;
-  for (let y = 0; y < bounds.h; y += step) {
-    for (let x = 0; x < bounds.w; x += step) {
-      const onEdge = x < band || y < band || x >= bounds.w - band || y >= bounds.h - band;
-      if (!onEdge) continue;
-      const i = (y * bounds.w + x) * 4;
-      const r = data[i];
-      const g = data[i + 1];
-      const b = data[i + 2];
-      const max = Math.max(r, g, b);
-      const min = Math.min(r, g, b);
-      samples.push({
-        luma: 0.2126 * r + 0.7152 * g + 0.0722 * b,
-        sat: max === 0 ? 0 : (max - min) / max,
-      });
-    }
-  }
-  return samples;
-}
-
 export function LobbyScreenWatch({
   ourNames,
   rosterNames,
@@ -121,7 +251,6 @@ export function LobbyScreenWatch({
   onOurSide,
   onDraft,
   onWatchingChange,
-  onScreenTooSmall,
   resetEpoch = 0,
 }: {
   ourNames: string[];
@@ -132,8 +261,6 @@ export function LobbyScreenWatch({
   onOurSide?: (names: string[]) => void;
   onDraft: (draft: LiveDraft) => void;
   onWatchingChange?: (watching: boolean) => void;
-  /** The drafter's monitor is smaller than the monitor being shared. */
-  onScreenTooSmall?: (tooSmall: boolean) => void;
   /** Bump to drop the last game and read the current screen from scratch. */
   resetEpoch?: number;
 }) {
@@ -154,18 +281,17 @@ export function LobbyScreenWatch({
   const onOurSideRef = useRef(onOurSide);
   const onDraftRef = useRef(onDraft);
   const onWatchingRef = useRef(onWatchingChange);
-  const onScreenTooSmallRef = useRef(onScreenTooSmall);
   const lastKeyRef = useRef("");
   const lastOursKeyRef = useRef("");
   const announcedPicksRef = useRef<string[]>([]);
-  const leftSlotHeroes = useRef<(string | null)[]>([null, null, null, null, null]);
-  const rightSlotHeroes = useRef<(string | null)[]>([null, null, null, null, null]);
-  const leftSlotPlayers = useRef<(string | null)[]>([null, null, null, null, null]);
-  const rightSlotPlayers = useRef<(string | null)[]>([null, null, null, null, null]);
   const draftRef = useRef<LiveDraft>({ ...EMPTY_LIVE_DRAFT });
   const openTurnRef = useRef<OpenTurn | null>(null);
-  const lineMode = useRef<string | null>(null);
-  const sparseMode = useRef<string | null>(null);
+  const picksStartedRef = useRef(false);
+  const facesRef = useRef<FaceRow[]>([]);
+  const frameSavedRef = useRef(false);
+  const inDraftRef = useRef(false);
+  const leftNamesRef = useRef<string[]>([]);
+  const rightNamesRef = useRef<string[]>([]);
 
   useEffect(() => {
     oursRef.current = ourNames;
@@ -186,11 +312,18 @@ export function LobbyScreenWatch({
     onWatchingRef.current = onWatchingChange;
   }, [onWatchingChange]);
   useEffect(() => {
-    onScreenTooSmallRef.current = onScreenTooSmall;
-  }, [onScreenTooSmall]);
-  useEffect(() => {
     onWatchingRef.current?.(phase !== "idle");
   }, [phase]);
+
+  useEffect(() => {
+    let live = true;
+    void loadFaceCatalog().then((rows) => {
+      if (live) facesRef.current = rows;
+    });
+    return () => {
+      live = false;
+    };
+  }, []);
 
   useEffect(() => {
     return () => {
@@ -209,7 +342,6 @@ export function LobbyScreenWatch({
     workerRef.current = null;
     void worker?.terminate();
     busyRef.current = false;
-    onScreenTooSmallRef.current?.(false);
     setPhase("idle");
   }
 
@@ -220,65 +352,136 @@ export function LobbyScreenWatch({
     return result.data.text;
   }
 
-  /** One OCR line per name banner, so both teams are read the same way. */
-  async function readNamePlates(
-    frame: HTMLCanvasElement,
-    worker: Worker,
-    boxes: readonly Box[],
-  ): Promise<string[]> {
-    const names: string[] = [];
-    try {
-      if (lineMode.current) {
-        await worker.setParameters({ tessedit_pageseg_mode: lineMode.current as never });
-      }
-      for (const box of boxes) {
-        const name = nameFromPlate(await readColumn(frame, worker, box));
-        if (!name || names.some((have) => have.toLowerCase() === name.toLowerCase())) continue;
-        names.push(name);
-        if (names.length === 5) break;
-      }
-    } finally {
-      if (sparseMode.current) {
-        await worker.setParameters({ tessedit_pageseg_mode: sparseMode.current as never });
-      }
-    }
-    return names;
+  function scoutHeaders(): Record<string, string> {
+    const secret = process.env.NEXT_PUBLIC_SCOUT_API_SECRET?.trim();
+    return secret ? { "x-scout-secret": secret } : {};
   }
 
-  async function lockedHeroes(
-    frame: HTMLCanvasElement,
-    worker: Worker,
-    slots: readonly Box[],
-    cache: (string | null)[],
-    players: (string | null)[],
-  ): Promise<{ hero: string; player: string | null }[]> {
-    const locks: { hero: string; player: string | null }[] = [];
-    for (let i = 0; i < slots.length; i++) {
-      const plate = straightenedPlate(frame, slots[i]);
-      if (!plate || !borderLooksLockedSamples(edgeSamples(plate))) {
-        cache[i] = null;
-        players[i] = null;
-        continue;
-      }
-      if (!cache[i] || !players[i]) {
-        const text = (await worker.recognize(plate)).data.text;
-        if (!cache[i]) cache[i] = heroOnPlate(text);
-        if (!players[i]) players[i] = playerFromSlotText(text);
-      }
-      if (cache[i] && players[i]) locks.push({ hero: cache[i] as string, player: players[i] });
+  function canvasBlob(canvas: HTMLCanvasElement, type: string, quality: number): Promise<Blob | null> {
+    return new Promise((resolve) => canvas.toBlob((blob) => resolve(blob), type, quality));
+  }
+
+  /** The name column, rotated flat and scaled the way the reader was measured. */
+  function deskewedColumn(frame: HTMLCanvasElement, box: Box): HTMLCanvasElement | null {
+    const sx = Math.round(box.x * frame.width);
+    const sy = Math.round(box.y * frame.height);
+    const sw = Math.max(1, Math.round(box.w * frame.width));
+    const sh = Math.max(1, Math.round(box.h * frame.height));
+    const scale = Math.min(4, 1800 / Math.min(sw, sh));
+    const dw = Math.round(sw * scale);
+    const dh = Math.round(sh * scale);
+    const rad = (box.rotate * Math.PI) / 180;
+    const cos = Math.abs(Math.cos(rad));
+    const sin = Math.abs(Math.sin(rad));
+    const plate = document.createElement("canvas");
+    plate.width = Math.ceil(dw * cos + dh * sin);
+    plate.height = Math.ceil(dw * sin + dh * cos);
+    const ctx = plate.getContext("2d");
+    if (!ctx) return null;
+    ctx.fillStyle = "#000";
+    ctx.fillRect(0, 0, plate.width, plate.height);
+    ctx.imageSmoothingEnabled = true;
+    ctx.translate(plate.width / 2, plate.height / 2);
+    ctx.rotate(rad);
+    ctx.drawImage(frame, sx, sy, sw, sh, -dw / 2, -dh / 2, dw, dh);
+    return plate;
+  }
+
+  async function pictureOf(canvas: HTMLCanvasElement): Promise<string | null> {
+    const blob =
+      (await canvasBlob(canvas, "image/webp", 0.9)) ?? (await canvasBlob(canvas, "image/jpeg", 0.92));
+    if (!blob) return null;
+    const bytes = new Uint8Array(await blob.arrayBuffer());
+    let binary = "";
+    for (let i = 0; i < bytes.length; i += 0x8000) {
+      binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
     }
-    return locks;
+    return btoa(binary);
+  }
+
+  type OcrLine = { text: string; top: number };
+
+/** Names and locked heroes. The pick columns use the same reader as the banners. */
+async function readLobby(
+  frame: HTMLCanvasElement,
+): Promise<{
+  left: string[];
+  right: string[];
+  leftLocks: { hero: string; player: string | null }[];
+  rightLocks: { hero: string; player: string | null }[];
+  picksLeft: OcrLine[];
+  picksRight: OcrLine[];
+  leftPicking: boolean;
+  rightPicking: boolean;
+  center: OcrLine[];
+} | null> {
+  const leftPlate = deskewedColumn(frame, DRAFT_NAME_COLUMN.left);
+  const rightPlate = deskewedColumn(frame, DRAFT_NAME_COLUMN.right);
+  const picksLeftPlate = deskewedColumn(frame, DRAFT_PICK_COLUMNS.left);
+  const picksRightPlate = deskewedColumn(frame, DRAFT_PICK_COLUMNS.right);
+  const centerPlate = deskewedColumn(frame, DRAFT_TURN_BOX);
+  if (!leftPlate || !rightPlate) return null;
+  const [left, right, picksLeft, picksRight, center] = await Promise.all([
+    pictureOf(leftPlate),
+    pictureOf(rightPlate),
+    picksLeftPlate ? pictureOf(picksLeftPlate) : Promise.resolve(null),
+    picksRightPlate ? pictureOf(picksRightPlate) : Promise.resolve(null),
+    centerPlate ? pictureOf(centerPlate) : Promise.resolve(null),
+  ]);
+  if (!left || !right) return null;
+  const res = await fetch("/api/ocr/names", {
+    method: "POST",
+    headers: { "content-type": "application/json", ...scoutHeaders() },
+    body: JSON.stringify({ left, right, picksLeft, picksRight, center }),
+  });
+  if (!res.ok) return null;
+  const data = (await res.json()) as {
+    left?: OcrLine[];
+    right?: OcrLine[];
+    picksLeft?: OcrLine[];
+    picksRight?: OcrLine[];
+    center?: OcrLine[];
+  };
+  const picksLeftLines = data.picksLeft ?? [];
+  const picksRightLines = data.picksRight ?? [];
+  const leftNames = namesFromOcrLines(data.left ?? []);
+  const rightNames = namesFromOcrLines(data.right ?? []);
+  const known = [...leftNames, ...rightNames, ...rosterRef.current];
+  const snapLocks = (lines: OcrLine[]) =>
+    locksFromOcrLines(lines).map((lock) => ({
+      hero: lock.hero,
+      player: lock.player ? snapToRoster(lock.player, known) : null,
+    }));
+  return {
+    left: leftNames,
+    right: rightNames,
+    leftLocks: snapLocks(picksLeftLines),
+    rightLocks: snapLocks(picksRightLines),
+    picksLeft: picksLeftLines,
+    picksRight: picksRightLines,
+    leftPicking: columnShowsPicking(picksLeftLines),
+    rightPicking: columnShowsPicking(picksRightLines),
+    center: data.center ?? [],
+  };
+}
+
+  function forgetNames() {
+    if (!lastOursKeyRef.current && !lastKeyRef.current) return;
+    lastOursKeyRef.current = "";
+    lastKeyRef.current = "";
+    onOurSideRef.current?.([]);
+    setNames([]);
   }
 
   function clearObserved() {
+    inDraftRef.current = false;
     announcedPicksRef.current = [];
-    leftSlotHeroes.current = [null, null, null, null, null];
-    rightSlotHeroes.current = [null, null, null, null, null];
-    leftSlotPlayers.current = [null, null, null, null, null];
-    rightSlotPlayers.current = [null, null, null, null, null];
     lastKeyRef.current = "";
     lastOursKeyRef.current = "";
+    leftNamesRef.current = [];
+    rightNamesRef.current = [];
     openTurnRef.current = null;
+    picksStartedRef.current = false;
     draftRef.current = {
       ...EMPTY_LIVE_DRAFT,
       ourPicks: [],
@@ -287,6 +490,7 @@ export function LobbyScreenWatch({
       theirBans: [],
     };
     onDraftRef.current(draftRef.current);
+    onOurSideRef.current?.([]);
     setNames([]);
     setStatus("Draft reset. Reading this screen from scratch.");
   }
@@ -311,62 +515,133 @@ export function LobbyScreenWatch({
       if (!ctx) return;
       ctx.drawImage(video, 0, 0);
       const roster = rosterRef.current;
-      const partyText = await readColumn(frame, worker, PARTY_NAME_ROW);
-      const leftPlayers = (await readNamePlates(frame, worker, DRAFT_NAME_PLATES.left)).map((name) =>
-        snapToRoster(name, roster),
-      );
-      const rightPlayers = (await readNamePlates(frame, worker, DRAFT_NAME_PLATES.right)).map((name) =>
-        snapToRoster(name, roster),
-      );
-      const usOnLeft = true;
-      const ourColumn = leftPlayers;
+      const titleText = await readColumn(frame, worker, DRAFT_TITLE_BOX);
       const centerText = await readColumn(frame, worker, DRAFT_TURN_BOX);
       const statusText = await readColumn(frame, worker, DRAFT_STATUS_BOX);
-      const banner = bannerTurn(`${centerText}\n${statusText}`);
-      const centerRead = turnFromOcr(centerText, roster);
+      if (epoch !== epochRef.current) return;
+      const screenPhase = watchPhase(
+        `${titleText}\n${centerText}\n${statusText}`,
+        inDraftRef.current,
+      );
+      if (screenPhase !== "draft") {
+        if (
+          screenPhase === "menu" &&
+          (inDraftRef.current || lastOursKeyRef.current || lastKeyRef.current)
+        ) {
+          clearObserved();
+        } else if (screenPhase === "wait") {
+          forgetNames();
+        }
+        setStatus(
+          screenPhase === "menu"
+            ? "On the game menu. Waiting for the draft."
+            : "Watching the main screen. Waiting for the draft.",
+        );
+        return;
+      }
+      inDraftRef.current = true;
+      const lobbyPromise = readLobby(frame);
+      const partyText = await readColumn(frame, worker, PARTY_NAME_ROW);
+      const leftPlates = plateSlots(ctx, frame, DRAFT_PICK_COLUMNS.left, DRAFT_PLATE_SLOTS.left);
+      const rightPlates = plateSlots(ctx, frame, DRAFT_PICK_COLUMNS.right, DRAFT_PLATE_SLOTS.right);
+      const leftHexes = DRAFT_BAN_HEXES.left.map((hex) => readHex(ctx, frame, hex));
+      const rightHexes = DRAFT_BAN_HEXES.right.map((hex) => readHex(ctx, frame, hex));
+      const lobby = await lobbyPromise;
+      const rapidCenter = (lobby?.center ?? []).map((line) => line.text).join("\n");
+      const centerSource = rapidCenter.trim() ? rapidCenter : centerText;
+      const usOnLeft = true;
+      const banner = bannerTurn(`${centerSource}\n${statusText}`);
+      const centerRead = turnFromOcr(centerSource, roster);
       if (banner.phase) centerRead.phase = banner.phase;
       if ((centerRead.phase ?? banner.phase) === "pick" && centerRead.hero) {
         const announced = announcedPicksRef.current;
         const last = announced[announced.length - 1];
         if (!last || heroKey(last) !== heroKey(centerRead.hero)) announced.push(centerRead.hero);
       }
-      const leftLocked = await lockedHeroes(
-        frame,
-        worker,
-        DRAFT_PICK_SLOTS.left,
-        leftSlotHeroes.current,
-        leftSlotPlayers.current,
-      );
-      const rightLocked = await lockedHeroes(
-        frame,
-        worker,
-        DRAFT_PICK_SLOTS.right,
-        rightSlotHeroes.current,
-        rightSlotPlayers.current,
-      );
       const draft = draftRef.current;
-      const phaseNow = banner.phase ?? centerRead.phase ?? draft.phase;
-      const allowPicks = phaseNow === "pick";
+      const knownNames = [...(lobby?.left ?? []), ...(lobby?.right ?? []), ...roster];
+      const snapPlate = (locks: { hero: string; player: string | null }[]) =>
+        locks.map((lock) => ({
+          hero: lock.hero,
+          player: lock.player ? snapToRoster(lock.player, knownNames) : null,
+        }));
+      const leftUsable = leftPlates.some((slot) => slot.fill !== "empty");
+      const rightUsable = rightPlates.some((slot) => slot.fill !== "empty");
+      const leftRead =
+        leftUsable && lobby
+          ? platesForLines(lobby.picksLeft, leftPlates)
+          : {
+              locked: (lobby?.leftLocks ?? []).map((lock) => ({ ...lock, slot: null })),
+              shown: [] as string[],
+            };
+      const rightRead =
+        rightUsable && lobby
+          ? platesForLines(lobby.picksRight, rightPlates)
+          : {
+              locked: (lobby?.rightLocks ?? []).map((lock) => ({ ...lock, slot: null })),
+              shown: [] as string[],
+            };
+      const leftLocked = leftUsable && lobby ? snapPlate(leftRead.locked) : (lobby?.leftLocks ?? []);
+      const rightLocked = rightUsable && lobby ? snapPlate(rightRead.locked) : (lobby?.rightLocks ?? []);
+      const slotted = slotsHoldPicks(leftLocked.length + rightLocked.length);
+      const fromSlots = lobby
+        ? pickingPhaseFromColumns({
+            leftPicking: lobby.leftPicking,
+            rightPicking: lobby.rightPicking,
+            bannerPhase: banner.phase ?? centerRead.phase,
+          })
+        : null;
+      const banPhase = banner.phase === "ban" || centerRead.phase === "ban";
+      if (!banPhase && (banner.phase === "pick" || fromSlots === "pick")) {
+        picksStartedRef.current = true;
+      }
+      const allowPicks = acceptPlatePicks({
+        banPhase,
+        picksStarted: picksStartedRef.current,
+      });
+      const ourShown = usOnLeft ? leftRead.shown : rightRead.shown;
+      const theirShown = usOnLeft ? rightRead.shown : leftRead.shown;
       const ourLocked = allowPicks
-        ? takeNewLocks(
-            draft.ourPicks,
-            usOnLeft ? leftLocked : rightLocked,
-            announcedPicksRef.current,
-            draft.ourPickPlayers,
+        ? dropShownLocks(
+            takeNewLocks(
+              draft.ourPicks,
+              usOnLeft ? leftLocked : rightLocked,
+              announcedPicksRef.current,
+              draft.ourPickPlayers,
+            ),
+            ourShown,
           )
-        : { heroes: [] as string[], players: [] as (string | null)[] };
+        : null;
       const theirLocked = allowPicks
-        ? takeNewLocks(
-            draft.theirPicks,
-            usOnLeft ? rightLocked : leftLocked,
-            announcedPicksRef.current,
-            draft.theirPickPlayers,
+        ? dropShownLocks(
+            takeNewLocks(
+              draft.theirPicks,
+              usOnLeft ? rightLocked : leftLocked,
+              announcedPicksRef.current,
+              draft.theirPickPlayers,
+            ),
+            theirShown,
           )
-        : { heroes: [] as string[], players: [] as (string | null)[] };
-      let ourPicks = ourLocked.heroes;
-      let theirPicks = theirLocked.heroes;
-      const leftBanText = await readColumn(frame, worker, DRAFT_BAN_STRIPS.left);
-      const rightBanText = await readColumn(frame, worker, DRAFT_BAN_STRIPS.right);
+        : null;
+      let ourPicks = ourLocked
+        ? ourLocked.heroes
+        : picksStartedRef.current
+          ? draft.ourPicks
+          : [];
+      let theirPicks = theirLocked
+        ? theirLocked.heroes
+        : picksStartedRef.current
+          ? draft.theirPicks
+          : [];
+      if (epoch !== epochRef.current) return;
+      if (lobby) {
+        const leftPlayers = lobby.left.map((name) => snapToRoster(name, roster));
+        const rightPlayers = lobby.right.map((name) => snapToRoster(name, roster));
+        if (leftPlayers.length >= 3) leftNamesRef.current = leftPlayers;
+        if (rightPlayers.length >= 3) rightNamesRef.current = rightPlayers;
+      }
+      const ourColumn = leftNamesRef.current;
+      const theirColumn = rightNamesRef.current;
       const turn = nextTurn(
         openTurnRef.current,
         centerRead.phase ? centerRead : { ...centerRead, phase: banner.phase },
@@ -375,48 +650,105 @@ export function LobbyScreenWatch({
           if (fold === ocrFold("HuckIt")) return "our";
           if (ourColumn.some((name) => ocrFold(name) === fold)) return "our";
           if (oursRef.current.some((name) => ocrFold(name) === fold)) return "our";
-          if (rightPlayers.some((name) => ocrFold(name) === fold)) return "their";
+          if (theirColumn.some((name) => ocrFold(name) === fold)) return "their";
           return null;
         },
-        banner.color ? sideFromBannerColor(banner.color, usOnLeft) : null,
+        banner.color
+          ? sideFromBannerColor(banner.color, usOnLeft)
+          : banSideFromSplash(`${centerSource}\n${statusText}`),
       );
       openTurnRef.current = turn.open;
-      const ourBanSeen = bansFromStrip(usOnLeft ? leftBanText : rightBanText, ourPicks);
-      const theirBanSeen = bansFromStrip(usOnLeft ? rightBanText : leftBanText, theirPicks);
-      let ourBans = rememberHeroes(draft.ourBans, ourBanSeen, 3);
-      let theirBans = rememberHeroes(draft.theirBans, theirBanSeen, 3);
-      if (turn.ban) {
-        if (turn.ban.side === "our") ourBans = rememberHeroes(ourBans, [turn.ban.hero], 3);
-        else theirBans = rememberHeroes(theirBans, [turn.ban.hero], 3);
-      }
-      let phase = banner.phase ?? centerRead.phase ?? draft.phase;
-      if (phase === "ban" && centerRead.hero) {
-        const banSide = shownBanSide({
-          center: centerText,
-          status: statusText,
-          player: centerRead.player,
-          ourNames: [...ourColumn, ...oursRef.current],
-          theirNames: rightPlayers,
+      const learnPlate = (
+        lock: { hero: string; slot: number | null },
+        slots: readonly DraftBox[],
+      ) => {
+        if (lock.slot == null) return;
+        const box = slots[lock.slot];
+        if (!box) return;
+        const region = sampleRegion(ctx, frame, box);
+        const vector = portraitVector(region.pixels, region.width, region.height);
+        if (!vector || !acceptPortraitExample(vector, lock.hero, facesRef.current)) return;
+        facesRef.current = [...facesRef.current, { hero: lock.hero, vector }];
+        void pngOf(region.pixels, region.width, region.height).then((image) => {
+          if (!image) return;
+          void fetch("/api/draft-examples", {
+            method: "POST",
+            headers: { "content-type": "application/json", ...scoutHeaders() },
+            body: JSON.stringify({ kind: "portrait", hero: lock.hero, image }),
+          }).catch(() => undefined);
         });
-        if (banSide) {
-          const key = heroKey(centerRead.hero);
-          if (banSide === "our") {
-            theirBans = theirBans.filter((hero) => heroKey(hero) !== key);
-            ourBans = rememberHeroes(ourBans, [centerRead.hero], 3);
-          } else {
-            ourBans = ourBans.filter((hero) => heroKey(hero) !== key);
-            theirBans = rememberHeroes(theirBans, [centerRead.hero], 3);
-          }
-        }
+      };
+      for (const lock of leftRead.locked) learnPlate(lock, DRAFT_PLATE_SLOTS.left);
+      for (const lock of rightRead.locked) learnPlate(lock, DRAFT_PLATE_SLOTS.right);
+      if (!frameSavedRef.current) {
+        frameSavedRef.current = true;
+        void new Promise<string | null>((resolve) => {
+          frame.toBlob(async (blob) => {
+            if (!blob) {
+              resolve(null);
+              return;
+            }
+            const bytes = new Uint8Array(await blob.arrayBuffer());
+            let binary = "";
+            for (let i = 0; i < bytes.length; i += 0x8000) {
+              binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+            }
+            resolve(btoa(binary));
+          }, "image/jpeg", 0.8);
+        }).then((image) => {
+          if (!image) return;
+          void fetch("/api/draft-examples", {
+            method: "POST",
+            headers: { "content-type": "application/json", ...scoutHeaders() },
+            body: JSON.stringify({ kind: "frame", image }),
+          }).catch(() => undefined);
+        });
       }
-      if (ourBans.length + theirBans.length < 2 && phase !== "pick") {
+      const namedHexes = (hexes: { filled: boolean; vector: number[] | null }[]) =>
+        hexes.map((hex) =>
+          hex.vector && facesRef.current.length ? matchPortrait(hex.vector, facesRef.current) : null,
+        );
+      const ourHexes = usOnLeft ? leftHexes : rightHexes;
+      const theirHexes = usOnLeft ? rightHexes : leftHexes;
+      const ourBans = bansFromHexFaces(
+        namedHexes(ourHexes),
+        ourHexes.map((hex) => hex.filled),
+        draft.ourBans,
+      );
+      const theirBans = bansFromHexFaces(
+        namedHexes(theirHexes),
+        theirHexes.map((hex) => hex.filled),
+        draft.theirBans,
+      );
+      const phase = banner.phase ?? centerRead.phase ?? fromSlots ?? (slotted ? "pick" : draft.phase);
+      if (banPhase && !picksStartedRef.current) {
         ourPicks = [];
         theirPicks = [];
       }
       let firstPick = draft.firstPick;
+      if (
+        !firstPick &&
+        ourPicks.length + theirPicks.length === 0 &&
+        lobby
+      ) {
+        const fromSlotsSide = firstPickFromPickingSlots({
+          leftPicking: lobby.leftPicking,
+          rightPicking: lobby.rightPicking,
+          usOnLeft,
+        });
+        if (fromSlotsSide) firstPick = fromSlotsSide;
+      }
+      if (
+        !firstPick &&
+        ourBans.length + theirBans.length + ourPicks.length + theirPicks.length === 0
+      ) {
+        const fromStatus = firstBanSideFromStatus(`${statusText}\n${centerText}`);
+        if (fromStatus) firstPick = fromStatus;
+      }
       const turnSide =
         turn.open?.side ??
-        (banner.color ? sideFromBannerColor(banner.color, usOnLeft) : null);
+        (banner.color ? sideFromBannerColor(banner.color, usOnLeft) : null) ??
+        sideFromTeamSplash(`${centerSource}\n${statusText}`);
       if (!firstPick && turn.open?.phase === "ban") {
         firstPick = turn.open.side === "our" ? "us" : "them";
       }
@@ -447,12 +779,12 @@ export function LobbyScreenWatch({
         if (inferred && (!firstPick || !currentFits)) firstPick = inferred;
       }
       let map = draft.map;
-      if (!map) map = mapFromTitle(await readColumn(frame, worker, DRAFT_TITLE_BOX));
+      if (!map) map = mapFromTitle(titleText);
       const nextDraft: LiveDraft = {
         ourPicks,
         theirPicks,
-        ourPickPlayers: ourLocked.players,
-        theirPickPlayers: theirLocked.players,
+        ourPickPlayers: ourLocked?.players ?? draft.ourPickPlayers,
+        theirPickPlayers: theirLocked?.players ?? draft.theirPickPlayers,
         ourBans,
         theirBans,
         firstPick,
@@ -464,23 +796,24 @@ export function LobbyScreenWatch({
       onDraftRef.current(nextDraft);
 
       const partyNames = partyNamesFromText(partyText).map((name) => snapToRoster(name, roster));
-      const inParty = partyNames.length >= 3 && ourPicks.length + theirPicks.length === 0;
-      if (inParty) {
+      const inParty =
+        partyNames.length >= 3 && ourPicks.length + theirPicks.length === 0 && ourColumn.length < 3;
+      if (ourColumn.length >= 3) {
+        const oursKey = ourColumn.map((name) => name.toLowerCase()).join("|");
+        if (oursKey !== lastOursKeyRef.current) {
+          lastOursKeyRef.current = oursKey;
+          onOurSideRef.current?.(ourColumn);
+        }
+      } else if (inParty) {
         const partyKey = partyNames.map((name) => name.toLowerCase()).join("|");
         if (partyKey !== lastOursKeyRef.current) {
           lastOursKeyRef.current = partyKey;
           onOurSideRef.current?.(partyNames);
         }
         setStatus(`In queue. Loading Storm League for ${partyNames.join(", ")}.`);
-      } else if (ourColumn.length > 0) {
-        const oursKey = ourColumn.map((name) => name.toLowerCase()).join("|");
-        if (oursKey !== lastOursKeyRef.current) {
-          lastOursKeyRef.current = oursKey;
-          onOurSideRef.current?.(ourColumn);
-        }
       }
-      const opponents = inParty ? [] : rightPlayers;
-      if (!inParty && opponents.length > 0) {
+      const opponents = inParty ? [] : theirColumn;
+      if (!inParty && opponents.length >= 3) {
         const key = opponents.map((name) => name.toLowerCase()).join("|");
         if (key !== lastKeyRef.current) {
           lastKeyRef.current = key;
@@ -489,15 +822,17 @@ export function LobbyScreenWatch({
         }
       }
       const locks = ourPicks.length + theirPicks.length + ourBans.length + theirBans.length;
-      if (!inParty) setStatus(
-        locks > 0
-          ? `Draft from the screen: we banned ${ourBans.join(", ") || "—"}, picked ${ourPicks.join(", ") || "—"}. They banned ${theirBans.join(", ") || "—"}, picked ${theirPicks.join(", ") || "—"}.`
-          : phase === "pick"
-            ? "Pick phase. Opening bans are already done, so the board is on the current pick. Heroes fill in as they lock."
-            : opponents.length > 0
-              ? `Read ${opponents.length} opponent name${opponents.length === 1 ? "" : "s"}. Waiting for a hero to lock.`
-              : "Watching the draft. No nameplates read on either side yet.",
-      );
+      if (!inParty) {
+        const who =
+          ourColumn.length + theirColumn.length > 0
+            ? `Us: ${ourColumn.join(", ") || "…"}. Them: ${theirColumn.join(", ") || "…"}.`
+            : "Reading the name banners.";
+        setStatus(
+          locks > 0
+            ? `${who} We banned ${draftHeroList(ourBans)}, picked ${draftHeroList(ourPicks)}. They banned ${draftHeroList(theirBans)}, picked ${draftHeroList(theirPicks)}.`
+            : who,
+        );
+      }
     } catch {
       setStatus("Could not read that frame. The watch is still running.");
     } finally {
@@ -510,11 +845,9 @@ export function LobbyScreenWatch({
     stopWatch();
     lastKeyRef.current = "";
     lastOursKeyRef.current = "";
+    leftNamesRef.current = [];
+    rightNamesRef.current = [];
     announcedPicksRef.current = [];
-    leftSlotHeroes.current = [null, null, null, null, null];
-    rightSlotHeroes.current = [null, null, null, null, null];
-    leftSlotPlayers.current = [null, null, null, null, null];
-    rightSlotPlayers.current = [null, null, null, null, null];
     draftRef.current = {
       ...EMPTY_LIVE_DRAFT,
       ourPicks: [],
@@ -523,6 +856,8 @@ export function LobbyScreenWatch({
       theirBans: [],
     };
     openTurnRef.current = null;
+    picksStartedRef.current = false;
+    inDraftRef.current = false;
     onDraftRef.current(draftRef.current);
     setNames([]);
     setPhase("watching");
@@ -553,24 +888,8 @@ export function LobbyScreenWatch({
       video.srcObject = stream;
       video.muted = true;
       await video.play();
-      const ratio = window.devicePixelRatio || 1;
-      const settings = track.getSettings();
-      onScreenTooSmallRef.current?.(
-        screenTooSmallForWatch(
-          {
-            width: Math.round(window.screen.width * ratio),
-            height: Math.round(window.screen.height * ratio),
-          },
-          {
-            width: video.videoWidth || settings.width || 0,
-            height: video.videoHeight || settings.height || 0,
-          },
-        ),
-      );
       const { createWorker, PSM } = await import("tesseract.js");
       const worker = await createWorker("eng");
-      lineMode.current = PSM.SINGLE_LINE;
-      sparseMode.current = PSM.SPARSE_TEXT;
       await worker.setParameters({
         tessedit_pageseg_mode: PSM.SPARSE_TEXT,
         tessedit_char_whitelist: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'",

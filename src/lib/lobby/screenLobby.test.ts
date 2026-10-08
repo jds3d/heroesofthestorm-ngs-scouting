@@ -4,20 +4,46 @@ import {
   actionsFromObserved,
   inferFirstPick,
   bannerTurn,
+  firstBanSideFromStatus,
+  nextBanSide,
+  banSideFromSplash,
+  acceptPlatePicks,
   shownBanSide,
   matchLobbyToRosters,
   sideFromBannerColor,
   heroFromPlateText,
+  heroOnPlate,
+  columnShowsPicking,
+  firstPickFromPickingSlots,
+  locksFromOcrLines,
+  pickingPhaseFromColumns,
   heroesFromColumn,
   nameFromPlate,
   namesFromOcrLines,
   lobbyNamesFromOcr,
+  draftLobbySeen,
   mapFromTitle,
+  menuScreenSeen,
+  watchPhase,
   namesFromColumn,
   partyNamesFromText,
   nextTurn,
   opponentColumn,
   bansFromStrip,
+  bansFromFilledHexes,
+  plateFill,
+  banHexFilled,
+  bansFromHexFaces,
+  faceSignature,
+  nearestFace,
+  portraitVector,
+  matchPortrait,
+  acceptPortraitExample,
+  portraitScore,
+  platesForLines,
+  dropShownLocks,
+  draftHeroList,
+  sideFromTeamSplash,
   borderLooksLocked,
   borderLooksLockedSamples,
   rememberHeroes,
@@ -26,7 +52,6 @@ import {
   rosterTagsForLobby,
   rosterTagsPresent,
   snapToRoster,
-  screenTooSmallForWatch,
   turnFromOcr,
 } from "./screenLobby";
 
@@ -113,24 +138,6 @@ describe("rosterTagsForLobby", () => {
   });
 });
 
-describe("watch screen size", () => {
-  it("warns only when the drafter screen is smaller than the shared screen", () => {
-    expect(screenTooSmallForWatch({ width: 1920, height: 1080 }, { width: 2560, height: 1440 })).toBe(
-      true,
-    );
-    expect(screenTooSmallForWatch({ width: 2560, height: 1440 }, { width: 1920, height: 1080 })).toBe(
-      false,
-    );
-    expect(screenTooSmallForWatch({ width: 1920, height: 1080 }, { width: 1920, height: 1080 })).toBe(
-      false,
-    );
-    expect(screenTooSmallForWatch({ width: 1910, height: 1070 }, { width: 1920, height: 1080 })).toBe(
-      false,
-    );
-    expect(screenTooSmallForWatch({ width: 1920, height: 1080 }, { width: 0, height: 0 })).toBe(false);
-  });
-});
-
 describe("draft locks from the screen", () => {
   it("reads hero labels, including Alarak's Xal'atath title", () => {
     const text = "GARROSH\nBeachyman\nXAL'ATATH\nTopgun707\nTHE LOST VIKINGS\nMarcy";
@@ -153,6 +160,19 @@ describe("draft locks from the screen", () => {
       ]),
     ).toEqual(["PeterWiggin", "Huckit", "AcldReign"]);
     expect(snapToRoster("Huckit", ["HuckIt#1686"])).toBe("HuckIt");
+    expect(namesFromOcrLines([{ text: "Dex", top: 1 }])).toEqual(["Dex"]);
+    expect(nameFromPlate("21222220BudT7312212")).toBeNull();
+    expect(
+      namesFromOcrLines([
+        { text: "ChiptuneScu", top: 10 },
+        { text: "trzen", top: 40 },
+        { text: "Huckit", top: 70 },
+        { text: "H", top: 80 },
+        { text: "Stefalthontg", top: 110 },
+        { text: "Helms", top: 140 },
+        { text: "21222220BudT7312212", top: 200 },
+      ]),
+    ).toEqual(["ChiptuneScu", "trzen", "Huckit", "Stefalthontg", "Helms"]);
   });
 
   it("treats a bright rim as locked and a dark rim as still open", () => {
@@ -285,6 +305,37 @@ describe("draft locks from the screen", () => {
     ]);
   });
 
+  it("treats a column of PICKING slots as the pick phase, and the enemy column as their first pick", () => {
+    const lines = [
+      { text: "Explanacion" },
+      { text: "PICKING" },
+      { text: "Frijolito" },
+    ];
+    expect(columnShowsPicking(lines)).toBe(true);
+    expect(columnShowsPicking([{ text: "Beachyman" }])).toBe(false);
+    expect(
+      pickingPhaseFromColumns({
+        leftPicking: false,
+        rightPicking: true,
+        bannerPhase: null,
+      }),
+    ).toBe("pick");
+    expect(
+      pickingPhaseFromColumns({
+        leftPicking: true,
+        rightPicking: false,
+        bannerPhase: "ban",
+      }),
+    ).toBeNull();
+    expect(
+      firstPickFromPickingSlots({
+        leftPicking: false,
+        rightPicking: true,
+        usOnLeft: true,
+      }),
+    ).toBe("them");
+  });
+
   it("skips the opening bans when the banner is already on a pick", () => {
     const actions = actionsFromObserved({
       weFirst: false,
@@ -365,6 +416,45 @@ describe("draft locks from the screen", () => {
     ).toBe(null);
   });
 
+  it("waits for a draft and ignores the Storm League menu", () => {
+    const menu = "HuckIt\nPlatinum\n7 Wins\nStorm League, 2026 Season 3\nSearching Storm League";
+    expect(menuScreenSeen(menu)).toBe(true);
+    expect(draftLobbySeen(menu)).toBe(false);
+    expect(watchPhase(menu, false)).toBe("menu");
+    expect(watchPhase("PLAY COLLECTION LOOT", false)).toBe("menu");
+    expect(watchPhase("erhe5ryBal shares Trott", false)).toBe("wait");
+    expect(draftLobbySeen("Towers of Doom\nHuckIt\nBanning")).toBe(true);
+    expect(watchPhase("RED PICK", false)).toBe("draft");
+    expect(watchPhase("Waiting for Enemy Ban...", false)).toBe("draft");
+    expect(bannerTurn("Waiting for Teammates...")).toEqual({ phase: "pick", color: null });
+    expect(bannerTurn("ILLIDAN\nZZEN")).toEqual({ phase: null, color: null });
+    expect(heroOnPlate("VALLA\nCriptoneSoul")).toBe("Valla");
+    expect(heroOnPlate("PICKING")).toBe(null);
+    expect(heroOnPlate("E.T.C.\nHuckIt")).toBe("E.T.C.");
+    expect(
+      locksFromOcrLines([
+        { text: "Raynor", top: 80 },
+        { text: "Chronos", top: 120 },
+        { text: "PICKING", top: 300 },
+        { text: "Valla", top: 460 },
+        { text: "SaltTea", top: 500 },
+      ]),
+    ).toEqual([
+      { hero: "Raynor", player: "Chronos" },
+      { hero: "Valla", player: "SaltTea" },
+    ]);
+    expect(
+      locksFromOcrLines([
+        { text: "SuperGoBu", top: 80 },
+        { text: "Dehaka", top: 120 },
+        { text: "PICKING", top: 300 },
+        { text: "Frijolito", top: 340 },
+      ]),
+    ).toEqual([{ hero: "Dehaka", player: "SuperGoBu" }]);
+    expect(watchPhase("", true)).toBe("draft");
+    expect(watchPhase(menu, true)).toBe("menu");
+  });
+
   it("reads the five party names and ignores the queue menu", () => {
     expect(
       partyNamesFromText(
@@ -383,6 +473,16 @@ describe("draft locks from the screen", () => {
       color: null,
     });
     expect(bannerTurn("Waiting for Enemy Ban...")).toEqual({ phase: "ban", color: null });
+    expect(firstBanSideFromStatus("Waiting for Enemy Ban...")).toBe("them");
+    expect(firstBanSideFromStatus("SKY TEMPLE")).toBe(null);
+    expect(banSideFromSplash("TheScrub\nBanning\nWaiting for Enemy Ban...")).toBe("their");
+    expect(banSideFromSplash("SYLVANAS\nBanned\nWaiting for Enemy Ban...")).toBe("our");
+    expect(acceptPlatePicks({ banPhase: true, picksStarted: false })).toBe(false);
+    expect(acceptPlatePicks({ banPhase: false, picksStarted: false })).toBe(false);
+    expect(acceptPlatePicks({ banPhase: false, picksStarted: true })).toBe(true);
+    expect(nextBanSide(false, 0, 0)).toBe("their");
+    expect(nextBanSide(false, 0, 1)).toBe("our");
+    expect(nextBanSide(true, 0, 0)).toBe("our");
     expect(
       shownBanSide({
         center: "ALARAK\nBANNED",
@@ -437,5 +537,119 @@ describe("draft locks from the screen", () => {
       phase: "ban",
       hero: null,
     });
+  });
+
+  it("treats a whitish plate as a lock and a blue plate as shown", () => {
+    const white = Array.from({ length: 80 }, () => ({ r: 210, g: 206, b: 198 }));
+    const blue = Array.from({ length: 80 }, () => ({ r: 40, g: 90, b: 190 }));
+    const dark = Array.from({ length: 80 }, () => ({ r: 8, g: 6, b: 16 }));
+    const warmLock = Array.from({ length: 80 }, () => ({ r: 170, g: 90, b: 40 }));
+    expect(plateFill(white)).toBe("locked");
+    expect(plateFill(blue)).toBe("shown");
+    expect(plateFill(dark)).toBe("empty");
+    expect(plateFill(warmLock)).toBe("locked");
+    expect(plateFill([])).toBe("empty");
+  });
+
+  it("counts a ban hex only when a face is in it", () => {
+    const face = Array.from({ length: 40 }, () => ({ r: 180, g: 40, b: 36 }));
+    const empty = Array.from({ length: 40 }, () => ({ r: 12, g: 8, b: 22 }));
+    expect(banHexFilled(face)).toBe(true);
+    expect(banHexFilled(empty)).toBe(false);
+  });
+
+  it("names a ban hex from the face and keeps that name when a later frame is blank", () => {
+    const paint = (r: number, g: number, b: number) =>
+      Array.from({ length: 16 }, () => ({ r, g, b }));
+    const valla = faceSignature(paint(200, 30, 40), 4, 4);
+    const johanna = faceSignature(paint(40, 80, 200), 4, 4);
+    expect(valla).not.toBeNull();
+    expect(johanna).not.toBeNull();
+    const catalog = [
+      { hero: "Valla", sig: valla ?? [] },
+      { hero: "Johanna", sig: johanna ?? [] },
+    ];
+    expect(nearestFace(valla ?? [], catalog)).toBe("Valla");
+    expect(nearestFace(johanna ?? [], catalog)).toBe("Johanna");
+    expect(
+      bansFromHexFaces(["Valla", null, null], [true, true, false], []),
+    ).toEqual(["Valla", UNSEEN_BAN]);
+    expect(
+      bansFromHexFaces([null, null, null], [false, false, false], ["Valla", "Johanna"]),
+    ).toEqual(["Valla", "Johanna"]);
+  });
+
+  it("matches a saved portrait and keeps a second view of that hero", () => {
+    const face = (shift: number) => {
+      const pixels = [];
+      for (let y = 0; y < 24; y++) {
+        for (let x = 0; x < 24; x++) {
+          pixels.push({
+            r: (x * 12 + shift) % 220,
+            g: (y * 8 + 20) % 180,
+            b: x < 12 ? 30 : 160,
+          });
+        }
+      }
+      return pixels;
+    };
+    const valla = portraitVector(face(0), 24, 24);
+    const vallaAgain = portraitVector(face(4), 24, 24);
+    const other = portraitVector(face(140), 24, 24);
+    expect(valla).not.toBeNull();
+    expect(vallaAgain).not.toBeNull();
+    expect(other).not.toBeNull();
+    expect(portraitScore(valla ?? [], vallaAgain ?? [])).toBeGreaterThan(0.84);
+    expect(matchPortrait(vallaAgain ?? [], [{ hero: "Valla", vector: valla ?? [] }])).toBe("Valla");
+    expect(matchPortrait(other ?? [], [{ hero: "Valla", vector: valla ?? [] }])).toBeNull();
+    expect(acceptPortraitExample(valla ?? [], "Valla", [])).toBe(true);
+    expect(acceptPortraitExample(valla ?? [], "Valla", [{ hero: "Valla", vector: valla ?? [] }])).toBe(
+      false,
+    );
+  });
+
+  it("locks the whitish plate and leaves the blue plate as shown", () => {
+    const read = platesForLines(
+      [
+        { text: "CHEN", top: 20 },
+        { text: "STUKOV", top: 200 },
+        { text: "ANUB'ARAK", top: 400 },
+      ],
+      [
+        { top: 0, fill: "locked" },
+        { top: 200, fill: "locked" },
+        { top: 400, fill: "shown" },
+      ],
+    );
+    expect(read.locked.map((lock) => lock.hero)).toEqual(["Chen", "Stukov"]);
+    expect(read.shown).toEqual(["Anub'arak"]);
+    expect(
+      dropShownLocks(
+        { heroes: ["Chen", "Anub'arak", "Sylvanas"], players: ["Beachyman", "PeterWiggin", null] },
+        read.shown,
+      ),
+    ).toEqual({ heroes: ["Chen", "Sylvanas"], players: ["Beachyman", null] });
+  });
+
+  it("counts filled ban hexes without inventing a hero name", () => {
+    expect(bansFromFilledHexes(3, [])).toEqual([UNSEEN_BAN, UNSEEN_BAN, UNSEEN_BAN]);
+    expect(bansFromFilledHexes(1, [])).toEqual([UNSEEN_BAN]);
+    expect(bansFromFilledHexes(3, ["Valla"])).toEqual(["Valla", UNSEEN_BAN, UNSEEN_BAN]);
+    expect(bansFromFilledHexes(0, [UNSEEN_BAN, UNSEEN_BAN, UNSEEN_BAN])).toEqual([
+      UNSEEN_BAN,
+      UNSEEN_BAN,
+      UNSEEN_BAN,
+    ]);
+    expect(draftHeroList([UNSEEN_BAN, UNSEEN_BAN, UNSEEN_BAN])).toBe("3 locked");
+    expect(draftHeroList(["Valla", UNSEEN_BAN])).toBe("Valla, 1 locked");
+  });
+
+  it("reads whose turn from the team splash without treating it as a ban", () => {
+    expect(sideFromTeamSplash("Your Team\nPicking")).toBe("our");
+    expect(sideFromTeamSplash("Waiting for Teammates...")).toBe("our");
+    expect(sideFromTeamSplash("Enemy Team\nPicking")).toBe("their");
+    expect(
+      inferFirstPick({ ourPicks: 3, theirPicks: 3, phase: "pick", turnSide: "our" }),
+    ).toBe("them");
   });
 });

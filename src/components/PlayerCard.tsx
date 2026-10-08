@@ -7,17 +7,35 @@ import type { ComfortHero, PlayerScout, SourceHeroStat } from "@/lib/scoring/typ
 function sourceLabel(
   short: string,
   source: SourceHeroStat | undefined,
+  gamesNote: string,
 ): string | null {
   if (!source || source.games <= 0) return null;
-  return `${short} ${(source.winRate * 100).toFixed(0)}% (${source.games}g)`;
+  return `${short} ${(source.winRate * 100).toFixed(0)}% (${source.games}g${gamesNote ? ` ${gamesNote}` : ""})`;
+}
+
+/** Recent Storm League games count fully; the rest of the window counts less. */
+function stormLeagueLabel(source: SourceHeroStat | undefined): string | null {
+  if (!source || source.games <= 0) return null;
+  const wr = `${(source.winRate * 100).toFixed(0)}%`;
+  const recent = source.recentGames;
+  if (recent == null || recent >= source.games) {
+    return `SL ${wr} (${source.games}g)`;
+  }
+  if (recent <= 0) return `SL ${wr} (${source.games}g older)`;
+  const older = source.games - recent;
+  return `SL ${wr} (${recent}g recent, ${older}g older)`;
 }
 
 function heroSourceLine(h: ComfortHero): string {
+  const ngs = sourceLabel("NGS", h.sources.ngsCurrent, "this season");
+  const history = sourceLabel("NGS history", h.sources.ngsPrior, "earlier seasons");
+  const sl = stormLeagueLabel(h.sources.stormLeague);
+  const qm = sourceLabel("QM", h.sources.quickMatch, "");
   const parts = [
-    sourceLabel("NGS", h.sources.ngsCurrent),
-    sourceLabel("NGS history", h.sources.ngsPrior),
-    sourceLabel("SL", h.sources.stormLeague),
-    sourceLabel("QM", h.sources.quickMatch),
+    ngs,
+    history,
+    sl ?? (ngs || history ? "SL none" : null),
+    qm,
   ].filter(Boolean);
   return parts.length > 0 ? parts.join(" · ") : "no sample";
 }

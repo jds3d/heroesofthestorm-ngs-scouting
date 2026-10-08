@@ -85,6 +85,7 @@ import {
   findEndDraftSwaps,
   findPickSwap,
   lockedPlayerIds,
+  playersSeatedOnLocks,
   type DraftSwap,
   type LockedPick,
 } from "@/lib/scoring/draftSwap";
@@ -101,6 +102,8 @@ import {
   playersMeetingSuggestBar,
   anySuggestablePair,
   slHeroSuggestions,
+  stormLeagueGames,
+  type SlHeroSuggestion,
   suggestablePairOwners,
   UNPLAYED_PICK_PENALTY,
 } from "@/lib/scoring/comfort";
@@ -406,6 +409,61 @@ export function gradePairSelection(
     suggested: { ...suggested, displayLabel: suggestedLabel },
     chosen: { ...chosen, displayLabel: chosenLabel },
   };
+}
+
+type ReportStepAction = {
+  side: "our" | "their";
+  kind: "ban" | "pick";
+  ordinal: number;
+  hero: string;
+  score?: {
+    best: number;
+    achieved: number;
+    bestLabel: string;
+    percentile?: number;
+    fieldSize?: number;
+  };
+};
+
+/**
+ * One row per ban and per pick window. A double pick is one row even when the
+ * lock saved no score — the caller grades that pair so picks 4 and 5 stay on
+ * the card.
+ */
+export function collectReportSteps(
+  history: readonly ReportStepAction[],
+  scorePair?: (
+    index: number,
+  ) => ReportStepAction["score"] | null,
+): DraftStepScore[] {
+  const steps: DraftStepScore[] = [];
+  for (let index = 0; index < history.length; index++) {
+    const action = history[index];
+    const partner =
+      action.kind === "pick" && isDoublePickWindow(DRAFT_ORDER, index)
+        ? history[index + 1]
+        : undefined;
+    const score =
+      action.score ??
+      partner?.score ??
+      (partner ? scorePair?.(index) ?? null : null);
+    if (partner) index += 1;
+    if (!score) continue;
+    steps.push({
+      side: action.side,
+      kind: action.kind,
+      label: partner
+        ? `Picks ${action.ordinal} + ${partner.ordinal}`
+        : `${action.kind === "ban" ? "Ban" : "Pick"} ${action.ordinal}`,
+      locked: partner ? `${action.hero} + ${partner.hero}` : action.hero,
+      bestLabel: score.bestLabel,
+      best: score.best,
+      achieved: score.achieved,
+      percentile: score.percentile,
+      fieldSize: score.fieldSize,
+    });
+  }
+  return steps;
 }
 
 function signedPoints(n: number): string {
@@ -1161,9 +1219,12 @@ function comfortSignal(
   roster: PlayerScout[],
   hero: string,
   player: string | null,
+  /** Already locked. An open search will not credit them with another hero. */
+  seated?: ReadonlySet<string>,
 ): { comfort: number; who: string | null } {
   if (!roster.length) return { comfort: 0, who: null };
   const want = displayPlayer(player)?.toLowerCase();
+  if (want && seated?.has(want)) return { comfort: 0, who: null };
   let best: { comfort: number; who: string | null } = {
     comfort: 0,
     who: null,
@@ -1172,6 +1233,7 @@ function comfortSignal(
     const name = displayPlayer(p.battletag);
     const nameKey = name?.toLowerCase();
     if (want && nameKey !== want) continue;
+    if (!want && nameKey && seated?.has(nameKey)) continue;
     const hit = p.topHeroes.find((h) => heroKey(h.hero) === heroKey(hero));
     if (!hit) {
       if (want) return { comfort: 0, who: name };
@@ -1998,6 +2060,67 @@ export function findSeatForCandidate(
   return null;
 }
 
+function stormLeagueGamesOn(
+  roster: PlayerScout[],
+  hero: string,
+  player: string,
+): number {
+  const want = player.toLowerCase();
+  for (const row of roster) {
+    const name = (displayPlayer(row.battletag) ?? "").toLowerCase();
+    if (name !== want) continue;
+    const hit = row.topHeroes.find((h) => heroKey(h.hero) === heroKey(hero));
+    return hit?.sources.stormLeague?.games ?? 0;
+  }
+  return 0;
+}
+
+/**
+ * Hero this player still owes the plan. The named seat wins over Storm League
+ * volume. If that hero is gone, the first alternative still up is the backup.
+ */
+export function openPlanHeroForPlayer(
+  player: string,
+  planPicks: DraftCompPick[],
+  gone: ReadonlySet<string>,
+): string | null {
+  const seat = planPicks.find(
+    (p) => !isLockedPlanSeat(p) && samePlayer(p.player, player),
+  );
+  if (!seat) return null;
+  const taken = new Set([...gone].map((hero) => heroKey(hero)));
+  if (!taken.has(heroKey(seat.hero))) return seat.hero;
+  const alt = (seat.alternatives ?? []).find(
+    (candidate) => !taken.has(heroKey(candidate.hero)),
+  );
+  return alt?.hero ?? null;
+}
+
+/**
+ * Storm League mode picks one hero per player from volume. When that player
+ * still owns an open plan seat, the seat hero is the suggestion — a 64-game
+ * Qhira does not replace a needed Illidan.
+ */
+export function applyPlanSeatsToSlSuggestions(
+  suggestions: SlHeroSuggestion[],
+  planPicks: DraftCompPick[],
+  gone: ReadonlySet<string>,
+  roster: PlayerScout[],
+): SlHeroSuggestion[] {
+  return suggestions.map((suggestion) => {
+    const hero = openPlanHeroForPlayer(suggestion.player, planPicks, gone);
+    if (!hero || heroKey(hero) === heroKey(suggestion.hero)) return suggestion;
+    const comfort = playerComfortOn(roster, hero, suggestion.player);
+    return {
+      ...suggestion,
+      hero,
+      sl: comfort,
+      comfort,
+      games: stormLeagueGamesOn(roster, hero, suggestion.player),
+    };
+  });
+}
+
 /** Put the suggested hero on its seat so the plan list matches the card. */
 export function showSuggestionOnPlan(
   picks: DraftCompPick[],
@@ -2139,12 +2262,23 @@ function compMatchupLine(
   return `${head}.`;
 }
 
+function playerStillOpen(
+  player: string | null | undefined,
+  seated?: ReadonlySet<string>,
+): boolean {
+  const name = displayPlayer(player ?? null)?.toLowerCase();
+  if (!name || !seated) return true;
+  return !seated.has(name);
+}
+
 export function expectTheirNext(
   planned: { hero: string; side: "our" | "their"; kind: "ban" | "pick" }[],
   historyLen: number,
   gone: Set<string>,
   theirLikely: DraftCompPick[],
   currentStepIsOurBan?: boolean,
+  /** Players who already locked a hero. They cannot be the face of a later pick. */
+  seatedPlayers?: ReadonlySet<string>,
 ): string | null {
   if (currentStepIsOurBan) return null;
   for (let i = historyLen; i < planned.length; i++) {
@@ -2154,10 +2288,22 @@ export function expectTheirNext(
     const who = theirLikely.find(
       (p) => heroKey(p.hero) === heroKey(step.hero),
     );
+    if (
+      step.kind === "pick" &&
+      who?.player &&
+      !playerStillOpen(who.player, seatedPlayers)
+    ) {
+      continue;
+    }
     const verb = step.kind === "ban" ? "ban" : "pick";
-    return `Expect them to ${verb} ${step.hero} next${who?.player ? ` (${displayPlayer(who.player)})` : ""}.`;
+    const name = playerStillOpen(who?.player, seatedPlayers)
+      ? displayPlayer(who?.player ?? null)
+      : null;
+    return `Expect them to ${verb} ${step.hero} next${name ? ` (${name})` : ""}.`;
   }
-  const nextLikely = theirLikely.find((p) => !isGone(p.hero, gone));
+  const nextLikely = theirLikely.find(
+    (p) => !isGone(p.hero, gone) && playerStillOpen(p.player, seatedPlayers),
+  );
   if (nextLikely) {
     const who = displayPlayer(nextLikely.player);
     return `Expect them toward ${nextLikely.hero}${who ? ` (${who})` : ""} from their likely five.`;
@@ -2966,15 +3112,18 @@ function theirOwnerForHero(
   theirLikely: DraftCompPick[],
   history: BoardAction[],
   theirRoster: PlayerScout[] = [],
+  claimUnnamed = false,
 ): string | null {
-  const used = lockedPlayerIds(
-    history
+  const used = playersSeatedOnLocks({
+    locks: history
       .filter((a) => a.side === "their" && a.kind === "pick")
       .map((a) => ({
         hero: a.hero,
         player: displayPlayer(a.player),
       })),
-  );
+    roster: theirRoster,
+    claimUnnamed,
+  });
 
   const direct = theirLikely.find((p) => heroKey(p.hero) === heroKey(hero));
   const directName = displayPlayer(direct?.player ?? null);
@@ -3055,6 +3204,45 @@ function restampSidePlayers(
   });
 }
 
+/** Locked heroes plus the player on that portrait, including locks the turn order has not placed yet. */
+function seatLocks(
+  history: readonly BoardAction[],
+  side: "our" | "their",
+  observedHeroes: readonly string[] | undefined,
+  observedPlayers: readonly (string | null)[] | undefined,
+): { hero: string; player: string | null }[] {
+  const observedName = new Map<string, string>();
+  (observedHeroes ?? []).forEach((hero, index) => {
+    const name = displayPlayer(observedPlayers?.[index] ?? null);
+    if (hero && name) observedName.set(heroKey(hero), name);
+  });
+  const locks: { hero: string; player: string | null }[] = [];
+  const seen = new Set<string>();
+  for (const action of history) {
+    if (action.side !== side || action.kind !== "pick") continue;
+    if (!action.hero || action.hero === UNSEEN_BAN) continue;
+    const key = heroKey(action.hero);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    locks.push({
+      hero: action.hero,
+      player:
+        observedName.get(key) ??
+        displayPlayer(action.player) ??
+        displayPlayer(action.draftedFor ?? null),
+    });
+  }
+  (observedHeroes ?? []).forEach((hero, index) => {
+    if (!hero || seen.has(heroKey(hero))) return;
+    seen.add(heroKey(hero));
+    locks.push({
+      hero,
+      player: displayPlayer(observedPlayers?.[index] ?? null),
+    });
+  });
+  return locks;
+}
+
 function ourLockedPicks(
   history: BoardAction[],
   planPicks: DraftCompPick[],
@@ -3097,6 +3285,7 @@ export function InteractiveDraft({
   screen = null,
   observedPicks = null,
   watchOnly = false,
+  sideKnown = true,
   tournamentMode,
   onTournamentModeChange,
   stormLeagueOnly = false,
@@ -3143,6 +3332,8 @@ export function InteractiveDraft({
   } | null;
   /** Screen watch fills every lock. Recommendations stay; clicks cannot add a hero. */
   watchOnly?: boolean;
+  /** False until the shared screen says who bans first. Unknown is not "them". */
+  sideKnown?: boolean;
   /**
    * When set, the parent owns the checkbox. On uses NGS pools. Off uses Storm
    * League history only.
@@ -3175,6 +3366,8 @@ export function InteractiveDraft({
   const [matchupPending, setMatchupPending] = useState<string[]>([]);
   const [matchupError, setMatchupError] = useState<string | null>(null);
   const [matchupTrack, setMatchupTrack] = useState<MatchupTrack | null>(null);
+  const [matchupRetry, setMatchupRetry] = useState(0);
+  const matchupAttempts = useRef({ key: "", n: 0 });
   const scoringMeta = matchupPatch ?? draftMeta;
   const screenDefaulted = useRef(Boolean(screen));
   useEffect(() => {
@@ -3349,6 +3542,37 @@ export function InteractiveDraft({
     }
     return { leave: false as const, pivot: null as string | null };
   }, [history, theirLikely, leaveDive, leaveDivePivot]);
+
+  // A player who already locked a hero. Storm League cannot move that hero onto
+  // someone else, so the suggestion must not offer them a second one.
+  const ourHeld = useMemo(
+    () =>
+      playersSeatedOnLocks({
+        locks: seatLocks(
+          history,
+          "our",
+          observedPicks?.ourPicks,
+          observedPicks?.ourPickPlayers,
+        ),
+        roster: homeRoster,
+        claimUnnamed: !tournamentDraftMode,
+      }),
+    [history, observedPicks, homeRoster, tournamentDraftMode],
+  );
+  const theirHeld = useMemo(
+    () =>
+      playersSeatedOnLocks({
+        locks: seatLocks(
+          history,
+          "their",
+          observedPicks?.theirPicks,
+          observedPicks?.theirPickPlayers,
+        ),
+        roster: theirRoster,
+        claimUnnamed: !tournamentDraftMode,
+      }),
+    [history, observedPicks, theirRoster, tournamentDraftMode],
+  );
 
   // Suggesting and grading share these scorers, so taking the top suggestion
   // always grades as the top option open — no hidden better hero in the field.
@@ -3541,23 +3765,32 @@ export function InteractiveDraft({
     };
   }
 
-  function pairScoring() {
-    const locked = ourLockedPicks(history, planPicks, homeRoster);
-    const ourLockedHeroes = history
+  function pairScoring(view?: { history: BoardAction[]; ours: boolean }) {
+    const hist = view?.history ?? history;
+    const sideOurs = view?.ours ?? ours;
+    const goneNow = view ? goneKeys(hist) : gone;
+    const ourCount = view
+      ? hist.filter((action) => action.side === "our" && action.kind === "pick").length
+      : ourPickCount;
+    const theirCount = view
+      ? hist.filter((action) => action.side === "their" && action.kind === "pick").length
+      : theirPickCount;
+    const locked = ourLockedPicks(hist, planPicks, homeRoster);
+    const ourLockedHeroes = hist
       .filter((action) => action.side === "our" && action.kind === "pick")
       .map((action) => action.hero);
-    const theirLockedHeroes = history
+    const theirLockedHeroes = hist
       .filter((action) => action.side === "their" && action.kind === "pick")
       .map((action) => action.hero);
-    const beforePlan = ours
-      ? applyLockedToPlan(livePlanPicks(planPicks, gone), locked, homeRoster, gone)
+    const beforePlan = sideOurs
+      ? applyLockedToPlan(livePlanPicks(planPicks, goneNow), locked, homeRoster, goneNow)
       : theirLikely.map((pick) =>
           theirLockedHeroes.some((hero) => heroKey(hero) === heroKey(pick.hero))
             ? { ...pick, note: "locked" }
             : pick,
         );
     const scoreSolo = (hero: string, forcedOwner?: string): ScoredOption => {
-      if (ours) {
+      if (sideOurs) {
         const seat = findSeatForCandidate(beforePlan, hero);
         const preferred = displayPlayer(seat?.seat.player ?? null);
         const taken = lockedPlayerIds(locked);
@@ -3587,9 +3820,9 @@ export function InteractiveDraft({
           ...buildPickScorecard({
             hero,
             table: scoringMeta,
-            gone,
+            gone: goneNow,
             map: map ?? null,
-            ourPickCount,
+            ourPickCount: ourCount,
             inPlan: Boolean(seat),
             fromAlt: Boolean(seat?.asAlt),
             planRole: seat?.seat.role ?? null,
@@ -3622,7 +3855,7 @@ export function InteractiveDraft({
         forcedOwner || seated?.player
           ? { comfort: playerComfortOn(theirRoster, hero, player), who: player }
           : comfortSignal(theirRoster, hero, player);
-      const theirSeats: LockedPick[] = history
+      const theirSeats: LockedPick[] = hist
         .filter((a) => a.side === "their" && a.kind === "pick")
         .map((a) => ({ hero: a.hero, player: displayPlayer(a.player) }));
       const reseat = reseatFor(theirRoster, theirSeats, hero, theirLikely);
@@ -3630,9 +3863,9 @@ export function InteractiveDraft({
         ...buildPickScorecard({
           hero,
           table: scoringMeta,
-          gone,
+          gone: goneNow,
           map: map ?? null,
-          ourPickCount: theirPickCount,
+          ourPickCount: theirCount,
           inPlan: Boolean(matched),
           fromAlt: Boolean(matched && !matched.exact),
           planRole: matched?.seat.role ?? null,
@@ -3665,12 +3898,12 @@ export function InteractiveDraft({
       soloCache.set(k, card);
       return card;
     };
-    const sideLocked = ours ? ourLockedHeroes : theirLockedHeroes;
-    const sideRoster = ours ? homeRoster : theirRoster;
-    const sideTaken = ours
+    const sideLocked = sideOurs ? ourLockedHeroes : theirLockedHeroes;
+    const sideRoster = sideOurs ? homeRoster : theirRoster;
+    const sideTaken = sideOurs
       ? lockedPlayerIds(locked)
       : lockedPlayerIds(
-          history
+          hist
             .filter((a) => a.side === "their" && a.kind === "pick")
             .map((a) => ({ hero: a.hero, player: displayPlayer(a.player) })),
         );
@@ -3689,7 +3922,7 @@ export function InteractiveDraft({
             )
             .map((hero) => ({ hero })),
           roster: sideRoster,
-          planHints: ours ? planPicks : theirLikely,
+          planHints: sideOurs ? planPicks : theirLikely,
         });
         const who = (hero: string) =>
           assigned.find((row) => heroKey(row.hero) === heroKey(hero))?.player ??
@@ -3718,8 +3951,8 @@ export function InteractiveDraft({
       );
       if (!owners) return [first, second];
       return [
-        ours ? solo(a, owners.first.player) : { ...first, player: owners.first.player },
-        ours
+        sideOurs ? solo(a, owners.first.player) : { ...first, player: owners.first.player },
+        sideOurs
           ? solo(b, owners.second.player)
           : { ...second, player: owners.second.player },
       ];
@@ -3733,7 +3966,7 @@ export function InteractiveDraft({
         projectBoth: (x, y) =>
           pairStructureProjection(lockedHeroPicks(sideLocked), [], x, y),
         contested: (hero) =>
-          ours &&
+          sideOurs &&
           Boolean(
             theyMightTake(hero, theirLikely, playableBanPriority, theirRoster),
           ),
@@ -3991,7 +4224,7 @@ export function InteractiveDraft({
 
   const provisional = useMemo(
     () =>
-      watchOnly || scopeMissing.length === 0 || matchupFetchFailed
+      sideKnown && (watchOnly || scopeMissing.length === 0 || matchupFetchFailed)
         ? sweepSuggestion(baseSuggestion())
         : null,
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -3999,6 +4232,7 @@ export function InteractiveDraft({
       scopeMissing.length,
       matchupFetchFailed,
       watchOnly,
+      sideKnown,
       step,
       planned,
       stepIndex,
@@ -4063,6 +4297,9 @@ export function InteractiveDraft({
 
   useEffect(() => {
     const batch = matchupTargetKey.split("|").filter(Boolean).slice(0, MATCHUP_FETCH_BATCH);
+    if (matchupAttempts.current.key !== matchupTargetKey) {
+      matchupAttempts.current = { key: matchupTargetKey, n: 0 };
+    }
     if (!batch.length) {
       setMatchupPending([]);
       setMatchupTrack((current) =>
@@ -4072,23 +4309,58 @@ export function InteractiveDraft({
     }
     const ctrl = new AbortController();
     let cancelled = false;
+    let timedOut = false;
+    let retryTimer = 0;
+    const names = batch.join(", ");
+    const giveUp = (message: string) => {
+      setMatchupError(message);
+      setMatchupTrack({ stage: "failed", heroes: batch });
+      setMatchupPending([]);
+    };
+    const retryOrStop = (message: string) => {
+      if (matchupAttempts.current.n >= 2) {
+        giveUp(message);
+        return;
+      }
+      matchupAttempts.current.n += 1;
+      retryTimer = window.setTimeout(() => {
+        if (!cancelled) setMatchupRetry((n) => n + 1);
+      }, 1200);
+    };
     setMatchupPending(batch);
     setMatchupError(null);
     const url = `/api/matchups?heroes=${encodeURIComponent(batch.join("|"))}`;
     const secret = process.env.NEXT_PUBLIC_SCOUT_API_SECRET?.trim();
+    const slowTimer = window.setTimeout(() => {
+      timedOut = true;
+      ctrl.abort();
+    }, 80_000);
     fetch(url, {
       signal: ctrl.signal,
       headers: secret ? { "x-scout-secret": secret } : {},
     })
       .then(async (res) => {
         if (cancelled) return;
-        const body = (await res.json()) as {
+        const raw = await res.text();
+        let body: {
           patch?: string;
           byHero?: DraftMetaTable["byHero"];
           error?: string;
+          incomplete?: boolean;
         };
+        try {
+          body = JSON.parse(raw) as typeof body;
+        } catch {
+          retryOrStop(
+            `Storm League timed out before ${names} came back. You can keep drafting; those duos stay at 0.`,
+          );
+          return;
+        }
         if (cancelled) return;
-        if (!res.ok) throw new Error(body.error || "Matchup fetch failed");
+        if (!res.ok) {
+          giveUp(body.error || "Matchup fetch failed");
+          return;
+        }
         const rows = body.byHero ?? {};
         if (Object.keys(rows).length) {
           setMatchupPatch((prev) =>
@@ -4097,29 +4369,34 @@ export function InteractiveDraft({
         }
         const returned = new Set(Object.keys(rows).map((key) => heroKey(key)));
         const failed = batch.filter((hero) => !returned.has(heroKey(hero)));
+        if (body.incomplete && failed.length) {
+          retryOrStop(
+            `Storm League timed out before ${failed.join(", ")} came back. You can keep drafting; those duos stay at 0.`,
+          );
+          return;
+        }
         if (failed.length) {
-          setMatchupError(
+          retryOrStop(
             `Could not load Storm League matchups for ${failed.join(", ")}. Those duos stay at 0.`,
           );
-          setMatchupTrack({ stage: "failed", heroes: failed });
-          setMatchupPending([]);
           return;
         }
         setMatchupPending([]);
       })
       .catch((err: unknown) => {
-        if (cancelled) return;
-        if (err instanceof DOMException && err.name === "AbortError") return;
-        const message = err instanceof Error ? err.message : "Matchup fetch failed";
-        setMatchupError(message);
-        setMatchupTrack({ stage: "failed", heroes: batch });
-        setMatchupPending([]);
+        if (cancelled && !timedOut) return;
+        if (err instanceof DOMException && err.name === "AbortError" && !timedOut) return;
+        retryOrStop(
+          `Storm League timed out before ${names} came back. You can keep drafting; those duos stay at 0.`,
+        );
       });
     return () => {
       cancelled = true;
       ctrl.abort();
+      window.clearTimeout(slowTimer);
+      window.clearTimeout(retryTimer);
     };
-  }, [matchupTargetKey, draftMeta]);
+  }, [matchupTargetKey, draftMeta, matchupRetry]);
 
   useEffect(() => {
     if (
@@ -4167,15 +4444,22 @@ export function InteractiveDraft({
       gone,
       theirLikely,
       ours && step.kind === "ban",
+      tournamentDraftMode ? undefined : theirHeld,
     );
 
     function watchSlSuggestion(
       roster: PlayerScout[],
       kind: "ban" | "pick",
       takenPlayers: Set<string>,
+      side: "our" | "their" = "our",
     ): Suggestion | null {
-      const targets = slHeroSuggestions({ roster, gone, takenPlayers });
-      if (!targets.length) return null;
+      const rawTargets = slHeroSuggestions({ roster, gone, takenPlayers });
+      const targets =
+        kind === "pick" && side === "our"
+          ? applyPlanSeatsToSlSuggestions(rawTargets, livePicks, gone, roster)
+          : rawTargets;
+      const used = new Set(targets.map((target) => heroKey(target.hero)));
+      const seated = new Set(targets.map((target) => target.player.toLowerCase()));
       const ourLockedHeroes = history
         .filter((a) => a.side === "our" && a.kind === "pick")
         .map((a) => a.hero);
@@ -4183,9 +4467,13 @@ export function InteractiveDraft({
         .filter((a) => a.side === "their" && a.kind === "pick")
         .map((a) => a.hero);
       const banning = kind === "ban";
-      const options = targets.map((target) => ({
-        ...buildPickScorecard({
-          hero: target.hero,
+      const needsOpenSeat = roster.some((player) => {
+        const name = player.battletag.split("#")[0]?.trim().toLowerCase() ?? "";
+        return Boolean(name) && !takenPlayers.has(name) && !seated.has(name) && stormLeagueGames(player) === 0;
+      });
+      const scoreOpen = (hero: string) =>
+        buildPickScorecard({
+          hero,
           table: scoringMeta,
           gone,
           map,
@@ -4193,10 +4481,112 @@ export function InteractiveDraft({
           inPlan: false,
           fromAlt: false,
           planRole: null,
-          lockedAllies: banning ? theirLockedHeroes : ourLockedHeroes,
-          theirLocked: banning ? ourLockedHeroes : theirLockedHeroes,
-          answeringTeamPool: banning ? ourHeroPool : theirHeroPool,
-          answerPerspective: banning ? "ours" : "theirs",
+          lockedAllies: banning
+            ? side === "our"
+              ? theirLockedHeroes
+              : ourLockedHeroes
+            : ourLockedHeroes,
+          theirLocked: banning
+            ? side === "our"
+              ? ourLockedHeroes
+              : theirLockedHeroes
+            : theirLockedHeroes,
+          answeringTeamPool: banning
+            ? side === "our"
+              ? ourHeroPool
+              : theirHeroPool
+            : theirHeroPool,
+          answerPerspective: banning ? (side === "our" ? "ours" : "theirs") : "theirs",
+          theirLikely,
+          banPriority: playableBanPriority,
+          theirRoster,
+          comfort: 0,
+          comfortWho: null,
+          swapDelta: 0,
+          takeAndRebuild: false,
+          kind,
+          lastPick,
+        }).total;
+      const open = (needsOpenSeat ? allHeroes : [])
+        .filter((hero) => !isGone(hero, gone) && !used.has(heroKey(hero)))
+        .map((hero) => ({ hero, total: scoreOpen(hero) }))
+        .sort((a, b) => b.total - a.total || a.hero.localeCompare(b.hero));
+      let cursor = 0;
+      for (const player of roster) {
+        const name = player.battletag.split("#")[0]?.trim() ?? "";
+        const key = name.toLowerCase();
+        if (!name || takenPlayers.has(key) || seated.has(key)) continue;
+        if (stormLeagueGames(player) > 0) continue;
+        if (kind === "pick" && side === "our") {
+          const plannedHero = openPlanHeroForPlayer(name, livePicks, gone);
+          if (plannedHero && !used.has(heroKey(plannedHero))) {
+            used.add(heroKey(plannedHero));
+            const comfort = playerComfortOn(roster, plannedHero, name);
+            targets.push({
+              player: name,
+              hero: plannedHero,
+              sl: comfort,
+              comfort,
+              games: stormLeagueGamesOn(roster, plannedHero, name),
+            });
+            continue;
+          }
+        }
+        while (cursor < open.length && used.has(heroKey(open[cursor].hero))) cursor += 1;
+        const pick = open[cursor];
+        if (!pick) break;
+        cursor += 1;
+        used.add(heroKey(pick.hero));
+        targets.push({
+          player: name,
+          hero: pick.hero,
+          sl: 0,
+          comfort: 0,
+          games: 0,
+        });
+      }
+      if (!targets.length) return null;
+      const options = targets.map((target) => {
+        const seat =
+          !banning && side === "our"
+            ? livePicks.find(
+                (p) =>
+                  !isLockedPlanSeat(p) &&
+                  samePlayer(p.player, target.player) &&
+                  (heroKey(p.hero) === heroKey(target.hero) ||
+                    p.alternatives?.some(
+                      (alt) => heroKey(alt.hero) === heroKey(target.hero),
+                    )),
+              )
+            : undefined;
+        return {
+        ...buildPickScorecard({
+          hero: target.hero,
+          table: scoringMeta,
+          gone,
+          map,
+          ourPickCount,
+          inPlan: Boolean(seat),
+          fromAlt: Boolean(
+            seat && heroKey(seat.hero) !== heroKey(target.hero),
+          ),
+          planRole: seat?.role ?? null,
+          lockedAllies: banning
+            ? side === "our"
+              ? theirLockedHeroes
+              : ourLockedHeroes
+            : ourLockedHeroes,
+          theirLocked: banning
+            ? side === "our"
+              ? ourLockedHeroes
+              : theirLockedHeroes
+            : theirLockedHeroes,
+          answeringTeamPool: banning
+            ? side === "our"
+              ? ourHeroPool
+              : theirHeroPool
+            : theirHeroPool,
+          answerPerspective: banning ? (side === "our" ? "ours" : "theirs") : "theirs",
           theirLikely,
           banPriority: playableBanPriority,
           theirRoster,
@@ -4208,41 +4598,73 @@ export function InteractiveDraft({
           lastPick,
         }),
         player: target.player,
-      }));
-      const first = targets[0];
-      const games =
-        first.games > 0 ? ` (${first.games} Storm League games)` : "";
+        games: target.games,
+      };
+      });
+      options.sort((a, b) => b.total - a.total || a.hero.localeCompare(b.hero));
+      const first = options[0];
+      const personal = first.games > 0;
+      const games = personal ? ` (${first.games} Storm League games)` : "";
+      const ownedSeat =
+        !banning && side === "our"
+          ? livePicks.find(
+              (p) =>
+                !isLockedPlanSeat(p) && samePlayer(p.player, first.player),
+            )
+          : undefined;
+      const fillsOwnedSeat = Boolean(
+        ownedSeat &&
+          (heroKey(ownedSeat.hero) === heroKey(first.hero) ||
+            ownedSeat.alternatives?.some(
+              (alt) => heroKey(alt.hero) === heroKey(first.hero),
+            )),
+      );
+      const planReason =
+        fillsOwnedSeat && ownedSeat
+          ? heroKey(ownedSeat.hero) === heroKey(first.hero)
+            ? `${first.player}: ${first.hero} — open ${planSeatJob(ownedSeat)} seat${games}.`
+            : `${first.player}: ${first.hero} — open ${planSeatJob(ownedSeat)} seat. ${ownedSeat.hero} is gone${games}.`
+          : null;
       return {
         hero: first.hero,
         badge: banning ? "Suggested bans" : "Suggested picks",
         showOurPlan: true,
-        planPicks: livePicks,
+        planPicks:
+          !banning && side === "our"
+            ? showSuggestionOnPlan(livePicks, first.hero, first.player)
+            : livePicks,
         compLine: comp,
         expectLine: expect,
         cautionLine: null,
         swapLine: null,
-        reason: banning
-          ? `Ban ${first.hero} — ${first.player} is comfortable on it in Storm League${games}. One suggestion per opponent.`
-          : `${first.player}: ${first.hero} from Storm League history${games}. One suggestion per player.`,
+        reason:
+          planReason ??
+          (personal
+          ? banning
+            ? side === "their"
+              ? `They ban ${first.hero} — ${first.player} plays it in Storm League${games}.`
+              : `Ban ${first.hero} — ${first.player} is comfortable on it in Storm League${games}. One suggestion per opponent.`
+            : `${first.player}: ${first.hero} from Storm League history${games}. One suggestion per player.`
+          : banning
+            ? side === "their"
+              ? `They ban ${first.hero} from ${first.player}. Comfort is 0 without saved history. Win rate, influence, map, matchups, and roles still score it.`
+              : `Ban ${first.hero} for ${first.player}. Comfort is 0 without saved history. Win rate, influence, map, matchups, and roles still score it.`
+            : `${first.player}: ${first.hero}. Comfort is 0 without saved history. Win rate, influence, map, matchups, and roles still score it.`),
         options,
       };
     }
 
     if (useStormLeague && !ours) {
-      const theirTaken = lockedPlayerIds(
-        history
-          .filter((action) => action.side === "their" && action.kind === "pick")
-          .map((action) => ({ hero: action.hero, player: action.player ?? null })),
-      );
       return watchSlSuggestion(
-        theirRoster,
+        step.kind === "ban" ? homeRoster : theirRoster,
         step.kind,
-        step.kind === "pick" ? theirTaken : new Set(),
+        step.kind === "pick" ? theirHeld : ourHeld,
+        "their",
       );
     }
 
     if (ours && step.kind === "ban") {
-      if (useStormLeague) return watchSlSuggestion(theirRoster, "ban", new Set());
+      if (useStormLeague) return watchSlSuggestion(theirRoster, "ban", theirHeld);
       const ourLockedHeroes = history
         .filter((a) => a.side === "our" && a.kind === "pick")
         .map((a) => a.hero);
@@ -4335,6 +4757,11 @@ export function InteractiveDraft({
     }
 
     if (!ours) {
+      const seated = tournamentDraftMode ? undefined : theirHeld;
+      const openOwner = (hero: string) => {
+        const who = theirOwnerName(hero, theirLikely);
+        return who && playerStillOpen(who, seated) ? who : null;
+      };
       const pool = [
         ...(planned[stepIndex]?.side === "their" &&
         !isGone(planned[stepIndex].hero, gone)
@@ -4346,12 +4773,21 @@ export function InteractiveDraft({
           if (isGone(h, gone)) return false;
           return arr.findIndex((x) => heroKey(x) === heroKey(h)) === i;
         })
-        .filter((h) =>
-          step.kind === "ban"
-            ? !homeRoster.length ||
-              heroMeetsSuggestBar(homeRoster, h, null)
-            : theirPlaysHero(theirRoster, h, theirLikely),
-        );
+        .filter((h) => {
+          if (step.kind === "ban") {
+            return (
+              !homeRoster.length || heroMeetsSuggestBar(homeRoster, h, null)
+            );
+          }
+          if (openOwner(h)) return theirPlaysHero(theirRoster, h, theirLikely);
+          return theirRoster.some((player) => {
+            const name = displayPlayer(player.battletag);
+            return (
+              playerStillOpen(name, seated) &&
+              heroMeetsSuggestBar(theirRoster, h, name)
+            );
+          });
+        });
       if (!pool.length) return null;
       const ourLockedHeroes = history
         .filter((a) => a.side === "our" && a.kind === "pick")
@@ -4374,7 +4810,8 @@ export function InteractiveDraft({
                 (a) => heroKey(a.hero) === heroKey(h),
               ),
           );
-          return filled ? { ...p, note: "locked" } : p;
+          const playerGone = !playerStillOpen(p.player, seated);
+          return filled || playerGone ? { ...p, note: "locked" } : p;
         });
         const openCount = theirMarked.filter((p) => !isLockedPlanSeat(p))
           .length;
@@ -4392,8 +4829,8 @@ export function InteractiveDraft({
               const hit = soloCache.get(k);
               if (hit) return hit;
               const matched = matchTheirPlanSeat(hero, theirLikely);
-              const seatWho = theirOwnerName(hero, theirLikely);
-              const sig = comfortSignal(theirRoster, hero, seatWho);
+              const seatWho = openOwner(hero);
+              const sig = comfortSignal(theirRoster, hero, seatWho, seated);
               const theirSeats: LockedPick[] = history
                 .filter((a) => a.side === "their" && a.kind === "pick")
                 .map((a) => ({ hero: a.hero, player: displayPlayer(a.player) }));
@@ -4463,8 +4900,8 @@ export function InteractiveDraft({
                 return {
                   hero: pair.first,
                   pairWith: pair.second,
-                  player: theirOwnerName(pair.first, theirLikely),
-                  pairPlayer: theirOwnerName(pair.second, theirLikely),
+                  player: openOwner(pair.first),
+                  pairPlayer: openOwner(pair.second),
                   total: pair.total,
                   firstSoloFactors: firstCard.factors,
                   secondSoloFactors: secondCard.factors,
@@ -4489,8 +4926,8 @@ export function InteractiveDraft({
               const options = pairSet.slice(0, 3).map(toOption);
               const originalPair = toOption(pairs[0]);
               const best = pairSet[0] ?? pairs[0];
-              const who = theirOwnerName(best.first, theirLikely);
-              const who2 = theirOwnerName(best.second, theirLikely);
+              const who = openOwner(best.first);
+              const who2 = openOwner(best.second);
               const theirProjected = projectedTheirHeroes(
                 history,
                 theirLikely,
@@ -4527,12 +4964,13 @@ export function InteractiveDraft({
       const options = pool
         .map((h) => {
           const matched = matchTheirPlanSeat(h, theirLikely);
-          const seatWho = theirOwnerName(h, theirLikely);
+          const seatWho = openOwner(h);
           // Ban denies our pockets; pick uses their comfort.
           const sig = comfortSignal(
             step.kind === "ban" ? homeRoster : theirRoster,
             h,
             step.kind === "ban" ? null : seatWho,
+            step.kind === "ban" ? undefined : seated,
           );
           // Ban: if we take it, they answer. Pick: if they take it, we answer.
           const theyAnswer = step.kind === "ban";
@@ -4568,15 +5006,17 @@ export function InteractiveDraft({
               lastPick,
               unplayed: step.kind === "pick" && heroUnplayedBy(theirRoster, h),
             }),
-            player: seatWho,
+            player: step.kind === "ban" ? sig.who : seatWho,
           };
         })
         .sort((a, b) => b.total - a.total || a.hero.localeCompare(b.hero))
         .slice(0, 3);
       const hero = options[0]?.hero;
       if (!hero) return null;
-      const who = theirLikely.find((p) => heroKey(p.hero) === heroKey(hero));
-      const whoName = displayPlayer(who?.player ?? null);
+      const whoName =
+        step.kind === "ban"
+          ? options[0]?.player ?? null
+          : openOwner(hero);
       const theirProjected = projectedTheirHeroes(
         history,
         theirLikely,
@@ -4612,7 +5052,7 @@ export function InteractiveDraft({
 
     // Our pick — plan heroes + seat alternatives, scored for this step.
     const takenPlayers = lockedPlayerIds(locked);
-    if (useStormLeague) return watchSlSuggestion(homeRoster, "pick", takenPlayers);
+    if (useStormLeague) return watchSlSuggestion(homeRoster, "pick", ourHeld);
     const candMeta = pickCandidates(livePicks, gone, homeRoster).filter((c) => {
       const who = displayPlayer(c.player);
       // Seat already filled — don't offer another hero for that player.
@@ -5104,26 +5544,41 @@ export function InteractiveDraft({
         player: displayPlayer(a.player),
       }));
     if (ourLocked.length < 5 || theirLocked.length < 5) return null;
-    const steps: DraftStepScore[] = [];
-    history.forEach((action, index) => {
-      if (!action.score) return;
-      const partner =
-        action.kind === "pick" && isDoublePickWindow(DRAFT_ORDER, index)
-          ? history[index + 1]
-          : undefined;
-      steps.push({
-        side: action.side,
-        kind: action.kind,
-        label: partner
-          ? `Picks ${action.ordinal} + ${partner.ordinal}`
-          : `${action.kind === "ban" ? "Ban" : "Pick"} ${action.ordinal}`,
-        locked: partner ? `${action.hero} + ${partner.hero}` : action.hero,
-        bestLabel: action.score.bestLabel,
-        best: action.score.best,
-        achieved: action.score.achieved,
-        percentile: action.score.percentile,
-        fieldSize: action.score.fieldSize,
+    const steps = collectReportSteps(history, (index) => {
+      const action = history[index];
+      const partner = history[index + 1];
+      if (!partner) return null;
+      const scoring = pairScoring({
+        history: history.slice(0, index),
+        ours: action.side === "our",
       });
+      const chosen = scoring.assemble(action.hero, partner.hero);
+      const chosenPair = {
+        ...chosen,
+        pairWith: chosen.pairWith ?? partner.hero,
+      };
+      const pool = allHeroes.filter(
+        (hero) => !goneKeys(history.slice(0, index)).has(heroKey(hero)),
+      );
+      const { benchmark, field } = roleMatchedPair({
+        best: chosenPair,
+        chosen: chosenPair,
+        pool,
+        soloTotal: (hero) => scoring.solo(hero).total,
+        assemble: scoring.assemble,
+        roleBlocked:
+          checkRequiredRoles([...scoring.sideLocked, action.hero, partner.hero])
+            .unfillable > 0,
+      });
+      return {
+        best: benchmark.total,
+        achieved: chosen.total,
+        bestLabel: benchmark.pairWith
+          ? `${benchmark.hero} + ${benchmark.pairWith}`
+          : benchmark.hero,
+        percentile: percentileRank(chosen.total, field),
+        fieldSize: field.length,
+      };
     });
     return gradeFinishedDraft({
       ourLocked,
@@ -5144,6 +5599,12 @@ export function InteractiveDraft({
     planPicks,
     homeRoster,
     theirRoster,
+    theirLikely,
+    playableBanPriority,
+    tournamentDraftMode,
+    ourHeroPool,
+    theirHeroPool,
+    allHeroes,
     scoringMeta,
     map,
     ourLabel,
@@ -5275,43 +5736,44 @@ export function InteractiveDraft({
           assembled.pairFactors,
           "second",
         );
-        let pairScore: StepScore | undefined;
-        if (bestPair) {
-          // Same scorer the suggestion sweep ranked with, so totals compare like for like.
-          const chosenPair = assembled;
-          const { benchmark, roleMatched, field } = roleMatchedPair({
-            best: bestPair,
-            chosen: { ...chosenPair, pairWith: chosenPair.pairWith ?? secondHero },
-            pool: suggestion
-              ? comfortGatedField(gradeField(suggestion), true)
-              : allHeroes.filter((h) => !isGone(h, gone)),
-            soloTotal: (h) => scoring.solo(h).total,
-            assemble: scoring.assemble,
-            roleBlocked:
-              checkRequiredRoles([...scoring.sideLocked, firstHero, secondHero])
-                .unfillable > 0,
-          });
-          const note = gradePairSelection(benchmark, chosenPair);
-          setDeviationNote(
-            roleMatched && heroKey(benchmark.hero) !== heroKey(bestPair.hero)
-              ? {
-                  ...note,
-                  summary: `${note.summary} Graded against the best ${pairRolesLabel(benchmark)} pair, not the overall top ${bestPair.hero} + ${bestPair.pairWith} (${signedPoints(bestPair.total)}), which fills different roles.`,
-                }
-              : note,
-          );
-          pairScore = {
-            best: benchmark.total,
-            achieved: chosenPair.total,
-            bestLabel: benchmark.pairWith
-              ? `${benchmark.hero} + ${benchmark.pairWith}`
-              : benchmark.hero,
-            percentile: percentileRank(chosenPair.total, field),
-            fieldSize: field.length,
-          };
-        } else {
-          setDeviationNote(null);
-        }
+        // A blind last double (Yrel with nobody on record) often has no
+        // suggestable benchmark pair. Still grade the lock, or picks 4 and 5
+        // never land on the report card.
+        const chosenPair = {
+          ...assembled,
+          pairWith: assembled.pairWith ?? secondHero,
+        };
+        if (!bestPair) bestPair = chosenPair;
+        const { benchmark, roleMatched, field } = roleMatchedPair({
+          best: bestPair,
+          chosen: chosenPair,
+          pool: suggestion
+            ? comfortGatedField(gradeField(suggestion), true)
+            : allHeroes.filter((h) => !isGone(h, gone)),
+          soloTotal: (h) => scoring.solo(h).total,
+          assemble: scoring.assemble,
+          roleBlocked:
+            checkRequiredRoles([...scoring.sideLocked, firstHero, secondHero])
+              .unfillable > 0,
+        });
+        const note = gradePairSelection(benchmark, chosenPair);
+        setDeviationNote(
+          roleMatched && heroKey(benchmark.hero) !== heroKey(bestPair.hero)
+            ? {
+                ...note,
+                summary: `${note.summary} Graded against the best ${pairRolesLabel(benchmark)} pair, not the overall top ${bestPair.hero} + ${bestPair.pairWith} (${signedPoints(bestPair.total)}), which fills different roles.`,
+              }
+            : note,
+        );
+        const pairScore: StepScore = {
+          best: benchmark.total,
+          achieved: chosenPair.total,
+          bestLabel: benchmark.pairWith
+            ? `${benchmark.hero} + ${benchmark.pairWith}`
+            : benchmark.hero,
+          percentile: percentileRank(chosenPair.total, field),
+          fieldSize: field.length,
+        };
         const nextHistory = [
           { side: ours ? "our" : "their", kind: "pick", ordinal: (ours ? ourPickCount : theirPickCount) + 1, hero: firstHero, score: pairScore, breakdown: firstBreakdown },
           { side: ours ? "our" : "their", kind: "pick", ordinal: (ours ? ourPickCount : theirPickCount) + 2, hero: secondHero, breakdown: secondBreakdown },
@@ -5351,7 +5813,13 @@ export function InteractiveDraft({
           ? plated
           : ours
             ? ownerForHero(hero, planPicks, homeRoster, lockedSoFar)
-            : theirOwnerForHero(hero, theirLikely, history, theirRoster);
+            : theirOwnerForHero(
+                hero,
+                theirLikely,
+                history,
+                theirRoster,
+                !tournamentDraftMode,
+              );
 
     let stepScore: StepScore | undefined;
     let breakdown: BoardBreakdown | undefined;
@@ -5688,7 +6156,9 @@ export function InteractiveDraft({
             ? theirBanCount
             : theirPickCount) + 1;
 
-  const stepLabel = !step
+  const stepLabel = !sideKnown
+    ? "Waiting to see who bans first"
+    : !step
     ? null
     : stepHeading({
         ours,
@@ -5913,7 +6383,12 @@ export function InteractiveDraft({
                 Step {stepIndex + 1} / {DRAFT_ORDER.length}
               </p>
             </div>
-            {watchOnly && (
+            {watchOnly && !sideKnown ? (
+              <p className="text-sm text-[#c5d4e0]">
+                Who bans first comes from the screen. Waiting for Enemy Ban means their turn.
+              </p>
+            ) : null}
+            {watchOnly && sideKnown && (
               <p className="text-sm text-[#c5d4e0]">
                 {tournamentDraftMode && !stormLeagueOnly
                   ? "Tournament mode uses NGS hero pools. Heroes lock from the shared screen."
@@ -5935,6 +6410,12 @@ export function InteractiveDraft({
                   : `Pair in progress: ${pairPick.join(" + ")} — choose one more hero to lock the duo.`}
               </div>
             )}
+
+            {!watchOnly && screen && !replay ? (
+              <p className="text-sm text-[#c5d4e0]">
+                Locks from the shared screen fill in on their own. Undo, then tap the right hero if a read is wrong.
+              </p>
+            ) : null}
 
             {!watchOnly && (
             <div className="space-y-1.5">
@@ -5971,11 +6452,30 @@ export function InteractiveDraft({
                 <p className="font-semibold text-[#e8eef2]">
                   Loading Storm League matchups before scoring…
                 </p>
-                <p className="mt-1 text-[#c5d4e0]">
-                  {matchupPending.length > 0
-                    ? `Pulling ${matchupPending.join(", ")} (${matchupMissing.length} left in queue)`
-                    : `${matchupMissing.length} hero${matchupMissing.length === 1 ? "" : "es"} queued`}
-                </p>
+                <ul className="mt-2 max-h-56 space-y-1 overflow-y-auto">
+                  {matchupMissing.map((hero) => {
+                    const pulling = matchupPending.some(
+                      (name) => heroKey(name) === heroKey(hero),
+                    );
+                    return (
+                      <li
+                        key={hero}
+                        className="flex items-baseline justify-between gap-3"
+                      >
+                        <span className={pulling ? "text-[#72d1b1]" : "text-[#e8eef2]"}>
+                          {hero}
+                        </span>
+                        <span
+                          className={`shrink-0 text-xs ${
+                            pulling ? "text-[#72d1b1]" : "text-[#8aa0b2]"
+                          }`}
+                        >
+                          {pulling ? "Pulling" : "Waiting"}
+                        </span>
+                      </li>
+                    );
+                  })}
+                </ul>
               </div>
             ) : null}
 

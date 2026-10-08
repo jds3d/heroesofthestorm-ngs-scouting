@@ -13,7 +13,11 @@ import { buildDraftMetaTable } from "@/lib/scoring/draftMeta";
 import { buildDraftPlan } from "@/lib/scoring/draftPlan";
 import { buildMapPlan } from "@/lib/scoring/mapPlan";
 import { heroKey } from "@/lib/scoring/heroMeta";
-import { isScoutBudgetExceeded, runWithScoutBudget } from "@/lib/scout/budget";
+import {
+  isScoutBudgetExceeded,
+  runWithScoutBudget,
+  withTighterBudget,
+} from "@/lib/scout/budget";
 import { draftHeroPool } from "@/lib/scout/draftHeroPool";
 import {
   loadSavedHomeReport,
@@ -175,17 +179,19 @@ export async function GET(request: Request, context: RouteContext) {
         patch,
         byHero: matchupBundles,
         incomplete: matchupsIncomplete,
-      } = await getHeroMatchupsMany(pool).catch((err) => {
-        if (isScoutBudgetExceeded(err)) throw err;
-        return {
-          patch: "",
-          byHero: {} as Record<
-            string,
-            import("@/lib/heroesprofile/client").HeroMatchupBundle
-          >,
-          incomplete: false,
-        };
-      });
+      } = await withTighterBudget(20_000, () => getHeroMatchupsMany(pool)).catch(
+        (err) => {
+          if (isScoutBudgetExceeded(err)) throw err;
+          return {
+            patch: "",
+            byHero: {} as Record<
+              string,
+              import("@/lib/heroesprofile/client").HeroMatchupBundle
+            >,
+            incomplete: false,
+          };
+        },
+      );
       if (matchupsIncomplete) report.incomplete = true;
       let mapStats: Awaited<ReturnType<typeof getGlobalHeroStatsByMap>> = [];
       try {
