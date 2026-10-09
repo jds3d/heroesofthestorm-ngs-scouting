@@ -1,18 +1,23 @@
 import { mkdir, readFile, readdir, writeFile } from "fs/promises";
 import path from "path";
 import { NextResponse } from "next/server";
+import { rowsFromBanHexExamples } from "@/lib/lobby/banHexCatalog";
 import { heroFromPlateText } from "@/lib/lobby/screenLobby";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 
 const PORTRAIT_DIR = path.join(process.cwd(), "examples", "draft-portraits");
+const BAN_HEX_DIR = path.join(process.cwd(), "examples", "ban-hexes");
+const BAN_HEX_MANIFEST = path.join(BAN_HEX_DIR, "manifest.json");
+const BAN_HEX_CATALOG = path.join(process.cwd(), "src", "lib", "lobby", "banHexCatalog.json");
 const FRAME_DIR = path.join(process.cwd(), "examples", "drafts");
 const MANIFEST = path.join(PORTRAIT_DIR, "manifest.json");
 const MAX_PER_HERO = 4;
 const MAX_FRAMES = 8;
 
 type ManifestRow = { hero: string; file: string };
+type BanHexManifestRow = { hero: string; file: string; source?: string };
 
 function asBase64(value: unknown, max: number): string | null {
   if (typeof value !== "string") return null;
@@ -20,6 +25,29 @@ function asBase64(value: unknown, max: number): string | null {
   if (cleaned.length < 32 || cleaned.length > max) return null;
   if (!/^[A-Za-z0-9+/=]+$/.test(cleaned)) return null;
   return cleaned;
+}
+
+async function readBanHexManifest(): Promise<BanHexManifestRow[]> {
+  try {
+    const raw = await readFile(BAN_HEX_MANIFEST, "utf8");
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter(
+      (row): row is BanHexManifestRow =>
+        !!row &&
+        typeof row === "object" &&
+        typeof (row as BanHexManifestRow).hero === "string" &&
+        typeof (row as BanHexManifestRow).file === "string" &&
+        !path.basename((row as BanHexManifestRow).file).includes(".."),
+    );
+  } catch {
+    return [];
+  }
+}
+
+async function writeBanHexCatalog(): Promise<void> {
+  const rows = rowsFromBanHexExamples();
+  await writeFile(BAN_HEX_CATALOG, JSON.stringify(rows, null, 2) + "\n");
 }
 
 async function readManifest(): Promise<ManifestRow[]> {
@@ -57,7 +85,35 @@ export async function GET() {
 
 /** Save a labeled portrait, or one full draft frame, from the live watch. */
 export async function POST(request: Request) {
-  const body = (await request.json()) as { kind?: unknown; hero?: unknown; image?: unknown };
+  const body = (await request.json()) as {
+    kind?: unknown;
+    hero?: unknown;
+    image?: unknown;
+    source?: unknown;
+  };
+  if (body.kind === "ban-hex") {
+    const hero = heroFromPlateText(typeof body.hero === "string" ? body.hero : "");
+    const image = asBase64(body.image, 500_000);
+    if (!hero || !image) return NextResponse.json({ error: "Expected a named ban hex" }, { status: 400 });
+    const bytes = Buffer.from(image, "base64");
+    if (bytes[0] !== 0x89 || bytes[1] !== 0x50) {
+      return NextResponse.json({ error: "Expected a png ban hex" }, { status: 400 });
+    }
+    await mkdir(BAN_HEX_DIR, { recursive: true });
+    const manifest = await readBanHexManifest();
+    const slug = hero.toLowerCase().replace(/[^a-z0-9]/g, "") || "hero";
+    const owned = manifest.filter((row) => row.hero === hero);
+    const file = `${slug}-${owned.length + 1}.png`;
+    await writeFile(path.join(BAN_HEX_DIR, file), bytes);
+    manifest.push({
+      hero,
+      file,
+      source: typeof body.source === "string" ? body.source.slice(0, 120) : undefined,
+    });
+    await writeFile(BAN_HEX_MANIFEST, JSON.stringify(manifest, null, 2) + "\n");
+    await writeBanHexCatalog();
+    return NextResponse.json({ ok: true, saved: true, file, catalog: "banHexCatalog.json" });
+  }
   if (body.kind === "frame") {
     const image = asBase64(body.image, 8_000_000);
     if (!image) return NextResponse.json({ error: "Expected a frame" }, { status: 400 });

@@ -382,12 +382,17 @@ export function heroDraftMeta(
  * Storm League matchups were fetched for this hero.
  * A globals-only row (no samples, flag unset) still needs a pull.
  */
+function heroHasPlayedMatchups(row: ComputedHeroMeta): boolean {
+  if (Object.values(row.matchupGameCounts ?? {}).some((games) => games > 0)) return true;
+  return (row.matchupSamples ?? []).some((sample) => sample.games > 0);
+}
+
 export function heroMatchupsLoaded(
   table: DraftMetaTable | null | undefined,
   hero: string,
 ): boolean {
   const row = table?.byHero[heroKey(hero)];
-  if (!row) return false;
+  if (!row || !heroHasPlayedMatchups(row)) return false;
   if (row.matchupsLoaded) return true;
   return (row.matchupSamples?.length ?? 0) > 0 || row.allySamples.length > 0;
 }
@@ -459,6 +464,37 @@ export function pairingGameCount(
     const fromSample = (list: MatchupEdge[] | undefined, other: string) =>
       list?.find((s) => heroKey(s.hero) === heroKey(other))?.games ?? 0;
     best = Math.max(fromSample(aMeta.matchupSamples, b), fromSample(bMeta.matchupSamples, a));
+  }
+  return best;
+}
+
+/** Best SL ally sample size once both heroes' ally rows are loaded. */
+export function allyPairingGameCount(
+  table: DraftMetaTable | null | undefined,
+  a: string,
+  b: string,
+): number | undefined {
+  if (!heroAlliesLoaded(table, a) || !heroAlliesLoaded(table, b)) {
+    return undefined;
+  }
+  const bk = heroKey(b);
+  const ak = heroKey(a);
+  const aMeta = heroDraftMeta(table, a);
+  const bMeta = heroDraftMeta(table, b);
+  let best = 0;
+  const ga = aMeta.allyGameCounts?.[bk];
+  const gb = bMeta.allyGameCounts?.[ak];
+  if (ga != null) best = Math.max(best, ga);
+  if (gb != null) best = Math.max(best, gb);
+  if (ga == null && gb == null) {
+    const fromSample = (list: SynergyEdge[] | undefined, other: string) =>
+      list?.find((s) => heroKey(s.hero) === heroKey(other))?.games ?? 0;
+    best = Math.max(
+      fromSample(aMeta.allySamples, b),
+      fromSample(bMeta.allySamples, a),
+      fromSample(aMeta.synergiesWith, b),
+      fromSample(bMeta.synergiesWith, a),
+    );
   }
   return best;
 }
@@ -537,16 +573,31 @@ export function duoMissingLine(
   if (pendingKey(subject) || pendingKey(other)) {
     return `${label}: fetching Storm League… → 0`;
   }
-  if (!heroMatchupsLoaded(table, subject)) {
-    return `${label}: ${subject} matchups not loaded — fetching… → 0`;
+  const loadHint = (name: string) =>
+    pendingKey(name) ? "fetching…" : "queued…";
+  if (verb === "together") {
+    if (!heroAlliesLoaded(table, subject)) {
+      return `${label}: ${subject} ally matchups not loaded — ${loadHint(subject)} → 0`;
+    }
+    if (!heroAlliesLoaded(table, other)) {
+      return `${label}: ${other} ally matchups not loaded — ${loadHint(other)} → 0`;
+    }
+  } else {
+    if (!heroMatchupsLoaded(table, subject)) {
+      return `${label}: ${subject} matchups not loaded — ${loadHint(subject)} → 0`;
+    }
+    if (!heroMatchupsLoaded(table, other)) {
+      return `${label}: ${other} matchups not loaded — ${loadHint(other)} → 0`;
+    }
   }
-  if (!heroMatchupsLoaded(table, other)) {
-    return `${label}: ${other} matchups not loaded — fetching… → 0`;
-  }
-  const games = pairingGameCount(table, subject, other);
+  const games =
+    verb === "together"
+      ? allyPairingGameCount(table, subject, other)
+      : pairingGameCount(table, subject, other);
   if (games === undefined) {
     return `${label}: fetching Storm League… → 0`;
   }
+  if (games === 0) return `${label}: fetching Storm League… → 0`;
   if (games > 0 && games < MIN_MATCHUP_GAMES) {
     return `${label}: only ${games.toLocaleString("en-US")} SL games (need ${MIN_MATCHUP_GAMES}) → 0`;
   }
@@ -556,7 +607,7 @@ export function duoMissingLine(
 /** Short label for a duo line that has nothing to score, or null when the line has a sample. */
 export function missingDuoLabel(text: string): string | null {
   if (
-    !/no sample with enough games|ally data unavailable|no verified sample|fetching Storm League|matchups not loaded|ally matchups not loaded|only \d|no Storm League pairing on record|no Storm League games together/i.test(
+    !/no sample with enough games|ally data unavailable|no verified sample|fetching Storm League|matchups not loaded|ally matchups not loaded|only \d|no Storm League pairing on record|no Storm League games together|no matchup games|no games together/i.test(
       text,
     )
   ) {
@@ -583,6 +634,106 @@ export function missingDuoReason(text: string): string | null {
     return "Storm League sample not loaded yet";
   }
   return body || null;
+}
+
+export type SuggestionDataGap = {
+  /** What this suggestion is still missing, one line each. */
+  missing: string[];
+  /** Share of this card's duo lines that already have a sample, 0–100. */
+  percent: number;
+  /** A Storm League pull for this hero is still queued or in flight. */
+  loading: boolean;
+  /** The latest pull for this hero failed. */
+  failed: boolean;
+};
+
+function namedIn(names: readonly string[], hero: string): boolean {
+  const key = heroKey(hero);
+  return names.some((name) => name === hero || heroKey(name) === key);
+}
+
+/** Whether a hero still needs a full Storm League matchup + ally pull. */
+export function heroStormLeagueBundleReady(
+  table: DraftMetaTable | null | undefined,
+  hero: string,
+): boolean {
+  return heroMatchupsLoaded(table, hero) && heroAlliesLoaded(table, hero);
+}
+
+export type HeroStormLeagueLoadState = "ready" | "pulling" | "queued" | "failed";
+
+export function heroStormLeagueLoadState(
+  table: DraftMetaTable | null | undefined,
+  hero: string,
+  queued: readonly string[],
+  failed: readonly string[],
+): HeroStormLeagueLoadState {
+  if (namedIn(failed, hero)) return "failed";
+  if (heroStormLeagueBundleReady(table, hero)) return "ready";
+  if (namedIn(queued, hero)) return "pulling";
+  return "queued";
+}
+
+function duoScoreLine(text: string): boolean {
+  if (missingDuoLabel(text)) return true;
+  const head = text.split(":")[0]?.trim() ?? "";
+  return /^(into|with)\s+/i.test(head);
+}
+
+/**
+ * Gap for one suggested hero (and its pair partner). Null when every duo
+ * line on the card already has a sample and nothing is still queued.
+ */
+export function suggestionDataGap(args: {
+  heroes: readonly string[];
+  lines: readonly string[];
+  queued: readonly string[];
+  failed: readonly string[];
+}): SuggestionDataGap | null {
+  const heroes = args.heroes.filter(Boolean);
+  let loaded = 0;
+  const missing: string[] = [];
+  const seen = new Set<string>();
+  for (const text of args.lines) {
+    if (!duoScoreLine(text)) continue;
+    const label = missingDuoLabel(text);
+    if (!label) {
+      loaded += 1;
+      continue;
+    }
+    if (seen.has(label)) continue;
+    seen.add(label);
+    const reason = missingDuoReason(text);
+    missing.push(reason ? `${label}: ${reason}` : label);
+  }
+  if (loaded === 0 && missing.length === 0) {
+    for (const hero of heroes) {
+      if (!namedIn(args.queued, hero) && !namedIn(args.failed, hero)) continue;
+      const line = `Storm League matchups for ${hero}`;
+      if (seen.has(line)) continue;
+      seen.add(line);
+      missing.push(line);
+    }
+  }
+  if (missing.length === 0) return null;
+  const failed = heroes.some((hero) => namedIn(args.failed, hero));
+  const queued = heroes.some((hero) => namedIn(args.queued, hero));
+  const fetching = missing.some((line) => /fetching|not loaded|queued/i.test(line));
+  const total = loaded + missing.length;
+  const percent = total === 0 ? 0 : Math.round((100 * loaded) / total);
+  return {
+    missing,
+    percent,
+    loading: !failed && (queued || fetching),
+    failed,
+  };
+}
+
+/** Tooltip for the missing-data badge. Percent only while a pull is still running. */
+export function suggestionDataGapTooltip(gap: SuggestionDataGap): string {
+  const head = gap.failed ? "Failed to load" : "Missing data";
+  const progress = gap.loading ? `\n${gap.percent}% loaded` : "";
+  return `${head}\n${gap.missing.join("\n")}${progress}`;
 }
 
 /** Ally synergy edges for heroes already locked on our side. */
@@ -649,7 +800,7 @@ export function allyDuos(
     const sample =
       moreGames(find(meta.allySamples, ally), find(allyMeta.allySamples, hero)) ??
       moreGames(find(meta.synergiesWith, ally), find(allyMeta.synergiesWith, hero));
-    if (sample) out.push(duoEdge(ally, sample.allyWinRate, sample.games));
+    if (sample && sample.games > 0) out.push(duoEdge(ally, sample.allyWinRate, sample.games));
   }
   return out;
 }
@@ -674,7 +825,7 @@ export function enemyDuos(
       ours && { winRate: 100 - ours.theirWinRate, games: ours.games },
       theirs && { winRate: theirs.theirWinRate, games: theirs.games },
     );
-    if (pick) out.push(duoEdge(enemy, pick.winRate, pick.games));
+    if (pick && pick.games > 0) out.push(duoEdge(enemy, pick.winRate, pick.games));
   }
   return out;
 }
@@ -702,11 +853,13 @@ export function scoreDuos(
   missingLine?: (other: string) => string | null,
 ): { points: number; summary: string; lines: string[]; math: string } {
   const scored = duos
+    .filter((d) => d.games > 0)
     .map((d) => ({
       duo: d,
       pts: Math.max(-weights.perDuoCap, Math.min(weights.perDuoCap, d.edgePp * weights.perPp)),
     }))
     .sort((a, b) => b.pts - a.pts);
+  const empty = duos.filter((d) => d.games <= 0);
   const sum = scored.reduce((s, x) => s + x.pts, 0);
   const points = Math.max(-weights.totalCap, Math.min(weights.totalCap, sum));
   const label = (hero: string) =>
@@ -715,13 +868,20 @@ export function scoreDuos(
     ({ duo, pts }) =>
       `${label(duo.hero)}: ${duo.winRate}% ${verb === "together" ? "together" : "win rate"} (${duo.games.toLocaleString("en-US")}g) → ${signed(pts)}`,
   );
-  const sampled = new Set(duos.map((d) => heroKey(d.hero)));
+  const sampled = new Set(scored.map(({ duo }) => heroKey(duo.hero)));
   for (const hero of others) {
     if (sampled.has(heroKey(hero))) continue;
     const line = missingLine
       ? missingLine(hero)
-      : `${label(hero)}: no sample with enough games → 0`;
+      : empty.some((duo) => heroKey(duo.hero) === heroKey(hero))
+        ? `${label(hero)}: fetching Storm League… → 0`
+        : `${label(hero)}: no sample with enough games → 0`;
     if (line) lines.push(line);
+  }
+  for (const duo of empty) {
+    if (others.some((hero) => heroKey(hero) === heroKey(duo.hero))) continue;
+    if (sampled.has(heroKey(duo.hero))) continue;
+    lines.push(`${label(duo.hero)}: fetching Storm League… → 0`);
   }
   const unsampled = lines.length - scored.length;
   const summary = scored.length

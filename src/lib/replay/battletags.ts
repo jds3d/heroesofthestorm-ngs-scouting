@@ -26,6 +26,11 @@ export function battletagFromHistory(
 
 let history: Map<string, ReplayName> | null = null;
 
+/** Drop the in-memory map after `replay-battletags.json` is updated on disk. */
+export function clearReplayBattletagCache(): void {
+  history = null;
+}
+
 function loadHistory(): Map<string, ReplayName> {
   if (history) return history;
   history = new Map();

@@ -12,19 +12,25 @@ import {
   NAMEPLATE_CELL_WIDTH,
   banHexFilled,
   bannerTurn,
-  borderLooksLocked,
   firstBanSideFromStatus,
   inferFirstPick,
+  pickCountsFit,
   mapFromTitle,
   nameplateCell,
   ocrFold,
+  plateFill,
   portraitFilled,
+  openSeatPlayers,
+  portraitIsLocked,
+  portraitTeamRim,
   progressFromObserved,
   readsBySlot,
   sideFromStatus,
   type DraftBox,
 } from "@/lib/lobby/screenLobby";
 import { matchBanPixels } from "@/lib/lobby/banFace";
+import { DRAFT_ORDER } from "@/lib/scoring/draftPlan";
+import { nextStepSuggestion } from "@/lib/scoring/pickPairs";
 import { decodePng, encodePng, type RgbaImage } from "@/lib/lobby/pngImage";
 
 const DRAFTS = path.join(process.cwd(), "examples", "drafts");
@@ -43,23 +49,6 @@ function boxOrigin(image: RgbaImage, box: DraftBox): { x: number; y: number; w: 
 
 function boxRgb(image: RgbaImage, box: DraftBox): { r: number; g: number; b: number }[] {
   return cropRgb(image, box).pixels;
-}
-
-/** Lumas just outside a portrait. A locked pick has a bright rim; a pre-pick does not. */
-function rimLumas(image: RgbaImage, box: DraftBox): number[] {
-  const { x, y, w, h } = boxOrigin(image, box);
-  const at = (px: number, py: number) => {
-    const [r, g, b] = sample(image, px, py);
-    return 0.2126 * r + 0.7152 * g + 0.0722 * b;
-  };
-  const lumas: number[] = [];
-  for (let px = x - 6; px < x + w + 6; px++) {
-    lumas.push(at(px, y - 4), at(px, y - 3), at(px, y + h + 2), at(px, y + h + 3));
-  }
-  for (let py = y - 2; py < y + h + 2; py++) {
-    lumas.push(at(x - 4, py), at(x - 3, py), at(x + w + 2, py), at(x + w + 3, py));
-  }
-  return lumas;
 }
 
 function cropRgb(
@@ -185,18 +174,59 @@ async function loadLobby(file: string) {
   const rightFaces = DRAFT_PLATE_SLOTS.right.map((box) => portraitFilled(boxRgb(image, box)));
   const phase = bannerTurn(statusText).phase;
   const turn = sideFromStatus(statusText);
-  // A bright rim is a lock. A hero only highlighted, and every face during bans, is not a pick yet.
-  const lockedPicks = (slots: readonly DraftBox[], reads: SlotRead[]) =>
-    phase === "ban"
-      ? []
-      : slots.flatMap((box, slot) => {
-          const read = reads[slot];
-          if (!read?.hero || !portraitFilled(boxRgb(image, box))) return [];
-          if (!borderLooksLocked(rimLumas(image, box))) return [];
-          return [{ hero: read.hero, player: read.player }];
-        });
-  const ourPicks = lockedPicks(DRAFT_PLATE_SLOTS.left, leftReads);
-  const theirPicks = lockedPicks(DRAFT_PLATE_SLOTS.right, rightReads);
+  const pixelAt = (x: number, y: number) => {
+    const [r, g, b] = sample(image, x, y);
+    return { r, g, b };
+  };
+  const lockedPicks = (
+    ally: boolean,
+    slots: readonly DraftBox[],
+    nameSlots: readonly DraftBox[],
+    reads: SlotRead[],
+  ) =>
+    slots.flatMap((box, slot) => {
+      const read = reads[slot];
+      const nameBox = nameSlots[slot];
+      if (!read?.hero || !nameBox) return [];
+      if (
+        !portraitIsLocked({
+          phase,
+          faceFilled: portraitFilled(boxRgb(image, box)),
+          teamRim: portraitTeamRim(image.width, image.height, box, pixelAt),
+          plate: plateFill(boxRgb(image, nameBox)),
+          ally,
+        })
+      ) {
+        return [];
+      }
+      return [{ hero: read.hero, player: read.player }];
+    });
+  const seatLocked = (ally: boolean, slots: readonly DraftBox[], nameSlots: readonly DraftBox[]) =>
+    slots.map((box, index) => {
+      const nameBox = nameSlots[index];
+      return portraitIsLocked({
+        phase,
+        faceFilled: portraitFilled(boxRgb(image, box)),
+        teamRim: portraitTeamRim(image.width, image.height, box, pixelAt),
+        plate: nameBox ? plateFill(boxRgb(image, nameBox)) : undefined,
+        ally,
+      });
+    });
+  const ourPicks = lockedPicks(true, DRAFT_PLATE_SLOTS.left, DRAFT_SLOT_NAMES.left, leftReads);
+  const theirPicks = lockedPicks(
+    false,
+    DRAFT_PLATE_SLOTS.right,
+    DRAFT_SLOT_NAMES.right,
+    rightReads,
+  );
+  const ourOpen = openSeatPlayers(
+    leftReads,
+    seatLocked(true, DRAFT_PLATE_SLOTS.left, DRAFT_SLOT_NAMES.left),
+  );
+  const theirOpen = openSeatPlayers(
+    rightReads,
+    seatLocked(false, DRAFT_PLATE_SLOTS.right, DRAFT_SLOT_NAMES.right),
+  );
   const ourBans = DRAFT_BAN_HEXES.left.flatMap((box) => {
     const crop = cropRgb(image, box);
     if (!banHexFilled(crop.pixels)) return [];
@@ -210,13 +240,22 @@ async function loadLobby(file: string) {
     return hero ? [hero] : [];
   });
   const firstPick =
-    inferFirstPick({
-      ourPicks: ourPicks.length,
-      theirPicks: theirPicks.length,
-      phase,
-      turnSide: turn,
-    }) ??
-    (ourPicks.length + theirPicks.length === 0 ? firstBanSideFromStatus(statusText) : null);
+    ourPicks.length + theirPicks.length > 0
+      ? (() => {
+          const usFits = pickCountsFit(true, ourPicks.length, theirPicks.length);
+          const themFits = pickCountsFit(false, ourPicks.length, theirPicks.length);
+          if (usFits && !themFits) return "us";
+          if (themFits && !usFits) return "them";
+          return (
+            inferFirstPick({
+              ourPicks: ourPicks.length,
+              theirPicks: theirPicks.length,
+              phase,
+              turnSide: turn,
+            }) ?? null
+          );
+        })()
+      : (firstBanSideFromStatus(statusText) ?? null);
   const progress =
     firstPick == null
       ? null
@@ -258,8 +297,12 @@ async function loadLobby(file: string) {
     leftLocks: locks(leftReads, leftFaces),
     rightLocks: locks(rightReads, rightFaces),
     firstPick,
+    ourPicks,
+    theirPicks,
     order: progress?.actions ?? [],
     next: progress?.next ?? null,
+    ourOpen,
+    theirOpen,
   };
 }
 
@@ -317,6 +360,25 @@ describe("draft lobby screenshots", () => {
       expect(draft.firstPick).toBe("us");
       expect(listed(draft.order)).toEqual([]);
       expect(draft.next).toEqual({ side: "our", kind: "ban" });
+      expect(draft.ourOpen.map(folded)).toEqual([
+        ocrFold("BurnBlade"),
+        ocrFold("Answered"),
+        ocrFold("HuckIt"),
+        ocrFold("ArcKane"),
+        ocrFold("Gatcan"),
+      ]);
+      expect(draft.theirOpen.map(folded)).toEqual([
+        ocrFold("Trinity"),
+        ocrFold("STigma"),
+        ocrFold("AzureWhale"),
+        ocrFold("sofresh"),
+      ]);
+      expect(nextStepSuggestion(DRAFT_ORDER, draft.order.length)).toEqual({
+        side: "fp",
+        kind: "ban",
+        picks: 1,
+        last: false,
+      });
     },
     180_000,
   );
@@ -364,6 +426,17 @@ describe("draft lobby screenshots", () => {
       ]);
       expect(draft.firstPick).toBe("us");
       expect(draft.next).toEqual({ side: "our", kind: "pick" });
+      expect(draft.ourOpen.map(folded)).toEqual([
+        ocrFold("Dante"),
+        ocrFold("hiimrick"),
+      ]);
+      expect(draft.theirOpen.map(folded)).toEqual([ocrFold("SKilleen")]);
+      expect(nextStepSuggestion(DRAFT_ORDER, draft.order.length)).toEqual({
+        side: "fp",
+        kind: "pick",
+        picks: 2,
+        last: true,
+      });
       expect(listed(draft.order)).toEqual([
         ["our", "ban", "Johanna", ""],
         ["their", "ban", "Qhira", ""],
@@ -378,6 +451,27 @@ describe("draft lobby screenshots", () => {
         ["our", "ban", "Tyrael", ""],
         ["their", "pick", "Nazeebo", ocrFold("Cinema")],
         ["their", "pick", "Stitches", ocrFold("Silver")],
+      ]);
+    },
+    180_000,
+  );
+
+  it(
+    "loads the Alterac Pass pick lobby without counting hovers as locks",
+    async () => {
+      const draft = await loadLobby(path.join(DRAFTS, "draft lobby alterac.png"));
+      expect(draft.map).toBe("Alterac Pass");
+      expect(draft.firstPick).toBe("us");
+      expect(draft.ourPicks.map((pick) => pick.hero)).toEqual(["Qhira"]);
+      expect(draft.theirPicks.map((pick) => pick.hero)).toEqual(["Brightwing", "Abathur"]);
+      expect(listed(draft.order)).toEqual([
+        ["our", "ban", "Johanna", ""],
+        ["their", "ban", "Hogger", ""],
+        ["our", "ban", "Zeratul", ""],
+        ["their", "ban", "Xal'atath", ""],
+        ["our", "pick", "Qhira", ocrFold("HuckIt")],
+        ["their", "pick", "Brightwing", ocrFold("AmateurDead")],
+        ["their", "pick", "Abathur", ocrFold("vsierra01")],
       ]);
     },
     180_000,

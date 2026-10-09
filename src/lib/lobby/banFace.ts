@@ -1,9 +1,10 @@
 import type { Rgb } from "@/lib/lobby/screenLobby";
 import catalogJson from "@/lib/lobby/banPortraits.json";
+import banHexCatalogJson from "@/lib/lobby/banHexCatalog.json";
 
 export type BanFace = { color: number[]; hog: number[] };
 
-type CatalogRow = {
+export type BanCatalogRow = {
   hero: string;
   color: number[];
   hog: number[];
@@ -12,7 +13,11 @@ type CatalogRow = {
   gray?: string;
 };
 
-const CATALOG = catalogJson as CatalogRow[];
+/** Official target portraits plus saved ban-hex crops that fuzzy-match at ~100%. */
+const CATALOG: BanCatalogRow[] = [
+  ...(catalogJson as BanCatalogRow[]),
+  ...(banHexCatalogJson as BanCatalogRow[]),
+];
 
 /** A ban is named only when one portrait leads the rest of the roster. */
 const MIN_SCORE = 0.66;
@@ -48,7 +53,7 @@ export function banFaceScore(query: BanFace, example: BanFace): number {
 }
 
 /** The hero whose saved portrait is this ban face. Unclear faces stay unnamed. */
-export function matchBanFace(query: BanFace, rows: readonly CatalogRow[] = CATALOG): string | null {
+export function matchBanFace(query: BanFace, rows: readonly BanCatalogRow[] = CATALOG): string | null {
   let best: { hero: string; score: number } | null = null;
   let second = -Infinity;
   for (const row of rows) {
@@ -60,6 +65,30 @@ export function matchBanFace(query: BanFace, rows: readonly CatalogRow[] = CATAL
   }
   if (!best || best.score < MIN_SCORE || best.score - second < MIN_MARGIN) return null;
   return best.hero;
+}
+
+/**
+ * Build a catalog row from a saved ban hex. The same read against this row
+ * scores ~1.0 on the color + HOG fingerprint.
+ */
+export function catalogRowFromBanHex(
+  hero: string,
+  pixels: readonly Rgb[],
+  width: number,
+  height: number,
+): BanCatalogRow | null {
+  const face = banFace(pixels, width, height);
+  if (!face) return null;
+  const luma = lumaOf(pixels, width, height);
+  const bytes = new Uint8Array(width * height);
+  for (let i = 0; i < bytes.length; i++) {
+    bytes[i] = Math.round(Math.min(255, luma[i] ?? 0));
+  }
+  const gray =
+    typeof Buffer !== "undefined"
+      ? Buffer.from(bytes).toString("base64")
+      : btoa(String.fromCharCode(...bytes));
+  return { hero, color: face.color, hog: face.hog, gw: width, gh: height, gray };
 }
 
 export function matchBanPixels(
@@ -104,7 +133,7 @@ function lumaOf(pixels: readonly Rgb[], width: number, height: number): Float32A
   return out;
 }
 
-function rowLuma(row: CatalogRow): { data: Float32Array; w: number; h: number } | null {
+function rowLuma(row: BanCatalogRow): { data: Float32Array; w: number; h: number } | null {
   if (!row.gray || !row.gw || !row.gh) return null;
   const bytes = decode64(row.gray);
   if (bytes.length < row.gw * row.gh) return null;

@@ -10,9 +10,17 @@ import {
   SYNERGY_DUO,
   type DraftMetaTable,
 } from "@/lib/scoring/draftMeta";
+import {
+  comfortPickPoints,
+  stormLeagueScore,
+} from "@/lib/scoring/comfort";
 import { heroKey } from "@/lib/scoring/heroMeta";
-import { checkRequiredRoles } from "@/lib/scoring/roles";
-import type { DraftCompPick } from "@/lib/scoring/types";
+import {
+  assignRequiredRoles,
+  checkRequiredRoles,
+  type RequiredRole,
+} from "@/lib/scoring/roles";
+import type { DraftCompPick, PlayerScout } from "@/lib/scoring/types";
 
 /** True when this step starts a same-side pick-pick double. */
 export function isDoublePickWindow(
@@ -28,6 +36,42 @@ export function isDoublePickWindow(
       b.kind === "pick" &&
       a.side === b.side,
   );
+}
+
+export type NextStepSuggestion = {
+  side: "fp" | "sp";
+  kind: "ban" | "pick";
+  /** 1 for one lock. 2 when this step starts a same-side double. */
+  picks: 1 | 2;
+  /** This side has no pick after this lock, or after this double. */
+  last: boolean;
+};
+
+/** What the suggestion should be for the next unplayed draft-order step. */
+export function nextStepSuggestion(
+  order: readonly { side: "fp" | "sp"; kind: "ban" | "pick" }[],
+  completed: number,
+): NextStepSuggestion | null {
+  const step = order[completed];
+  if (!step) return null;
+  if (step.kind === "ban") {
+    return { side: step.side, kind: "ban", picks: 1, last: false };
+  }
+  const pair = isDoublePickWindow(order, completed);
+  const after = completed + (pair ? 2 : 1);
+  let later = false;
+  for (let i = after; i < order.length; i++) {
+    if (order[i]?.kind === "pick" && order[i]?.side === step.side) {
+      later = true;
+      break;
+    }
+  }
+  return {
+    side: step.side,
+    kind: "pick",
+    picks: pair ? 2 : 1,
+    last: !later,
+  };
 }
 
 export type PairSeatCand = {
@@ -314,4 +358,212 @@ export function rankDoublePickPairs(args: {
     .sort((a, b) => b.total - a.total || a.first.localeCompare(b.first))
     .slice(0, maxPairs)
     .map(({ key: _k, ...rest }) => rest);
+}
+
+/** Points added for each required role this pair covers that was still open. */
+const ROLE_SPLIT_BONUS = 24;
+
+export type OpenSeatHeroOption = {
+  hero: string;
+  /** Storm League score used to rank the hero. */
+  sl: number;
+  games: number;
+  comfort: number;
+};
+
+export type OpenSeatPairLock = {
+  player: string;
+  hero: string;
+  /** Required role this hero is counted as filling, or the hero's own role. */
+  role: string;
+  sl: number;
+  games: number;
+  comfort: number;
+};
+
+export type OpenSeatPair = {
+  first: OpenSeatPairLock;
+  second: OpenSeatPairLock;
+  /** "tank + healer", or "double ranged damage" when both fill the same job. */
+  roleSplit: string;
+};
+
+function splitRoleLabel(role: RequiredRole | undefined): string {
+  switch (role) {
+    case "tank":
+      return "Tank";
+    case "healer":
+      return "Healer";
+    case "offlane":
+      return "Offlane";
+    case "ranged damage":
+      return "Ranged";
+    default:
+      return "Flex";
+  }
+}
+
+/**
+ * Roles the two locks fill once the heroes already locked have taken theirs.
+ * A hero with no required role left is Flex.
+ */
+export function predictPairRoleSplit(
+  locked: readonly string[],
+  first: string,
+  second: string,
+): { firstRole: string; secondRole: string; label: string } {
+  const assigned = assignRequiredRoles([...locked, first, second]);
+  const firstRole = splitRoleLabel(assigned.get(locked.length));
+  const secondRole = splitRoleLabel(assigned.get(locked.length + 1));
+  const label =
+    firstRole === secondRole ? `double ${firstRole}` : `${firstRole} + ${secondRole}`;
+  return { firstRole, secondRole, label };
+}
+
+function newlyCoveredRoles(
+  locked: readonly string[],
+  first: string,
+  second: string,
+): number {
+  const before = new Set(assignRequiredRoles(locked).values());
+  const after = assignRequiredRoles([...locked, first, second]);
+  let covered = 0;
+  for (const index of [locked.length, locked.length + 1]) {
+    const role = after.get(index);
+    if (role && !before.has(role)) covered += 1;
+  }
+  return covered;
+}
+
+/**
+ * Best hero pairs for the players still picking.
+ * Comfort picks the hero. Covering a required role that is still open
+ * outranks a second hero in a role the team already has.
+ * Locks stay in open-seat order.
+ */
+export function rankOpenSeatPairs(args: {
+  seats: { player: string; heroes: OpenSeatHeroOption[] }[];
+  lockedHeroes: readonly string[];
+  maxPairs?: number;
+}): OpenSeatPair[] {
+  const maxPairs = args.maxPairs ?? 3;
+  if (args.seats.length < 2) return [];
+  const ranked: (OpenSeatPair & { total: number })[] = [];
+  for (let i = 0; i < args.seats.length; i++) {
+    for (let j = i + 1; j < args.seats.length; j++) {
+      const earlier = args.seats[i];
+      const later = args.seats[j];
+      for (const a of earlier.heroes) {
+        for (const b of later.heroes) {
+          if (heroKey(a.hero) === heroKey(b.hero)) continue;
+          const split = predictPairRoleSplit(args.lockedHeroes, a.hero, b.hero);
+          const total =
+            comfortPickPoints(a.sl) +
+            comfortPickPoints(b.sl) +
+            newlyCoveredRoles(args.lockedHeroes, a.hero, b.hero) * ROLE_SPLIT_BONUS +
+            checkRequiredRoles([...args.lockedHeroes, a.hero, b.hero]).points;
+          ranked.push({
+            first: {
+              player: earlier.player,
+              hero: a.hero,
+              role: split.firstRole,
+              sl: a.sl,
+              games: a.games,
+              comfort: a.comfort,
+            },
+            second: {
+              player: later.player,
+              hero: b.hero,
+              role: split.secondRole,
+              sl: b.sl,
+              games: b.games,
+              comfort: b.comfort,
+            },
+            roleSplit: split.label,
+            total,
+          });
+        }
+      }
+    }
+  }
+  ranked.sort(
+    (a, b) =>
+      b.total - a.total ||
+      a.first.hero.localeCompare(b.first.hero) ||
+      a.second.hero.localeCompare(b.second.hero),
+  );
+  return ranked.slice(0, maxPairs).map(({ total: _total, ...pair }) => pair);
+}
+
+function plateName(tag: string): string {
+  return tag.split("#")[0]?.trim() ?? "";
+}
+
+/**
+ * Double-pick window for the live screen: one pair from the open seats'
+ * Storm League pools, with the role split that pair is predicted to fill.
+ */
+export function openSeatDoublePick(args: {
+  openPlayers: readonly string[];
+  roster: readonly PlayerScout[];
+  gone: ReadonlySet<string>;
+  lockedHeroes: readonly string[];
+}): OpenSeatPair[] {
+  const goneKeys = new Set([...args.gone].map((hero) => heroKey(hero)));
+  for (const hero of args.lockedHeroes) goneKeys.add(heroKey(hero));
+  const seats: { player: string; heroes: OpenSeatHeroOption[] }[] = [];
+  for (const player of args.openPlayers) {
+    const shown = plateName(player);
+    const key = shown.toLowerCase();
+    if (!shown) continue;
+    const scout = args.roster.find(
+      (row) => plateName(row.battletag).toLowerCase() === key,
+    );
+    if (!scout) continue;
+    const heroes: OpenSeatHeroOption[] = [];
+    const seen = new Set<string>();
+    const pool = [...scout.topHeroes].sort((a, b) => {
+      const as = a.sources.stormLeague ? stormLeagueScore(a.sources.stormLeague) : 0;
+      const bs = b.sources.stormLeague ? stormLeagueScore(b.sources.stormLeague) : 0;
+      return bs - as || a.hero.localeCompare(b.hero);
+    });
+    for (const hero of pool) {
+      const source = hero.sources.stormLeague;
+      if (!source || source.games <= 0) continue;
+      const sl = stormLeagueScore(source);
+      if (sl <= 0) continue;
+      const id = heroKey(hero.hero);
+      if (goneKeys.has(id) || seen.has(id)) continue;
+      seen.add(id);
+      heroes.push({
+        hero: hero.hero,
+        sl,
+        games: source.games,
+        comfort: hero.comfort,
+      });
+      if (heroes.length >= 4) break;
+    }
+    if (heroes.length) seats.push({ player: shown, heroes });
+  }
+  return rankOpenSeatPairs({ seats, lockedHeroes: args.lockedHeroes });
+}
+
+/** Sentence for the live suggestion. Our double names who locks which hero. */
+export function describeOpenSeatPair(args: {
+  pair: OpenSeatPair;
+  side: "our" | "their";
+  last: boolean;
+}): string {
+  const { pair, side, last } = args;
+  const lead = last
+    ? side === "our"
+      ? "Next is our last picks."
+      : "Next is their last picks."
+    : side === "our"
+      ? "Next is our double."
+      : "Next is their double.";
+  if (side === "our") {
+    return `${lead} ${pair.first.player} locks ${pair.first.hero}, ${pair.second.player} locks ${pair.second.hero}. Role split: ${pair.roleSplit}.`;
+  }
+  return `${lead} Role split: ${pair.roleSplit} (${pair.first.hero} + ${pair.second.hero}).`;
 }

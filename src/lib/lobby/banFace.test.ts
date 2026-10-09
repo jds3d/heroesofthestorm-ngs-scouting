@@ -6,6 +6,7 @@ import { decodePng } from "@/lib/lobby/pngImage";
 import type { Rgb } from "@/lib/lobby/screenLobby";
 
 const LOBBY = path.join(process.cwd(), "examples", "drafts", "draft lobby volskaya.png");
+const ALTERAC = path.join(process.cwd(), "examples", "drafts", "draft lobby alterac 2.png");
 
 function crop(file: string, x0: number, y0: number, x1: number, y1: number): string | null {
   const image = decodePng(readFileSync(file));
@@ -35,5 +36,16 @@ describe("ban portraits", () => {
       crop(LOBBY, 1972, 22, 2046, 118),
       crop(LOBBY, 2104, 22, 2178, 118),
     ]).toEqual(["Johanna", "Sgt. Hammer", "Tyrael", "Qhira", "Xal'atath", "E.T.C."]);
-  });
+  }, 20_000);
+
+  it("names Hogger and Whitemane on the Alterac Pass bans", () => {
+    expect([
+      crop(ALTERAC, 378, 22, 452, 118),
+      crop(ALTERAC, 510, 22, 584, 118),
+      crop(ALTERAC, 642, 22, 716, 118),
+      crop(ALTERAC, 1840, 22, 1914, 118),
+      crop(ALTERAC, 1972, 22, 2046, 118),
+      crop(ALTERAC, 2104, 22, 2178, 118),
+    ]).toEqual(["Johanna", "Zeratul", "Illidan", "Hogger", "Xal'atath", "Whitemane"]);
+  }, 20_000);
 });

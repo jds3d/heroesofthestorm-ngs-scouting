@@ -1,4 +1,7 @@
+import { readFileSync } from "node:fs";
+import path from "node:path";
 import { describe, expect, it } from "vitest";
+import { decodePng } from "@/lib/lobby/pngImage";
 import {
   UNSEEN_BAN,
   actionsFromObserved,
@@ -6,6 +9,7 @@ import {
   bannerTurn,
   colorfulFraction,
   firstBanSideFromStatus,
+  openSeatPlayers,
   portraitFilled,
   readSlotPlate,
   readsBySlot,
@@ -25,7 +29,6 @@ import {
   heroesFromColumn,
   nameFromPlate,
   namesFromOcrLines,
-  lobbyNamesFromOcr,
   draftLobbySeen,
   mapFromTitle,
   menuScreenSeen,
@@ -47,10 +50,14 @@ import {
   portraitScore,
   platesForLines,
   dropShownLocks,
+  pruneHoverPicks,
   draftHeroList,
   sideFromTeamSplash,
   borderLooksLocked,
   borderLooksLockedSamples,
+  DRAFT_PLATE_SLOTS,
+  portraitIsLocked,
+  portraitTeamRim,
   rememberHeroes,
   playerFromSlotText,
   takeNewLocks,
@@ -60,27 +67,20 @@ import {
   turnFromOcr,
 } from "./screenLobby";
 
-const OURS = ["Beachyman", "HuckIt", "MoJoE", "MrHustler", "Topgun707"];
-
-describe("lobbyNamesFromOcr", () => {
-  it("keeps the five names that are not us, heroes, or lobby chrome", () => {
-    const text = `
-      STORM LEAGUE
-      Beachyman HuckIt MoJoE MrHustler Topgun707
-      Stark chesslooter EkeeB Iron Shuman
-      BAN PICK Johanna Alterac Pass
-    `;
-    expect(lobbyNamesFromOcr(text, OURS)).toEqual([
-      "Stark",
-      "chesslooter",
-      "EkeeB",
-      "Iron",
-      "Shuman",
-    ]);
-  });
-
-  it("returns a short list when the screen does not show five opponents", () => {
-    expect(lobbyNamesFromOcr("BAN PICK Johanna", OURS)).toEqual([]);
+describe("openSeatPlayers", () => {
+  it("keeps every unlocked name and drops a player who already locked", () => {
+    expect(
+      openSeatPlayers(
+        [
+          { player: "L337" },
+          { player: "Dante" },
+          { player: "HuckIt" },
+          { player: "hiimrick" },
+          { player: "Magic" },
+        ],
+        [true, false, true, false, true],
+      ),
+    ).toEqual(["Dante", "hiimrick"]);
   });
 });
 
@@ -183,6 +183,72 @@ describe("draft locks from the screen", () => {
   it("treats a bright rim as locked and a dark rim as still open", () => {
     expect(borderLooksLocked([30, 40, 180, 200, 210, 190, 205, 170, 40, 35])).toBe(true);
     expect(borderLooksLocked([20, 30, 25, 40, 35, 30, 28, 32, 22, 26])).toBe(false);
+    const locked = { blue: 28, red: 0 };
+    const hover = { blue: 7, red: 0 };
+    expect(portraitIsLocked({ phase: "ban", faceFilled: true, teamRim: locked })).toBe(false);
+    expect(portraitIsLocked({ phase: "pick", faceFilled: true, teamRim: hover })).toBe(false);
+    expect(portraitIsLocked({ phase: null, faceFilled: true, teamRim: locked })).toBe(true);
+    expect(portraitIsLocked({ phase: "pick", faceFilled: false, teamRim: locked })).toBe(false);
+  });
+
+  it("leaves the Alterac Tyrande hover unlocked", () => {
+    const image = decodePng(
+      readFileSync(path.join(process.cwd(), "examples", "drafts", "draft lobby alterac 2.png")),
+    );
+    const pixelAt = (x: number, y: number) => {
+      const px = Math.max(0, Math.min(image.width - 1, x));
+      const py = Math.max(0, Math.min(image.height - 1, y));
+      const i = (py * image.width + px) * 4;
+      return { r: image.data[i] ?? 0, g: image.data[i + 1] ?? 0, b: image.data[i + 2] ?? 0 };
+    };
+    const locked = (box: (typeof DRAFT_PLATE_SLOTS.left)[number]) => {
+      const x = Math.round(box.x * image.width);
+      const y = Math.round(box.y * image.height);
+      const w = Math.round(box.w * image.width);
+      const h = Math.round(box.h * image.height);
+      const pixels = [];
+      for (let row = 0; row < h; row++) {
+        for (let col = 0; col < w; col++) {
+          pixels.push(pixelAt(x + col, y + row));
+        }
+      }
+      return portraitIsLocked({
+        phase: "pick",
+        faceFilled: portraitFilled(pixels),
+        teamRim: portraitTeamRim(image.width, image.height, box, pixelAt),
+      });
+    };
+    expect(DRAFT_PLATE_SLOTS.left.map(locked)).toEqual([true, false, true, true, true]);
+    expect(DRAFT_PLATE_SLOTS.right.map(locked)).toEqual([true, false, true, true, true]);
+  });
+
+  it("keeps the Volskaya highlight unlocked and the colored rims locked", () => {
+    const image = decodePng(
+      readFileSync(path.join(process.cwd(), "examples", "drafts", "draft lobby volskaya.png")),
+    );
+    const pixelAt = (x: number, y: number) => {
+      const px = Math.max(0, Math.min(image.width - 1, x));
+      const py = Math.max(0, Math.min(image.height - 1, y));
+      const i = (py * image.width + px) * 4;
+      return { r: image.data[i] ?? 0, g: image.data[i + 1] ?? 0, b: image.data[i + 2] ?? 0 };
+    };
+    const locked = (box: (typeof DRAFT_PLATE_SLOTS.left)[number]) => {
+      const x = Math.round(box.x * image.width);
+      const y = Math.round(box.y * image.height);
+      const w = Math.round(box.w * image.width);
+      const h = Math.round(box.h * image.height);
+      const pixels = [];
+      for (let row = 0; row < h; row++) {
+        for (let col = 0; col < w; col++) pixels.push(pixelAt(x + col, y + row));
+      }
+      return portraitIsLocked({
+        phase: "pick",
+        faceFilled: portraitFilled(pixels),
+        teamRim: portraitTeamRim(image.width, image.height, box, pixelAt),
+      });
+    };
+    expect(DRAFT_PLATE_SLOTS.left.map(locked)).toEqual([true, false, true, false, true]);
+    expect(DRAFT_PLATE_SLOTS.right.map(locked)).toEqual([true, true, false, true, true]);
   });
 
   it("treats a blue or red team glow as locked and a dim purple background as open", () => {
@@ -482,14 +548,10 @@ describe("draft locks from the screen", () => {
     expect(watchPhase(menu, true)).toBe("menu");
   });
 
-  it("reads the five party names and ignores the queue menu", () => {
+  it("reads the five party names from the party-row crop", () => {
     expect(
-      partyNamesFromText(
-        "Topgun707 Beachyman HuckIt MoJoE MrHustler\nPlatinum Gold Diamond\nQuick Match Searching",
-      ),
+      partyNamesFromText("Topgun707 Beachyman HuckIt MoJoE MrHustler"),
     ).toEqual(["Topgun707", "Beachyman", "HuckIt", "MoJoE", "MrHustler"]);
-    expect(partyNamesFromText("Quick Match\nQuic Jers")).toEqual([]);
-    expect(namesFromColumn("Quic")).toEqual([]);
   });
 
   it("reads RED PICK as their turn when we are on the left", () => {
@@ -605,6 +667,8 @@ describe("draft locks from the screen", () => {
     expect(readSlotPlate(["DBIUS", "Answered"])).toEqual({ hero: null, player: "Answered" });
     expect(readSlotPlate(["hiimrick"])).toEqual({ hero: null, player: "hiimrick" });
     expect(readSlotPlate(["STITCHES", "Silver"])).toEqual({ hero: "Stitches", player: "Silver" });
+    expect(readSlotPlate(["TYRANDE", "Level"])).toEqual({ hero: "Tyrande", player: "Level" });
+    expect(nameFromPlate("Level")).toBe("Level");
     expect(readSlotPlate(["HanFOTS", "ANUB'ARAK", "MaXiMus"])).toEqual({
       hero: "Anub'arak",
       player: "MaXiMus",
@@ -675,6 +739,16 @@ describe("draft locks from the screen", () => {
     expect(acceptPortraitExample(valla ?? [], "Valla", [{ hero: "Valla", vector: valla ?? [] }])).toBe(
       false,
     );
+  });
+
+  it("drops a hover hero that was briefly remembered as a pick", () => {
+    expect(
+      pruneHoverPicks(
+        ["Greymane", "Qhira"],
+        ["goz", "HuckIt"],
+        ["Greymane", "Alarak"],
+      ),
+    ).toEqual({ heroes: ["Qhira"], players: ["HuckIt"] });
   });
 
   it("locks the whitish plate and leaves the blue plate as shown", () => {

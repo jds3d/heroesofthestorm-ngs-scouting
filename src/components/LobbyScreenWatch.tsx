@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import { TimeLeftBar } from "@/components/TimeLeftBar";
 import { heroKey } from "@/lib/scoring/heroMeta";
 import { matchBanPixels } from "@/lib/lobby/banFace";
 import type { Worker } from "tesseract.js";
@@ -24,7 +25,12 @@ import {
   inferFirstPick,
   pickCountsFit,
   PARTY_NAME_ROW,
+  openSeatPlayers,
   portraitFilled,
+  plateFill,
+  portraitIsLocked,
+  portraitTeamRim,
+  pruneHoverPicks,
   readsBySlot,
   draftHeroList,
   partyNamesFromText,
@@ -44,6 +50,7 @@ import {
   turnFromOcr,
   watchPhase,
   type DraftBox,
+  type PlateFill,
   type LiveDraft,
   type OpenTurn,
   type Rgb,
@@ -225,6 +232,32 @@ function straightenedPlate(frame: HTMLCanvasElement, box: Box): HTMLCanvasElemen
   return plate;
 }
 
+function screenLoad(status: string): {
+  label: string;
+  expectedMs: number;
+  resetKey: string;
+} | null {
+  if (status.startsWith("In queue. Loading Storm League")) {
+    const names = status
+      .replace(/^In queue\. Loading Storm League for /, "")
+      .replace(/\.$/, "");
+    const count = names.split(",").map((name) => name.trim()).filter(Boolean).length;
+    return {
+      label: status,
+      expectedMs: 15_000 + Math.max(1, count) * 3_000,
+      resetKey: names,
+    };
+  }
+  if (status.startsWith("Draft reset.")) {
+    return {
+      label: "Reading this screen from scratch.",
+      expectedMs: 18_000,
+      resetKey: "draft-reset",
+    };
+  }
+  return null;
+}
+
 export function LobbyScreenWatch({
   ourNames,
   rosterNames,
@@ -232,6 +265,7 @@ export function LobbyScreenWatch({
   onOurSide,
   onDraft,
   onWatchingChange,
+  onReplaySync,
   resetEpoch = 0,
 }: {
   ourNames: string[];
@@ -242,6 +276,8 @@ export function LobbyScreenWatch({
   onOurSide?: (names: string[]) => void;
   onDraft: (draft: LiveDraft) => void;
   onWatchingChange?: (watching: boolean) => void;
+  /** Pull new `.StormReplay` files into the battletag cache before a draft or after a game. */
+  onReplaySync?: () => void | Promise<void>;
   /** Bump to drop the last game and read the current screen from scratch. */
   resetEpoch?: number;
 }) {
@@ -271,8 +307,13 @@ export function LobbyScreenWatch({
   const facesRef = useRef<FaceRow[]>([]);
   const frameSavedRef = useRef(false);
   const inDraftRef = useRef(false);
+  const onReplaySyncRef = useRef(onReplaySync);
   const leftNamesRef = useRef<string[]>([]);
   const rightNamesRef = useRef<string[]>([]);
+
+  useEffect(() => {
+    onReplaySyncRef.current = onReplaySync;
+  }, [onReplaySync]);
 
   useEffect(() => {
     oursRef.current = ourNames;
@@ -409,10 +450,20 @@ function stackNameplates(frame: HTMLCanvasElement, boxes: readonly DraftBox[]): 
   return plate;
 }
 
-function faceFilled(frame: HTMLCanvasElement, box: DraftBox): boolean {
-  const ctx = frame.getContext("2d");
-  if (!ctx) return false;
-  return portraitFilled(sampleBox(ctx, frame, box));
+function framePixelAt(
+  ctx: CanvasRenderingContext2D,
+  frame: HTMLCanvasElement,
+): ((x: number, y: number) => Rgb) | null {
+  let data: Uint8ClampedArray;
+  try {
+    data = ctx.getImageData(0, 0, frame.width, frame.height).data;
+  } catch {
+    return null;
+  }
+  return (x, y) => {
+    const i = (y * frame.width + x) * 4;
+    return { r: data[i] ?? 0, g: data[i + 1] ?? 0, b: data[i + 2] ?? 0 };
+  };
 }
 
 /** Names and locked heroes from the five slots on each side. */
@@ -421,8 +472,28 @@ async function readLobby(
 ): Promise<{
   left: string[];
   right: string[];
-  leftLocks: { hero: string; player: string | null; slot: number }[];
-  rightLocks: { hero: string; player: string | null; slot: number }[];
+  leftSlots: {
+    hero: string;
+    player: string | null;
+    slot: number;
+    plate: PlateFill;
+    faceFilled: boolean;
+    teamRim: { blue: number; red: number };
+    ally: boolean;
+  }[];
+  rightSlots: {
+    hero: string;
+    player: string | null;
+    slot: number;
+    plate: PlateFill;
+    faceFilled: boolean;
+    teamRim: { blue: number; red: number };
+    ally: boolean;
+  }[];
+  leftShown: string[];
+  rightShown: string[];
+  leftReads: { hero: string | null; player: string | null }[];
+  rightReads: { hero: string | null; player: string | null }[];
   picksLeft: OcrLine[];
   picksRight: OcrLine[];
   leftPicking: boolean;
@@ -452,32 +523,56 @@ async function readLobby(
   };
   const leftReads = readsBySlot(data.left ?? []);
   const rightReads = readsBySlot(data.right ?? []);
-  const leftFaces = DRAFT_PLATE_SLOTS.left.map((box) => faceFilled(frame, box));
-  const rightFaces = DRAFT_PLATE_SLOTS.right.map((box) => faceFilled(frame, box));
+  const ctx = frame.getContext("2d");
+  const pixelAt = ctx ? framePixelAt(ctx, frame) : null;
+  const slots = (
+    ally: boolean,
+    reads: { hero: string | null; player: string | null }[],
+    portraitBoxes: readonly DraftBox[],
+    nameBoxes: readonly DraftBox[],
+  ) =>
+    reads.flatMap((read, index) => {
+      const box = portraitBoxes[index];
+      const nameBox = nameBoxes[index];
+      if (!read.hero || !box || !nameBox || !ctx || !pixelAt) return [];
+      const plate = plateFill(sampleBox(ctx, frame, nameBox));
+      return [
+        {
+          hero: read.hero,
+          player: read.player,
+          slot: index,
+          plate,
+          faceFilled: portraitFilled(sampleBox(ctx, frame, box)),
+          teamRim: portraitTeamRim(frame.width, frame.height, box, pixelAt),
+          ally,
+        },
+      ];
+    });
+  const shownHeroes = (
+    reads: { hero: string | null; player: string | null }[],
+    nameBoxes: readonly DraftBox[],
+  ) => {
+    if (!ctx) return [];
+    return reads.flatMap((read, index) => {
+      const nameBox = nameBoxes[index];
+      if (!read.hero || !nameBox) return [];
+      if (plateFill(sampleBox(ctx, frame, nameBox)) !== "shown") return [];
+      return [read.hero];
+    });
+  };
   const players = (reads: { hero: string | null; player: string | null }[]) =>
     reads.flatMap((read) => (read.player ? [read.player] : []));
   const leftNames = players(leftReads);
   const rightNames = players(rightReads);
-  const known = [...leftNames, ...rightNames, ...rosterRef.current];
-  const locks = (
-    reads: { hero: string | null; player: string | null }[],
-    faces: boolean[],
-  ) =>
-    reads.flatMap((read, index) => {
-      if (!faces[index] || !read.hero) return [];
-      return [
-        {
-          hero: read.hero,
-          player: read.player ? snapToRoster(read.player, known) : null,
-          slot: index,
-        },
-      ];
-    });
   return {
     left: leftNames,
     right: rightNames,
-    leftLocks: locks(leftReads, leftFaces),
-    rightLocks: locks(rightReads, rightFaces),
+    leftSlots: slots(true, leftReads, DRAFT_PLATE_SLOTS.left, DRAFT_SLOT_NAMES.left),
+    rightSlots: slots(false, rightReads, DRAFT_PLATE_SLOTS.right, DRAFT_SLOT_NAMES.right),
+    leftShown: shownHeroes(leftReads, DRAFT_SLOT_NAMES.left),
+    rightShown: shownHeroes(rightReads, DRAFT_SLOT_NAMES.right),
+    leftReads,
+    rightReads,
     picksLeft: [],
     picksRight: [],
     leftPicking: false,
@@ -549,6 +644,8 @@ async function readLobby(
           screenPhase === "menu" &&
           (inDraftRef.current || lastOursKeyRef.current || lastKeyRef.current)
         ) {
+          await onReplaySyncRef.current?.();
+          if (epoch !== epochRef.current) return;
           clearObserved();
         } else if (screenPhase === "wait") {
           forgetNames();
@@ -559,6 +656,10 @@ async function readLobby(
             : "Watching the main screen. Waiting for the draft.",
         );
         return;
+      }
+      if (!inDraftRef.current) {
+        await onReplaySyncRef.current?.();
+        if (epoch !== epochRef.current) return;
       }
       inDraftRef.current = true;
       const lobbyPromise = readLobby(frame);
@@ -585,12 +686,35 @@ async function readLobby(
           player: lock.player ? snapToRoster(lock.player, knownNames) : null,
           slot: lock.slot,
         }));
-      const leftLocked = snapPlate(lobby?.leftLocks ?? []);
-      const rightLocked = snapPlate(lobby?.rightLocks ?? []);
+      const banPhase = banner.phase === "ban" || centerRead.phase === "ban";
+      const platePhase = banPhase ? "ban" : (banner.phase ?? centerRead.phase);
+      const lockedSlots = (
+        rows: {
+          hero: string;
+          player: string | null;
+          slot: number;
+          plate: PlateFill;
+          faceFilled: boolean;
+          teamRim: { blue: number; red: number };
+          ally: boolean;
+        }[],
+      ) =>
+        snapPlate(
+          rows.filter((row) =>
+            portraitIsLocked({
+              phase: platePhase,
+              faceFilled: row.faceFilled,
+              teamRim: row.teamRim,
+              plate: row.plate,
+              ally: row.ally,
+            }),
+          ),
+        );
+      const leftLocked = lockedSlots(lobby?.leftSlots ?? []);
+      const rightLocked = lockedSlots(lobby?.rightSlots ?? []);
       const slotted = slotsHoldPicks(leftLocked.length + rightLocked.length);
       const fromSlots = null;
-      const banPhase = banner.phase === "ban" || centerRead.phase === "ban";
-      if (slotted) picksStartedRef.current = true;
+      if (!banPhase && slotted) picksStartedRef.current = true;
       if (!banPhase && (banner.phase === "pick" || fromSlots === "pick")) {
         picksStartedRef.current = true;
       }
@@ -600,20 +724,32 @@ async function readLobby(
           banPhase,
           picksStarted: picksStartedRef.current,
         });
+      const ourShown = usOnLeft ? lobby?.leftShown ?? [] : lobby?.rightShown ?? [];
+      const theirShown = usOnLeft ? lobby?.rightShown ?? [] : lobby?.leftShown ?? [];
+      const ourPruned = pruneHoverPicks(
+        draft.ourPicks,
+        draft.ourPickPlayers,
+        ourShown,
+      );
+      const theirPruned = pruneHoverPicks(
+        draft.theirPicks,
+        draft.theirPickPlayers,
+        theirShown,
+      );
       const ourLocked = allowPicks
         ? takeNewLocks(
-            draft.ourPicks,
+            ourPruned.heroes,
             usOnLeft ? leftLocked : rightLocked,
             announcedPicksRef.current,
-            draft.ourPickPlayers,
+            ourPruned.players,
           )
         : null;
       const theirLocked = allowPicks
         ? takeNewLocks(
-            draft.theirPicks,
+            theirPruned.heroes,
             usOnLeft ? rightLocked : leftLocked,
             announcedPicksRef.current,
-            draft.theirPickPlayers,
+            theirPruned.players,
           )
         : null;
       let ourPicks = ourLocked
@@ -763,24 +899,68 @@ async function readLobby(
         else if (theirBans.length > 0 && ourBans.length === 0) firstPick = "them";
       }
       if (ourPicks.length + theirPicks.length > 0) {
-        const inferred = inferFirstPick({
-          ourPicks: ourPicks.length,
-          theirPicks: theirPicks.length,
-          phase,
-          turnSide,
-        });
-        const currentFits = firstPick
-          ? pickCountsFit(firstPick === "us", ourPicks.length, theirPicks.length)
-          : false;
-        if (inferred && (!firstPick || !currentFits)) firstPick = inferred;
+        const usFits = pickCountsFit(true, ourPicks.length, theirPicks.length);
+        const themFits = pickCountsFit(false, ourPicks.length, theirPicks.length);
+        if (usFits && !themFits) {
+          firstPick = "us";
+        } else if (themFits && !usFits) {
+          firstPick = "them";
+        } else {
+          const inferred = inferFirstPick({
+            ourPicks: ourPicks.length,
+            theirPicks: theirPicks.length,
+            phase,
+            turnSide,
+          });
+          const currentFits = firstPick
+            ? pickCountsFit(firstPick === "us", ourPicks.length, theirPicks.length)
+            : false;
+          if (inferred && (!firstPick || !currentFits)) firstPick = inferred;
+        }
       }
       let map = draft.map;
       if (!map) map = mapFromTitle(titleText);
+      const seatCtx = frame.getContext("2d");
+      const seatPixels = seatCtx ? framePixelAt(seatCtx, frame) : null;
+      const lockedFlags = (boxes: readonly DraftBox[], nameBoxes: readonly DraftBox[], ally: boolean) =>
+        boxes.map((box, index) => {
+          if (!seatCtx || !seatPixels) return false;
+          const nameBox = nameBoxes[index];
+          return portraitIsLocked({
+            phase: platePhase,
+            faceFilled: portraitFilled(sampleBox(seatCtx, frame, box)),
+            teamRim: portraitTeamRim(frame.width, frame.height, box, seatPixels),
+            plate: nameBox ? plateFill(sampleBox(seatCtx, frame, nameBox)) : undefined,
+            ally,
+          });
+        });
+      const namedSeats = (
+        reads: readonly { player: string | null }[],
+      ) =>
+        reads.map((read) => ({
+          player: read.player ? snapToRoster(read.player, knownNames) : null,
+        }));
+      const ourReads = usOnLeft ? lobby?.leftReads ?? [] : lobby?.rightReads ?? [];
+      const theirReads = usOnLeft ? lobby?.rightReads ?? [] : lobby?.leftReads ?? [];
+      const ourBoxes = usOnLeft ? DRAFT_PLATE_SLOTS.left : DRAFT_PLATE_SLOTS.right;
+      const theirBoxes = usOnLeft ? DRAFT_PLATE_SLOTS.right : DRAFT_PLATE_SLOTS.left;
+      const ourNameBoxes = usOnLeft ? DRAFT_SLOT_NAMES.left : DRAFT_SLOT_NAMES.right;
+      const theirNameBoxes = usOnLeft ? DRAFT_SLOT_NAMES.right : DRAFT_SLOT_NAMES.left;
+      const ourOpenPlayers =
+        lobby && ourReads.some((read) => read.player)
+          ? openSeatPlayers(namedSeats(ourReads), lockedFlags(ourBoxes, ourNameBoxes, true))
+          : draft.ourOpenPlayers ?? [];
+      const theirOpenPlayers =
+        lobby && theirReads.some((read) => read.player)
+          ? openSeatPlayers(namedSeats(theirReads), lockedFlags(theirBoxes, theirNameBoxes, false))
+          : draft.theirOpenPlayers ?? [];
       const nextDraft: LiveDraft = {
         ourPicks,
         theirPicks,
         ourPickPlayers: ourLocked?.players ?? draft.ourPickPlayers,
         theirPickPlayers: theirLocked?.players ?? draft.theirPickPlayers,
+        ourOpenPlayers,
+        theirOpenPlayers,
         ourBans,
         theirBans,
         firstPick,
@@ -913,9 +1093,20 @@ async function readLobby(
   }
 
   if (phase !== "idle") {
+    const load = screenLoad(status);
     return (
       <div className="flex flex-wrap items-center justify-between gap-3">
-        <p className="text-sm text-[var(--muted)]">{status}</p>
+        <div className="min-w-0 flex-1 space-y-2">
+          {load ? (
+            <TimeLeftBar
+              label={load.label}
+              expectedMs={load.expectedMs}
+              resetKey={load.resetKey}
+            />
+          ) : (
+            <p className="text-sm text-[var(--muted)]">{status}</p>
+          )}
+        </div>
         <button
           type="button"
           onClick={() => {

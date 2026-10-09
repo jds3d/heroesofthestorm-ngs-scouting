@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   COMFORT_SUGGEST_MIN,
+  comfortMeetsSuggestBar,
   buildPlayerComfort,
   comfortFromSources,
   fallbackPoolScore,
@@ -10,9 +11,12 @@ import {
   anySuggestablePair,
   overlayStormLeague,
   playerComfortOn,
+  resolvePlayerScout,
   playerFromStormLeague,
   playerWithoutHistory,
   playersMeetingSuggestBar,
+  comfortPairOwners,
+  heroesForOpenPlayers,
   slHeroSuggestions,
   sourceMapGames,
   stormLeagueGames,
@@ -147,6 +151,15 @@ describe("suggest bar", () => {
       heroMeetsSuggestBar(roster, "Garrosh", "Beachyman"),
     ).toBe(false);
     expect(playerComfortOn(roster, "Stitches", "Beachyman")).toBe(0.22);
+  });
+
+  it("resolves truncated lobby names to roster comfort", () => {
+    const sirWatson: PlayerScout = {
+      battletag: "SirWatsonII#1234",
+      topHeroes: [hero("Malthael", 0.31)],
+    } as PlayerScout;
+    expect(resolvePlayerScout([sirWatson], "SirWatsonII")).toBe(sirWatson);
+    expect(playerComfortOn([sirWatson], "Malthael", "SirWatsonII...")).toBe(0.31);
   });
 
   it("will not hand a hero to a player under 15 when someone else clears it", () => {
@@ -407,6 +420,70 @@ describe("slHeroSuggestions", () => {
     );
     expect(player.topHeroes.map((hero) => hero.hero)).toEqual(["Li-Ming"]);
     expect(slHeroSuggestions({ roster: [player], gone: new Set() })).toHaveLength(1);
+  });
+});
+
+describe("heroesForOpenPlayers", () => {
+  it("gives each open player a hero from their own pool and skips anyone who locked", () => {
+    const dante = playerFromStormLeague(
+      "Dante",
+      new Map([
+        ["Falstad", sl(40, 20)],
+        ["Greymane", sl(10, 8)],
+      ]),
+    );
+    const hiimrick = playerFromStormLeague(
+      "hiimrick",
+      new Map([
+        ["Falstad", sl(12, 10)],
+        ["Zeratul", sl(8, 6)],
+      ]),
+    );
+    const locked = playerFromStormLeague(
+      "L337",
+      new Map([["Abathur", sl(50, 10)]]),
+    );
+    const suggestions = heroesForOpenPlayers({
+      openPlayers: ["Dante", "hiimrick"],
+      roster: [dante, hiimrick, locked],
+      gone: new Set(["Greymane"]),
+    });
+    expect(suggestions.map((row) => [row.player, row.hero])).toEqual([
+      ["Dante", "Falstad"],
+      ["hiimrick", "Zeratul"],
+    ]);
+  });
+});
+
+describe("comfortPairOwners", () => {
+  it("names who plays which hero from comfort under the suggest bar", () => {
+    const huck = playerFromStormLeague(
+      "HuckIt",
+      new Map([
+        ["Alarak", sl(4, 2)],
+        ["Hogger", sl(1, 3)],
+      ]),
+    );
+    const pangi = playerFromStormLeague(
+      "PangiTMoDiba",
+      new Map([
+        ["Alarak", sl(1, 2)],
+        ["Hogger", sl(8, 2)],
+      ]),
+    );
+    huck.topHeroes.forEach((hero) => {
+      hero.comfort = hero.hero === "Alarak" ? 0.08 : 0.03;
+    });
+    pangi.topHeroes.forEach((hero) => {
+      hero.comfort = hero.hero === "Hogger" ? 0.09 : 0.02;
+    });
+    expect(comfortMeetsSuggestBar(0.09)).toBe(false);
+    expect(
+      comfortPairOwners([huck, pangi], "Alarak", "Hogger", new Set(["goz"])),
+    ).toEqual({
+      first: { player: "HuckIt", comfort: 0.08 },
+      second: { player: "PangiTMoDiba", comfort: 0.09 },
+    });
   });
 });
 

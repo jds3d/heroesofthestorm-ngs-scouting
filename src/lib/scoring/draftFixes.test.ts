@@ -55,6 +55,8 @@ import {
   matchupFetchQueue,
   missingDuoLabel,
   missingDuoReason,
+  suggestionDataGap,
+  suggestionDataGapTooltip,
   pairingGameCount,
   scoreDuos,
   SYNERGY_DUO,
@@ -405,11 +407,17 @@ describe("duo scoring", () => {
 
   it("lists every locked hero in the breakdown, including unsampled ones", () => {
     const allies = ["Whitemane", "Falstad", "Valla"];
-    const result = scoreDuos(allyDuos(table, "Tyrael", allies), SYNERGY_DUO, "together", allies);
+    const result = scoreDuos(
+      allyDuos(table, "Tyrael", allies),
+      SYNERGY_DUO,
+      "together",
+      allies,
+      (ally) => duoMissingLine(table, "Tyrael", ally, "together"),
+    );
     expect(result.lines).toEqual([
       "with Falstad: 57% together (90g) → +8",
       "with Whitemane: 54% together (1,000g) → +5",
-      "with Valla: no sample with enough games → 0",
+      "with Valla: Valla ally matchups not loaded — queued… → 0",
     ]);
     expect(Math.round(result.points)).toBe(13);
     expect(missingDuoLabel(result.lines[2]!)).toBe("with Valla");
@@ -453,7 +461,7 @@ describe("duo scoring", () => {
         ["Garrosh", "Anduin", "Junkrat", "Deathwing", "Gul'dan", "Samuro"],
         ["Samuro", "Anduin"],
       ),
-    ).toEqual(["Samuro", "Garrosh", "Junkrat", "Deathwing", "Gul'dan"]);
+    ).toEqual(["Samuro", "Anduin", "Garrosh", "Junkrat", "Deathwing", "Gul'dan"]);
   });
 
   it("does not flag a hero as missing data into itself", () => {
@@ -477,6 +485,19 @@ describe("duo scoring", () => {
     expect(result.lines.some((line) => line.startsWith("into Anduin:"))).toBe(true);
   });
 
+  it("explains ally gaps with ally load state, not enemy matchup counts", () => {
+    const table = buildDraftMetaTable({
+      patch: "test",
+      global: [g("Zagara", 46.5), g("Muradin", 50)],
+      matchups: {
+        Zagara: [enemy("Muradin", 48, 2000)],
+      },
+    });
+    expect(duoMissingLine(table, "Zagara", "Muradin", "together")).toContain(
+      "Zagara ally matchups not loaded",
+    );
+  });
+
   it("explains why a duo scored 0 instead of a generic loading message", () => {
     const table = buildDraftMetaTable({
       patch: "test",
@@ -495,6 +516,25 @@ describe("duo scoring", () => {
     expect(missingDuoReason(line ?? "")).toBe("only 12 SL games (need 40)");
     const unloaded = duoMissingLine(table, "Garrosh", "Anduin", "into");
     expect(unloaded).toContain("Anduin matchups not loaded");
+  });
+
+  it("keeps a hero with no played matchups on the fetch queue", () => {
+    const table = buildDraftMetaTable({
+      patch: "test",
+      global: [
+        { hero: "Tyrael", winRate: 52, influence: 10, popularity: 20, banRate: 0, pickRate: 0, games: 4000 },
+        { hero: "Valla", winRate: 50, influence: 0, popularity: 10, banRate: 0, pickRate: 0, games: 3000 },
+      ],
+      matchups: {
+        Tyrael: [{ hero: "Valla", wins: 0, losses: 0, games: 0, enemyWinRate: 50 }],
+        Valla: [],
+      },
+    });
+    expect(matchupFetchQueue(table, ["Valla", "Tyrael"])).toEqual(["Valla", "Tyrael"]);
+    expect(duoMissingLine(table, "Tyrael", "Valla", "into", new Set(["Tyrael"]))).toContain(
+      "fetching",
+    );
+    expect(enemyDuos(table, "Tyrael", ["Valla"])).toEqual([]);
   });
 
   it("reads into Tyrael from Tyrael's row when our hero was never fetched", () => {
@@ -568,6 +608,81 @@ describe("duo scoring", () => {
   });
 });
 
+describe("suggestion data gap", () => {
+  const loaded = "into Diablo: 54% win rate (800g) → +2";
+  const fetching = "into Garrosh: fetching Storm League… → 0";
+  const thin = "with Anduin: only 12 SL games (need 40) → 0";
+
+  it("reports the loaded share while a duo is still fetching", () => {
+    const gap = suggestionDataGap({
+      heroes: ["Valla"],
+      lines: [loaded, fetching],
+      queued: ["Valla"],
+      failed: [],
+    });
+    expect(gap).toMatchObject({
+      percent: 50,
+      loading: true,
+      failed: false,
+    });
+    expect(gap?.missing).toEqual([
+      "into Garrosh: fetching Storm League…",
+    ]);
+    expect(suggestionDataGapTooltip(gap!)).toBe(
+      "Missing data\ninto Garrosh: fetching Storm League…\n50% loaded",
+    );
+  });
+
+  it("names the hero payload when the card has no duo lines yet", () => {
+    const gap = suggestionDataGap({
+      heroes: ["Valla"],
+      lines: ["2 duos, net +4"],
+      queued: ["Valla"],
+      failed: [],
+    });
+    expect(gap).toMatchObject({
+      missing: ["Storm League matchups for Valla"],
+      percent: 0,
+      loading: true,
+      failed: false,
+    });
+  });
+
+  it("stays amber without a percent once the gaps are settled", () => {
+    const gap = suggestionDataGap({
+      heroes: ["Valla"],
+      lines: [loaded, thin],
+      queued: [],
+      failed: [],
+    });
+    expect(gap).toMatchObject({ loading: false, failed: false, percent: 50 });
+    expect(suggestionDataGapTooltip(gap!)).not.toMatch(/% loaded/);
+  });
+
+  it("marks the card failed when that hero's pull failed", () => {
+    const gap = suggestionDataGap({
+      heroes: ["Valla", "Tyrande"],
+      lines: [fetching],
+      queued: ["Valla"],
+      failed: ["Tyrande"],
+    });
+    expect(gap?.failed).toBe(true);
+    expect(gap?.loading).toBe(false);
+    expect(suggestionDataGapTooltip(gap!).startsWith("Failed to load")).toBe(true);
+  });
+
+  it("returns nothing when every duo line has a sample", () => {
+    expect(
+      suggestionDataGap({
+        heroes: ["Valla"],
+        lines: [loaded],
+        queued: [],
+        failed: [],
+      }),
+    ).toBeNull();
+  });
+});
+
 describe("matchup data depth", () => {
   it("pulls more patches while ally duos are still imprecise, not just enemies", () => {
     const precise = { hero: "X", wins: 0, losses: 0, games: 5000, enemyWinRate: 50 };
@@ -583,6 +698,7 @@ describe("matchup data depth", () => {
         allies: [{ hero: "Y", wins: 0, losses: 0, games: 5000, allyWinRate: 52 }],
       }),
     ).toBe(false);
+    expect(matchupsNeedMoreGames({ enemies: [], allies: [] })).toBe(true);
   });
 });
 

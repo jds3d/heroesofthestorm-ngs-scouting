@@ -4,114 +4,6 @@ import { HERO_META, heroKey } from "@/lib/scoring/heroMeta";
 import { allDraftHeroes, heroDraftSlug } from "@/lib/scoring/heroPortrait";
 import type { ReplayAction } from "@/lib/review/replayDraft";
 
-const UI_WORDS = new Set([
-  "allied",
-  "alterac",
-  "and",
-  "ban",
-  "banning",
-  "bans",
-  "battlefield",
-  "blue",
-  "bonus",
-  "braxis",
-  "core",
-  "cursed",
-  "defeat",
-  "disconnect",
-  "doom",
-  "draft",
-  "dragon",
-  "enemy",
-  "eternity",
-  "experience",
-  "first",
-  "fort",
-  "foundry",
-  "fourth",
-  "from",
-  "garden",
-  "hanamura",
-  "hero",
-  "heroes",
-  "holdout",
-  "hollow",
-  "infernal",
-  "junction",
-  "keep",
-  "league",
-  "left",
-  "level",
-  "loading",
-  "lobby",
-  "map",
-  "match",
-  "aram",
-  "brawl",
-  "bronze",
-  "collection",
-  "custom",
-  "diamond",
-  "gold",
-  "grandmaster",
-  "loot",
-  "master",
-  "platinum",
-  "play",
-  "quick",
-  "searching",
-  "season",
-  "selected",
-  "server",
-  "banned",
-  "teammates",
-  "browse",
-  "silver",
-  "starting",
-  "watch",
-  "wins",
-  "mercenary",
-  "objective",
-  "pass",
-  "pick",
-  "picking",
-  "picks",
-  "placement",
-  "player",
-  "players",
-  "queen",
-  "queue",
-  "ranked",
-  "ready",
-  "reconnect",
-  "red",
-  "right",
-  "score",
-  "second",
-  "shire",
-  "shrines",
-  "sky",
-  "spider",
-  "storm",
-  "team",
-  "temple",
-  "terror",
-  "that",
-  "the",
-  "third",
-  "this",
-  "time",
-  "tomb",
-  "towers",
-  "versus",
-  "victory",
-  "volskaya",
-  "warhead",
-  "well",
-  "with",
-  "your",
-]);
-
 function isHero(token: string): boolean {
   const key = heroKey(token);
   return Object.prototype.hasOwnProperty.call(HERO_META, key);
@@ -340,6 +232,12 @@ export type LiveDraft = {
   theirPickPlayers: (string | null)[];
   ourBans: string[];
   theirBans: string[];
+  /**
+   * Players whose portrait is not locked, top seat down.
+   * Suggestions belong to these seats and not to anyone who already locked.
+   */
+  ourOpenPlayers?: string[];
+  theirOpenPlayers?: string[];
   /** Who banned first. In this lobby that side also picks first. */
   firstPick: "us" | "them" | null;
   /** Last phase read from the center banner. */
@@ -354,6 +252,8 @@ export const EMPTY_LIVE_DRAFT: LiveDraft = {
   theirPickPlayers: [],
   ourBans: [],
   theirBans: [],
+  ourOpenPlayers: [],
+  theirOpenPlayers: [],
   firstPick: null,
   phase: null,
   map: null,
@@ -372,17 +272,6 @@ export type OpenTurn = {
   side: "our" | "their";
 };
 
-function isUiFragment(token: string): boolean {
-  const fold = token.toLowerCase();
-  if (UI_WORDS.has(fold)) return true;
-  if (fold.length < 5) {
-    for (const word of UI_WORDS) {
-      if (word.startsWith(fold) && word.length > fold.length) return true;
-    }
-  }
-  return false;
-}
-
 function plateNameToken(token: string, allowShort = false): string | null {
   const cleaned = token.replace(/^'+|'+$/g, "");
   // Banners can be three letters (Dex). Other OCR still ignores those scraps.
@@ -391,7 +280,7 @@ function plateNameToken(token: string, allowShort = false): string | null {
     ? /^[A-Za-z][A-Za-z0-9']{2,17}$/
     : /^[A-Za-z][A-Za-z0-9']{3,17}$/;
   if (!pattern.test(cleaned) || /\d{4,}/.test(cleaned)) return null;
-  if (isUiFragment(cleaned) || isHero(cleaned) || heroFromPlateText(cleaned)) return null;
+  if (isHero(cleaned) || heroFromPlateText(cleaned)) return null;
   return cleaned;
 }
 
@@ -402,26 +291,7 @@ function plateLines(text: string): string[] {
     .filter(Boolean);
 }
 
-const RANK_TAGS = new Set([
-  "bronze",
-  "silver",
-  "gold",
-  "platinum",
-  "diamond",
-  "master",
-  "grandmaster",
-]);
-
-/** A rank label that is also someone's battletag, once the hero on that plate is known. */
-function rankTag(line: string): string | null {
-  const token = line.trim();
-  if (!/^[A-Za-z]{3,17}$/.test(token)) return null;
-  if (!RANK_TAGS.has(token.toLowerCase())) return null;
-  return token;
-}
-
 function playerToken(line: string, allowShort = false): string | null {
-  if (isUiFragment(line)) return null;
   const ranked = line
     .split(/[^A-Za-z0-9']+/)
     .map((token) => plateNameToken(token, allowShort))
@@ -450,7 +320,7 @@ export function readSlotPlate(lines: readonly string[]): {
       heroSeen = true;
       continue;
     }
-    const asPlayer = nameFromPlate(line, true) ?? (heroSeen ? rankTag(line) : null);
+    const asPlayer = nameFromPlate(line, true);
     if (!asPlayer) continue;
     if (!heroSeen || !player) player = asPlayer;
   }
@@ -474,6 +344,27 @@ export function readsBySlot(
     buckets[index].push(line.text);
   }
   return buckets.map((bucket) => readSlotPlate(bucket));
+}
+
+/**
+ * Names still picking, in seat order. A locked portrait is out, even when the
+ * plate still shows that player's name.
+ */
+export function openSeatPlayers(
+  seats: readonly { player: string | null }[],
+  locked: readonly boolean[],
+): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  seats.forEach((seat, index) => {
+    const name = seat.player?.trim();
+    if (!name || locked[index]) return;
+    const key = name.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push(name);
+  });
+  return out;
 }
 
 export function nameFromPlate(text: string, allowShort = false): string | null {
@@ -523,18 +414,14 @@ export function heroOnPlate(text: string): string | null {
   if (!lines.length) return null;
   if (lines.every((line) => /\bpicking\b/i.test(line))) return null;
   for (const line of lines) {
-    if (isUiFragment(line) || /\bpicking\b/i.test(line)) continue;
+    if (/\bpicking\b/i.test(line)) continue;
     const hero = heroFromPlateText(line);
     if (hero) return hero;
   }
   return null;
 }
 
-/**
- * Names across the Storm League party screen, left to right.
- * Rank words and the top menu are ignored, so queuing can load our five
- * before the draft opens.
- */
+/** Names from the party-row OCR crop, left to right (at most five). */
 export function partyNamesFromText(text: string): string[] {
   const names: string[] = [];
   const seen = new Set<string>();
@@ -591,7 +478,7 @@ export function playerFromSlotText(text: string): string | null {
 /**
  * Locked heroes from one column, top to bottom.
  * A hero line opens a slot. The next player line under it is who locked it.
- * "PICKING" and rank words are not locks.
+ * "PICKING" is not a lock.
  */
 export function locksFromOcrLines(
   lines: readonly { text: string; top: number }[],
@@ -1058,6 +945,98 @@ export function borderLooksLocked(edgeLumas: readonly number[]): boolean {
   return peak >= 175 && bright >= 0.05;
 }
 
+/**
+ * Blue and red pixels on the ring just outside a portrait.
+ * A locked ally glows blue and a locked enemy glows red. A white hover does not.
+ */
+export function portraitTeamRim(
+  frameWidth: number,
+  frameHeight: number,
+  box: DraftBox,
+  pixelAt: (x: number, y: number) => Rgb,
+): { blue: number; red: number } {
+  const x = Math.max(0, Math.round(box.x * frameWidth));
+  const y = Math.max(0, Math.round(box.y * frameHeight));
+  const w = Math.max(1, Math.min(frameWidth - x, Math.round(box.w * frameWidth)));
+  const h = Math.max(1, Math.min(frameHeight - y, Math.round(box.h * frameHeight)));
+  let blue = 0;
+  let red = 0;
+  const take = (px: number, py: number) => {
+    const sx = Math.max(0, Math.min(frameWidth - 1, px));
+    const sy = Math.max(0, Math.min(frameHeight - 1, py));
+    const pixel = pixelAt(sx, sy);
+    if (lumaOf(pixel) < 150) return;
+    const { r, g, b } = pixel;
+    const max = Math.max(r, g, b);
+    const min = Math.min(r, g, b);
+    const sat = max === 0 ? 0 : (max - min) / max;
+    if (sat < 0.22) return;
+    if (b > r + 15 && b >= g) blue += 1;
+    else if (r > b + 15 && r >= g) red += 1;
+  };
+  for (let px = x - 6; px < x + w + 6; px++) {
+    take(px, y - 4);
+    take(px, y - 3);
+    take(px, y + h + 2);
+    take(px, y + h + 3);
+  }
+  for (let py = y - 2; py < y + h + 2; py++) {
+    take(x - 4, py);
+    take(x - 3, py);
+    take(x + w + 2, py);
+    take(x + w + 3, py);
+  }
+  return { blue, red };
+}
+
+/**
+ * A side portrait is a locked pick only after bans, and only with a blue or red rim.
+ * A painted face during a ban, or a white hover during picks, is not a lock.
+ */
+export function portraitIsLocked(args: {
+  phase: "ban" | "pick" | null;
+  faceFilled: boolean;
+  teamRim: { blue: number; red: number };
+  /** Blue nameplate behind a hover. Whitish plate is a real lock. */
+  plate?: PlateFill;
+  /** Our side glows brighter on a real lock than a portrait still in the column. */
+  ally?: boolean;
+}): boolean {
+  if (args.phase === "ban" || !args.faceFilled) return false;
+  if (args.plate === "shown") return false;
+  const glow = args.teamRim.blue + args.teamRim.red;
+  if (args.ally === true) {
+    if (glow >= 48 || args.teamRim.red >= 8) return true;
+    // A portrait still in the column can glow without being locked.
+    if (glow >= 35) return false;
+    return glow >= 12;
+  }
+  if (args.ally === false) {
+    return glow >= 12;
+  }
+  return glow >= 12;
+}
+
+/** Drop picks that are visible again on a blue hover plate. */
+export function pruneHoverPicks(
+  prev: readonly string[],
+  prevPlayers: readonly (string | null)[],
+  shown: readonly string[],
+): { heroes: string[]; players: (string | null)[] } {
+  if (!shown.length) {
+    return { heroes: [...prev], players: [...prevPlayers] };
+  }
+  const drop = new Set(shown.map((hero) => heroKey(hero)));
+  const heroes: string[] = [];
+  const players: (string | null)[] = [];
+  prev.forEach((hero, index) => {
+    if (drop.has(heroKey(hero))) return;
+    heroes.push(hero);
+    players.push(prevPlayers[index] ?? null);
+  });
+  return { heroes, players };
+}
+
 /** Same rule, plus a saturated blue or red rim that is bright but not white. */
 export function borderLooksLockedSamples(samples: readonly EdgeSample[]): boolean {
   if (borderLooksLocked(samples.map((sample) => sample.luma))) return true;
@@ -1487,6 +1466,12 @@ export function watchPhase(
   return "wait";
 }
 
+function nameOnRoster(name: string, roster: readonly string[]): boolean {
+  const folded = ocrFold(name);
+  if (!folded) return false;
+  return roster.some((tag) => ocrFold(tag.split("#")[0]?.trim() ?? tag) === folded);
+}
+
 export function turnFromOcr(text: string, roster: readonly string[]): TurnRead {
   let player: string | null = null;
   let hero: string | null = null;
@@ -1499,7 +1484,10 @@ export function turnFromOcr(text: string, roster: readonly string[]): TurnRead {
       continue;
     }
     const name = nameFromPlate(line);
-    if (name) player = snapToRoster(name, roster);
+    if (!name) continue;
+    const snapped = snapToRoster(name, roster);
+    if (roster.length > 0 && !nameOnRoster(snapped, roster)) continue;
+    player = snapped;
   }
   return { player, phase: bannerTurn(text).phase, hero };
 }
@@ -1756,38 +1744,6 @@ export function opponentColumn(
   if (hits(left) > hits(right)) return [...right];
   if (hits(right) > hits(left)) return [...left];
   return right.length >= left.length ? [...right] : [...left];
-}
-
-function nameToken(raw: string): string | null {
-  const cleaned = raw.replace(/^[^A-Za-z0-9]+|[^A-Za-z0-9]+$/g, "");
-  if (!/^[A-Za-z][A-Za-z0-9]{2,17}$/.test(cleaned)) return null;
-  if (cleaned.replace(/[0-9]/g, "").length < 3) return null;
-  const fold = cleaned.toLowerCase();
-  if (UI_WORDS.has(fold) || isHero(cleaned)) return null;
-  return cleaned;
-}
-
-/**
- * Player names read off a draft or lobby screenshot.
- * Drops heroes, map words, and the five names already on our side.
- * Returns at most five opponents, in the order they were read.
- */
-export function lobbyNamesFromOcr(text: string, ourNames: readonly string[]): string[] {
-  const ours = new Set(
-    ourNames.map((name) => name.split("#")[0]?.trim().toLowerCase()).filter(Boolean),
-  );
-  const seen = new Set<string>();
-  const names: string[] = [];
-  for (const raw of text.split(/[\s,;|/]+/)) {
-    const name = nameToken(raw);
-    if (!name) continue;
-    const fold = name.toLowerCase();
-    if (ours.has(fold) || seen.has(fold)) continue;
-    seen.add(fold);
-    names.push(name);
-    if (names.length === 5) break;
-  }
-  return names;
 }
 
 /** Battletags for the screen names that are actually on this roster. Unmatched names are left out. */

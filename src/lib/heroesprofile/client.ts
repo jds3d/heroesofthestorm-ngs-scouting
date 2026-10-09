@@ -1173,6 +1173,10 @@ export function gamesForMatchupPrecision(winRatePct: number): number {
  * 50.5% and 58% are both refined until precision is met (or we hit the cap).
  */
 export function matchupsNeedMoreGames(bundle: HeroMatchupBundle): boolean {
+  const played =
+    bundle.enemies.some((e) => e.games > 0) || bundle.allies.some((a) => a.games > 0);
+  // An empty payload is not a finished pull. Keep stacking patches.
+  if (!played) return true;
   const imprecise = (games: number, wr: number) =>
     games > 0 && matchupMarginOfError(games, wr) > MATCHUP_MOE_TARGET;
   return (

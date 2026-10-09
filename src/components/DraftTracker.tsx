@@ -1,3 +1,7 @@
+"use client";
+
+import { TimeLeftBar } from "@/components/TimeLeftBar";
+
 export type SlTrackStatus = "queued" | "pulling" | "found" | "miss" | "error";
 
 export type SlTrackRow = {
@@ -17,6 +21,41 @@ function stageAt(rows: readonly SlTrackRow[]): number {
   if (!rows.length) return 0;
   if (rows.some((row) => row.status === "queued" || row.status === "pulling")) return 1;
   return 2;
+}
+
+function syncActivity(rows: readonly SlTrackRow[]): {
+  label: string;
+  expectedMs: number;
+  progress: number | null;
+  resetKey: string;
+} | null {
+  const pulling = rows.filter(
+    (row) => row.status === "queued" || row.status === "pulling",
+  );
+  if (!rows.length) {
+    return {
+      label: "Reading the map title and the ten player names off the shared screen.",
+      expectedMs: 18_000,
+      progress: null,
+      resetKey: "names",
+    };
+  }
+  if (pulling.length) {
+    const shown = pulling.slice(0, 3).map((row) => row.name);
+    const extra = pulling.length - shown.length;
+    const who =
+      extra > 0
+        ? `${shown.join(", ")}, and ${extra} more`
+        : shown.join(", ");
+    const settled = rows.length - pulling.length;
+    return {
+      label: `Storm League history still loading for ${who}.`,
+      expectedMs: 15_000 + rows.length * 3_000,
+      progress: settled > 0 ? settled / rows.length : null,
+      resetKey: "storm-league",
+    };
+  }
+  return null;
 }
 
 function statusLine(row: SlTrackRow): string {
@@ -41,6 +80,7 @@ export function DraftTracker({
   const settled =
     rows.length > 0 &&
     rows.every((row) => row.status === "found" || row.status === "miss" || row.status === "error");
+  const activity = syncActivity(rows);
 
   return (
     <div className="rounded-md border border-[#2a3a48] bg-[#0f1821] px-4 py-3 text-[#e8eef2]">
@@ -56,7 +96,7 @@ export function DraftTracker({
                     done
                       ? "border-[#72d1b1] bg-[#72d1b1] text-[#0f1821]"
                       : current
-                        ? "border-[#72d1b1] text-[#72d1b1] ring-4 ring-[#72d1b1]/20"
+                        ? "border-[#72d1b1] text-[#72d1b1] ring-4 ring-[#72d1b1]/20 animate-pulse"
                         : "border-[#3d5163] text-[#5a6b78]"
                   }`}
                 >
@@ -83,7 +123,7 @@ export function DraftTracker({
                 {index === 0
                   ? rows.length
                     ? `${rows.length} on screen`
-                    : "Watching the draft"
+                    : "Reading names"
                   : index === 1
                     ? settled
                       ? `${found} of ${rows.length} found`
@@ -98,6 +138,18 @@ export function DraftTracker({
           );
         })}
       </ol>
+
+      {activity ? (
+        <div className="mt-4">
+          <TimeLeftBar
+            label={activity.label}
+            expectedMs={activity.expectedMs}
+            progress={activity.progress}
+            resetKey={activity.resetKey}
+            tone="dark"
+          />
+        </div>
+      ) : null}
 
       {rows.length > 0 && (
         <ul className="mt-3 space-y-1 border-t border-[#2a3a48] pt-3">

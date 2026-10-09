@@ -5,6 +5,7 @@ import type { DraftMetaTable } from "@/lib/scoring/draftMeta";
 import type { PlayerScout, ScoutReport } from "@/lib/scoring/types";
 import type { ReviewGame, ReviewGameSummary } from "@/lib/review/replayDraft";
 import { DraftTracker, type SlTrackRow } from "@/components/DraftTracker";
+import { TimeLeftBar, scoutExpectedMs } from "@/components/TimeLeftBar";
 import { LobbyScreenWatch } from "@/components/LobbyScreenWatch";
 import { ScoutReportView } from "@/components/ScoutReport";
 import { InteractiveDraft } from "@/components/InteractiveDraft";
@@ -36,6 +37,14 @@ type RosterPlayer = { battletag: string; games: number };
 function scoutHeaders(): HeadersInit {
   const secret = process.env.NEXT_PUBLIC_SCOUT_API_SECRET?.trim();
   return secret ? { "x-scout-secret": secret } : {};
+}
+
+async function syncLocalReplays(): Promise<void> {
+  try {
+    await scoutFetch("/api/replays/sync");
+  } catch {
+    /* optional: replay folder may be missing in Docker */
+  }
 }
 
 async function scoutFetch(path: string, init?: RequestInit): Promise<Response> {
@@ -125,7 +134,6 @@ export function ScoutApp() {
   const [ourFive, setOurFive] = useState<string[]>([]);
   const [theirFive, setTheirFive] = useState<string[]>([]);
   const [loadingRoster, setLoadingRoster] = useState(false);
-  const [loadingProgress, setLoadingProgress] = useState(12);
   const [scoutPass, setScoutPass] = useState(1);
   const [matchupsFilling, setMatchupsFilling] = useState(false);
   const [reviewOpen, setReviewOpen] = useState(false);
@@ -190,38 +198,6 @@ export function ScoutApp() {
       }))
       .filter((stage) => stage.count > 0);
   }, [predictedCalls]);
-
-  useEffect(() => {
-    if (!loadingReport) {
-      setLoadingProgress(0);
-      return;
-    }
-
-    const startedAt = Date.now();
-    const timer = window.setInterval(() => {
-      const elapsed = Date.now() - startedAt;
-      // Hero matchups can take several minutes. Keep the bar moving without
-      // claiming the scout is almost finished.
-      const crawl = 12 + Math.min(60, (elapsed / 90_000) * 60);
-      setLoadingProgress(Math.round(crawl));
-    }, 400);
-
-    return () => window.clearInterval(timer);
-  }, [loadingReport]);
-
-  const currentProgress = Math.max(0, Math.min(100, loadingProgress));
-  const activeStage =
-    loadingStages.length > 0
-      ? loadingStages[
-          Math.min(
-            loadingStages.length - 1,
-            Math.max(
-              0,
-              Math.floor((currentProgress / 100) * loadingStages.length),
-            ),
-          )
-        ].label
-      : "Generating report";
 
   useEffect(() => {
     let cancelled = false;
@@ -329,6 +305,11 @@ export function ScoutApp() {
   }, [slNameKey]);
 
   useEffect(() => {
+    if (!sharing) return;
+    void syncLocalReplays();
+  }, [sharing]);
+
+  useEffect(() => {
     if (!sharing || watchMeta) return;
     let cancelled = false;
     scoutFetch("/api/meta/heroes")
@@ -367,6 +348,8 @@ export function ScoutApp() {
     setSlTrack(rows);
     setSlTrackError(null);
     (async () => {
+      await syncLocalReplays();
+      if (cancelled) return;
       await Promise.all(
         tags.map(async (tag, index) => {
           if (cancelled) return;
@@ -502,6 +485,7 @@ export function ScoutApp() {
     if (!selected || selected === homeName) {
       setTheirRoster([]);
       setTheirFive([]);
+      setLoadingRoster(false);
       return;
     }
     let cancelled = false;
@@ -548,7 +532,6 @@ export function ScoutApp() {
     setError(null);
     setLoadingReport(true);
     setLoadingReview(true);
-    setLoadingProgress(12);
     try {
       const res = await scoutFetch(`/api/review/game?id=${encodeURIComponent(id)}`);
       const game = (await res.json()) as ReviewGame & { error?: string };
@@ -573,7 +556,6 @@ export function ScoutApp() {
     theirs: string[],
   ): Promise<boolean> {
     setLoadingReport(true);
-    setLoadingProgress(12);
     setScoutPass(1);
     setMatchupsFilling(false);
     setError(null);
@@ -678,6 +660,23 @@ export function ScoutApp() {
       }),
     [stormTheirs, homeLabels],
   );
+
+  const livePlanLoadingLabel = useMemo(() => {
+    if (!sharing || report) return null;
+    if (!watchMeta?.byHero || !Object.keys(watchMeta.byHero).length) {
+      return "Loading Storm League hero stats and matchups.";
+    }
+    const pulling = slTrack.some(
+      (row) => row.status === "queued" || row.status === "pulling",
+    );
+    if (pulling) {
+      return "Loading Storm League history for players on screen.";
+    }
+    if (stormHome.length < 4) {
+      return "Reading player names from the screen.";
+    }
+    return null;
+  }, [sharing, report, watchMeta, slTrack, stormHome.length]);
 
   const draftSaveKey = [
     liveDraft?.map ?? "",
@@ -785,6 +784,7 @@ export function ScoutApp() {
         <LobbyScreenWatch
           ourNames={ourRoster.map((player) => player.battletag.split("#")[0] ?? player.battletag)}
           rosterNames={[...ourRoster, ...theirRoster].map((player) => player.battletag)}
+          onReplaySync={syncLocalReplays}
           onLobby={(names) => {
             setLobbyNames(names);
             const tags = rosterTagsForLobby(names, theirRoster);
@@ -808,6 +808,13 @@ export function ScoutApp() {
               loading={loadingTeams}
               onSelect={setSelected}
             />
+            {loadingTeams ? (
+              <TimeLeftBar
+                label="Loading the A-league team list from NGS."
+                expectedMs={12_000}
+                resetKey="teams"
+              />
+            ) : null}
           </div>
           <button
             type="button"
@@ -827,18 +834,23 @@ export function ScoutApp() {
           onChange={setOurFive}
         />
         {selected && !scoutingSelf && (
-          <LineupPicker
-            title={`Their 5 — ${selected} (${theirFive.length}/5)`}
-            hint={
-              loadingRoster
-                ? "Loading roster and season games…"
-                : "Defaults to the five with the most NGS games this season."
-            }
-            players={theirRoster}
-            selected={theirFive}
-            disabled={loadingReport || loadingRoster}
-            onChange={setTheirFive}
-          />
+          <>
+            <LineupPicker
+              title={`Their 5 — ${selected} (${theirFive.length}/5)`}
+              hint="Defaults to the five with the most NGS games this season."
+              players={theirRoster}
+              selected={theirFive}
+              disabled={loadingReport || loadingRoster}
+              onChange={setTheirFive}
+            />
+            {loadingRoster ? (
+              <TimeLeftBar
+                label={`Loading ${selected}'s roster and this season's games.`}
+                expectedMs={15_000}
+                resetKey={selected}
+              />
+            ) : null}
+          </>
         )}
         </>
         )}
@@ -897,47 +909,46 @@ export function ScoutApp() {
       )}
       {loadingReport && (
         <div className="space-y-3 rounded-xl border border-[var(--line)] bg-[var(--panel)] p-4 text-sm text-[var(--muted)] shadow-sm">
-          <div className="flex items-center justify-between gap-3">
-            <p className="font-medium text-[var(--ink)]">
-              {loadingReview
-                ? refreshPlayerData
-                  ? "Refreshing source data and loading the draft review…"
-                  : "Loading the draft review…"
-                : refreshPlayerData
-                  ? "Refreshing source data and generating the scout report…"
-                  : scoutPass > 1
-                    ? `Still working (pass ${scoutPass}). The report opens as soon as the roster is ready.`
-                    : "Generating the scout report…"}
-            </p>
-            <span className="text-xs font-semibold uppercase tracking-[0.18em] text-[var(--accent)]">
-              {Math.round(currentProgress)}%
-            </span>
-          </div>
-          <div className="h-2 overflow-hidden rounded-full bg-[var(--line)]">
-            <div
-              className="h-full rounded-full bg-[var(--accent)] transition-[width] duration-300 ease-out"
-              style={{ width: `${currentProgress}%` }}
-            />
-          </div>
-          <div className="flex items-center justify-between gap-4 text-xs uppercase tracking-[0.14em] text-[var(--muted)]">
-            <span>Current step</span>
-            <span>{activeStage}</span>
-          </div>
+          <p className="font-medium text-[var(--ink)]">
+            {loadingReview
+              ? refreshPlayerData
+                ? "Refreshing source data and loading the draft review."
+                : "Loading the draft review."
+              : refreshPlayerData
+                ? "Refreshing source data and generating the scout report."
+                : scoutPass > 1
+                  ? `Pass ${scoutPass}. The report stays up while the rest of the data finishes.`
+                  : "Generating the scout report."}
+          </p>
+          <TimeLeftBar
+            label={
+              loadingStages.length
+                ? scoutPass > 1
+                  ? "Continuing from what is already saved."
+                  : `This pass still has ${loadingStages.reduce((sum, stage) => sum + stage.count, 0)} API calls.`
+                : "Counting which API calls this scout still needs."
+            }
+            expectedMs={scoutExpectedMs(loadingStages, scoutPass)}
+            resetKey={`${scoutPass}-${loadingStages.map((stage) => stage.key).join("|")}`}
+            steps={
+              loadingStages.length
+                ? loadingStages.map((stage) => ({
+                    id: stage.key,
+                    label: stage.label,
+                  }))
+                : [{ id: "calls", label: "Call list" }]
+            }
+          />
           {predictedCalls && predictedCalls.some((c) => c.count > 0) ? (
-            <div className="space-y-2">
-              <p className="text-xs uppercase tracking-[0.14em] text-[var(--muted)]">
-                Planned API calls
-              </p>
-              <ul className="grid gap-1 sm:grid-cols-2">
-                {predictedCalls
-                  .filter((c) => c.count > 0)
-                  .map((c) => (
-                    <li key={c.kind} className="rounded-md border border-[var(--line)] bg-[var(--bg)] px-2 py-1 text-xs text-[var(--ink)]">
-                      {c.label}: {c.count}
-                    </li>
-                  ))}
-              </ul>
-            </div>
+            <ul className="grid gap-1 sm:grid-cols-2">
+              {predictedCalls
+                .filter((c) => c.count > 0)
+                .map((c) => (
+                  <li key={c.kind} className="rounded-md border border-[var(--line)] bg-[var(--bg)] px-2 py-1 text-xs text-[var(--ink)]">
+                    {c.label}: {c.count}
+                  </li>
+                ))}
+            </ul>
           ) : predictedCalls ? (
             <p>API queue: no new source pulls expected.</p>
           ) : null}
@@ -950,7 +961,13 @@ export function ScoutApp() {
           {draftSaved ? (
             <p className="text-sm text-[var(--muted)]">Saved drafts/{draftSaved}</p>
           ) : null}
-          {statsNote ? (
+          {statsNote?.startsWith("Looking up") ? (
+            <TimeLeftBar
+              label={statsNote}
+              expectedMs={8_000}
+              resetKey={statsNote}
+            />
+          ) : statsNote && !(loadingReport && statsNote.startsWith("Loading ")) ? (
             <p className="text-sm text-[var(--muted)]">{statsNote}</p>
           ) : null}
           <InteractiveDraft
@@ -970,6 +987,7 @@ export function ScoutApp() {
             map={liveDraft?.map}
             watchOnly
             stormLeagueOnly
+            planLoadingLabel={livePlanLoadingLabel}
             tournamentMode={tournamentDraft}
             onTournamentModeChange={setTournamentDraft}
           />
@@ -977,10 +995,13 @@ export function ScoutApp() {
       ) : null}
 
       {matchupsFilling && report && (
-        <p className="rounded-md border border-[var(--line)] bg-[var(--panel)] px-4 py-3 text-sm text-[var(--muted)]">
-          Hero matchups are still loading. This report is ready to use and will
-          update as they finish.
-        </p>
+        <div className="rounded-md border border-[var(--line)] bg-[var(--panel)] px-4 py-3 shadow-sm">
+          <TimeLeftBar
+            label="Hero matchups are still loading. The report is ready and will update as they finish."
+            expectedMs={75_000}
+            resetKey="matchups"
+          />
+        </div>
       )}
 
       {report && (
@@ -1273,7 +1294,11 @@ function ReviewGamePicker({
     <div className="space-y-2 border-t border-[var(--line)] pt-4">
       <p className="text-sm font-medium text-[var(--ink)]">Games we&apos;ve played</p>
       {loading ? (
-        <p className="text-sm text-[var(--muted)]">Loading NGS schedule…</p>
+        <TimeLeftBar
+          label="Loading the NGS schedule and the replay list."
+          expectedMs={12_000}
+          resetKey="review-games"
+        />
       ) : !games?.length ? (
         <p className="text-sm text-[var(--muted)]">No reported games with replays yet.</p>
       ) : (

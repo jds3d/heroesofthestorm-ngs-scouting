@@ -1,5 +1,6 @@
 import { leagueConfig } from "@/config/league";
 import type { HeroStat } from "@/lib/heroesprofile/types";
+import { snapToRoster } from "@/lib/lobby/screenLobby";
 import { heroKey, heroRole } from "@/lib/scoring/heroMeta";
 import type {
   ComfortHero,
@@ -66,6 +67,38 @@ function playerDisplayName(battletag: string): string {
   return battletag.split("#")[0]?.trim() ?? battletag;
 }
 
+function screenNameKey(name: string): string {
+  return playerDisplayName(name).toLowerCase().replace(/\.+$/, "");
+}
+
+/** Match a screen or plan name to one roster row (OCR slips, truncation). */
+export function resolvePlayerScout(
+  roster: PlayerScout[],
+  player: string | null | undefined,
+): PlayerScout | undefined {
+  if (!player || !roster.length) return undefined;
+  const want = screenNameKey(player);
+  if (!want) return undefined;
+  for (const row of roster) {
+    if (screenNameKey(row.battletag) === want) return row;
+  }
+  const snapped = snapToRoster(
+    playerDisplayName(player),
+    roster.map((row) => row.battletag),
+  );
+  const fromSnap = roster.find(
+    (row) => screenNameKey(row.battletag) === screenNameKey(snapped),
+  );
+  if (fromSnap) return fromSnap;
+  if (want.length >= 6) {
+    for (const row of roster) {
+      const name = screenNameKey(row.battletag);
+      if (name.startsWith(want) || want.startsWith(name)) return row;
+    }
+  }
+  return undefined;
+}
+
 /** Comfort on a hero for one player, or the roster high when player is omitted. */
 export function playerComfortOn(
   roster: PlayerScout[],
@@ -73,21 +106,67 @@ export function playerComfortOn(
   player: string | null | undefined,
 ): number {
   if (!roster.length) return 0;
-  const want = player ? playerDisplayName(player).toLowerCase() : null;
+  if (player) {
+    const scout = resolvePlayerScout(roster, player);
+    if (!scout) return 0;
+    const hit = scout.topHeroes.find((h) => heroKey(h.hero) === heroKey(hero));
+    return hit?.comfort ?? 0;
+  }
   let best = 0;
   for (const p of roster) {
-    const name = playerDisplayName(p.battletag);
-    const nameKey = name.toLowerCase();
-    if (want && nameKey !== want) continue;
     const hit = p.topHeroes.find((h) => heroKey(h.hero) === heroKey(hero));
-    if (!hit) {
-      if (want) return 0;
-      continue;
-    }
-    if (want) return hit.comfort;
-    best = Math.max(best, hit.comfort);
+    if (hit) best = Math.max(best, hit.comfort);
   }
   return best;
+}
+
+/**
+ * Seat two heroes on two different free players by raw comfort, including
+ * samples under the suggest bar. Used when a duo still has to name who plays
+ * which hero.
+ */
+export function comfortPairOwners(
+  roster: PlayerScout[],
+  first: string,
+  second: string,
+  taken?: ReadonlySet<string>,
+): { first: SuggestableOwner; second: SuggestableOwner } | null {
+  const takenIds = new Set([...(taken ?? [])].map((name) => name.toLowerCase()));
+  const free: string[] = [];
+  for (const player of roster) {
+    const name = playerDisplayName(player.battletag);
+    if (!name || takenIds.has(name.toLowerCase())) continue;
+    if (free.some((have) => have.toLowerCase() === name.toLowerCase())) continue;
+    free.push(name);
+  }
+  if (free.length < 2) return null;
+  let best: {
+    first: SuggestableOwner;
+    second: SuggestableOwner;
+    score: number;
+  } | null = null;
+  for (const a of free) {
+    for (const b of free) {
+      if (a.toLowerCase() === b.toLowerCase()) continue;
+      const firstComfort = playerComfortOn(roster, first, a);
+      const secondComfort = playerComfortOn(roster, second, b);
+      const score = firstComfort + secondComfort;
+      if (score <= 0) continue;
+      if (
+        !best ||
+        score > best.score ||
+        (score === best.score && a.localeCompare(best.first.player) < 0)
+      ) {
+        best = {
+          first: { player: a, comfort: firstComfort },
+          second: { player: b, comfort: secondComfort },
+          score,
+        };
+      }
+    }
+  }
+  if (!best) return null;
+  return { first: best.first, second: best.second };
 }
 
 export function heroMeetsSuggestBar(
@@ -649,6 +728,69 @@ export function slHeroSuggestions(args: {
   for (const player of args.roster) {
     const name = playerDisplayName(player.battletag).toLowerCase();
     const hit = assigned.get(name);
+    if (hit) ordered.push(hit);
+  }
+  return ordered;
+}
+
+/**
+ * One hero for every player who has not locked, taken from that player's own
+ * Storm League pool. A player already seated is not in `openPlayers`, so they
+ * get nothing. Two players who share a best hero keep it for the stronger pool;
+ * the other player gets their next hero.
+ */
+export function heroesForOpenPlayers(args: {
+  openPlayers: readonly string[];
+  roster: readonly PlayerScout[];
+  gone: ReadonlySet<string>;
+}): SlHeroSuggestion[] {
+  const goneKeys = new Set([...args.gone].map((hero) => heroKey(hero)));
+  const nameOf = (tag: string) => playerDisplayName(tag).toLowerCase();
+  const rows: {
+    player: string;
+    options: { hero: string; sl: number; comfort: number; games: number }[];
+  }[] = [];
+  for (const player of args.openPlayers) {
+    const shown = player.split("#")[0]?.trim() ?? "";
+    const key = shown.toLowerCase();
+    if (!shown) continue;
+    const scout = args.roster.find((row) => nameOf(row.battletag) === key);
+    if (!scout) continue;
+    const options = scout.topHeroes
+      .map((hero) => {
+        const rank = slRank(hero);
+        return {
+          hero: hero.hero,
+          sl: rank.sl,
+          comfort: rank.sl > 0 ? hero.comfort : 0,
+          games: rank.games,
+        };
+      })
+      .filter((option) => option.sl > 0 && !goneKeys.has(heroKey(option.hero)))
+      .sort((a, b) => b.sl - a.sl || a.hero.localeCompare(b.hero));
+    if (options.length) rows.push({ player: shown, options });
+  }
+  const byStrength = [...rows].sort(
+    (a, b) => b.options[0].sl - a.options[0].sl || a.player.localeCompare(b.player),
+  );
+  const used = new Set<string>();
+  const assigned = new Map<string, SlHeroSuggestion>();
+  for (const row of byStrength) {
+    const pick = row.options.find((option) => !used.has(heroKey(option.hero)));
+    if (!pick) continue;
+    used.add(heroKey(pick.hero));
+    assigned.set(row.player.toLowerCase(), {
+      player: row.player,
+      hero: pick.hero,
+      sl: pick.sl,
+      comfort: pick.comfort,
+      games: pick.games,
+    });
+  }
+  const ordered: SlHeroSuggestion[] = [];
+  for (const player of args.openPlayers) {
+    const key = (player.split("#")[0]?.trim() ?? "").toLowerCase();
+    const hit = assigned.get(key);
     if (hit) ordered.push(hit);
   }
   return ordered;
