@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import {
+  countPendingMatchupCallsByHero,
   getGlobalHeroStats,
   getHeroMatchupsMany,
 } from "@/lib/heroesprofile/client";
@@ -8,7 +9,7 @@ import { heroKey, heroRole } from "@/lib/scoring/heroMeta";
 import { isScoutBudgetExceeded, runWithScoutBudget } from "@/lib/scout/budget";
 
 /** Stay under Cloudflare's ~125s proxy timeout so the browser gets JSON. */
-const MATCHUP_REQUEST_BUDGET_MS = 70_000;
+const MATCHUP_REQUEST_BUDGET_MS = 90_000;
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 300;
@@ -25,7 +26,13 @@ export async function GET(request: Request) {
     );
   } catch (err) {
     if (isScoutBudgetExceeded(err)) {
-      return NextResponse.json({ patch: "", byHero: {}, incomplete: true });
+      return NextResponse.json({
+        patch: "",
+        byHero: {},
+        incomplete: true,
+        error:
+          "Server time limit reached before matchups finished (not Heroes Profile quota).",
+      });
     }
     const message = err instanceof Error ? err.message : "Matchup fetch failed";
     return NextResponse.json({ error: message, byHero: {} }, { status: 502 });
@@ -33,9 +40,10 @@ export async function GET(request: Request) {
 }
 
 async function matchupsResponse(request: Request) {
+  const params = new URL(request.url).searchParams;
   const heroes = [
     ...new Set(
-      (new URL(request.url).searchParams.get("heroes") ?? "")
+      (params.get("heroes") ?? "")
         .split("|")
         .map((s) => s.trim())
         .filter((name) => name && heroRole(name) !== "Unknown"),
@@ -46,12 +54,22 @@ async function matchupsResponse(request: Request) {
     return NextResponse.json({ patch: "", byHero: {} });
   }
 
-  const { patch, byHero: bundles, incomplete } = await getHeroMatchupsMany(heroes);
+  const heroApiCalls = await countPendingMatchupCallsByHero(heroes);
+  const pendingCalls = Object.values(heroApiCalls).reduce(
+    (sum, n) => sum + n,
+    0,
+  );
+  const cacheOnly = pendingCalls === 0;
+  const { patch, byHero: bundles, incomplete } = await getHeroMatchupsMany(heroes, {
+    cacheOnly,
+  });
   let global: Awaited<ReturnType<typeof getGlobalHeroStats>> = [];
-  try {
-    global = await getGlobalHeroStats();
-  } catch (err) {
-    if (!isScoutBudgetExceeded(err)) throw err;
+  if (!cacheOnly) {
+    try {
+      global = await getGlobalHeroStats();
+    } catch (err) {
+      if (!isScoutBudgetExceeded(err)) throw err;
+    }
   }
   const matchups: Record<string, (typeof bundles)[string]["enemies"]> = {};
   const allies: Record<string, (typeof bundles)[string]["allies"]> = {};
@@ -75,6 +93,9 @@ async function matchupsResponse(request: Request) {
   return NextResponse.json({
     patch: built.patch,
     byHero: rows,
+    pendingCalls,
+    heroApiCalls,
+    fromCache: pendingCalls === 0,
     ...(incomplete ? { incomplete: true } : {}),
   });
 }

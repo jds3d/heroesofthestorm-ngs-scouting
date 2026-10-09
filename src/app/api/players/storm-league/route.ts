@@ -14,8 +14,8 @@ export async function GET(request: Request) {
   if (!tags.length) return NextResponse.json({ players: [] });
 
   try {
-    const players = await loadStormLeaguePlayers(tags);
-    return NextResponse.json({ players });
+    const { players, apiCalls, cacheCalls } = await loadStormLeaguePlayers(tags);
+    return NextResponse.json({ players, apiCalls, cacheCalls });
   } catch (err) {
     const message =
       err instanceof HeroesProfileError

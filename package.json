@@ -8,7 +8,8 @@
     "start": "next start",
     "lint": "eslint",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "sync:portraits": "vitest run --config vitest.portrait-sync.config.ts"
   },
   "dependencies": {
     "hots-parser": "^7.55.7",

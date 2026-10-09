@@ -58,13 +58,13 @@ import {
   mapSpecialistTooltip,
   liveCountersUp,
   mergeLoadedMatchupRows,
+  matchupFetchQueue,
   missingDuoLabel,
   missingDuoReason,
   suggestionDataGap,
   suggestionDataGapTooltip,
   type SuggestionDataGap,
   MATCHUP_FETCH_BATCH,
-  matchupFetchQueue,
   heroStormLeagueLoadState,
   nakedOfflaneOpeningRisk,
   scoreDuos,
@@ -96,8 +96,10 @@ import {
   type LockedPick,
 } from "@/lib/scoring/draftSwap";
 import {
+  BELOW_BAR_SEAT_PENALTY,
   COMFORT_PICK_CAP,
   COMFORT_PICK_MULTIPLIER,
+  COMFORT_SUGGEST_MIN,
   comfortMeetsSuggestBar,
   comfortPickPoints,
   filterBanList,
@@ -115,6 +117,7 @@ import {
 import { heroKey, heroRole, heroTags } from "@/lib/scoring/heroMeta";
 import { checkRequiredRoles, UNFILLABLE_ROLE_PENALTY } from "@/lib/scoring/roles";
 import {
+  likelyPicksUnderOpenSlots,
   rebuildTheirRemainingFive,
   type TheirRemainingSeat,
 } from "@/lib/scoring/theirFive";
@@ -128,6 +131,20 @@ import type {
   PlayerScout,
 } from "@/lib/scoring/types";
 import { allDraftHeroes } from "@/lib/scoring/heroPortrait";
+import {
+  loadSessionMatchups,
+  saveSessionMatchups,
+} from "@/lib/scoring/matchupSession";
+import {
+  MatchupHeroLoadBars,
+  MatchupHeroLoadLines,
+} from "@/components/MatchupHeroLoadBars";
+import { recordMatchupLoadBatch } from "@/lib/scoring/liveLoadCallStats";
+import {
+  type LiveSuggestionsGate,
+  type MatchupLoadMode,
+  matchupLoadKindLine,
+} from "@/lib/scoring/matchupLoadDisplay";
 import {
   percentileRank,
   roleMatchedPair,
@@ -205,6 +222,10 @@ type MatchupTrackStage = "spotted" | "pulling" | "cached" | "scored" | "failed";
 type MatchupTrack = {
   stage: MatchupTrackStage;
   heroes: string[];
+  queueRemaining?: number;
+  loadMode?: MatchupLoadMode;
+  pendingCalls?: number;
+  heroApiCalls?: Record<string, number>;
 };
 
 type ScoredOption = {
@@ -657,6 +678,13 @@ type Suggestion = {
   options: ScoredOption[];
   /** Each option is one open player's suggestion, not an alternate for the first. */
   perPlayer?: boolean;
+  /** Live watch: one column per roster seat, three picks deep. */
+  perPlayerGrid?: {
+    player: string;
+    open: boolean;
+    lockedHero: string | null;
+    options: ScoredOption[];
+  }[];
   /**
    * Double-pick windows: the top pair before any hero was clicked. Options get
    * re-seeded around the first click; grading still compares to this.
@@ -1184,6 +1212,21 @@ export function buildPickScorecard(args: {
     comfortDetail,
     `min(${COMFORT_PICK_CAP}, ${args.comfort.toFixed(2)} × ${COMFORT_PICK_MULTIPLIER}) = ${comfortPts.toFixed(2)} → rounded to ${Math.round(comfortPts)}`,
   );
+
+  if (
+    args.kind === "pick" &&
+    args.comfortWho &&
+    args.comfort < COMFORT_SUGGEST_MIN
+  ) {
+    addFactor(
+      factors,
+      "below-bar",
+      "Not on player pool",
+      BELOW_BAR_SEAT_PENALTY,
+      `${args.comfortWho} is under the ${(COMFORT_SUGGEST_MIN * 100).toFixed(0)} comfort bar on ${args.hero} — do not suggest a blind pick for that seat.`,
+      `flat ${BELOW_BAR_SEAT_PENALTY} when a named seat is below the suggest bar`,
+    );
+  }
 
   if (args.kind === "pick" && args.unplayed) {
     addFactor(
@@ -3374,6 +3417,7 @@ export function InteractiveDraft({
   onTournamentModeChange,
   stormLeagueOnly = false,
   planLoadingLabel = null,
+  onSuggestionsGate,
   onWatchReset,
 }: {
   tree: DraftTreeNode;
@@ -3434,6 +3478,8 @@ export function InteractiveDraft({
   stormLeagueOnly?: boolean;
   /** Shown while meta or player pools are still loading in live mode. */
   planLoadingLabel?: string | null;
+  /** Live pizza tracker: matchups still blocking suggestions. */
+  onSuggestionsGate?: (gate: LiveSuggestionsGate | null) => void;
   /** Clears the screen reader so the next frames load a new draft. */
   onWatchReset?: () => void;
 }) {
@@ -3453,17 +3499,23 @@ export function InteractiveDraft({
   const [deviationNote, setDeviationNote] = useState<DeviationReport | null>(
     null,
   );
-  const [matchupPatch, setMatchupPatch] = useState<DraftMetaTable | null>(null);
+  const [matchupPatch, setMatchupPatch] = useState<DraftMetaTable | null>(() =>
+    loadSessionMatchups(),
+  );
   const [matchupPending, setMatchupPending] = useState<string[]>([]);
   const [matchupError, setMatchupError] = useState<string | null>(null);
   const [matchupTrack, setMatchupTrack] = useState<MatchupTrack | null>(null);
   const [matchupRetry, setMatchupRetry] = useState(0);
-  const [gapLogged, setGapLogged] = useState(false);
   const matchupAttempts = useRef({ key: "", n: 0 });
+  const matchupLoadStatsRecorded = useRef(new Set<string>());
   const gapSession = useRef(
     `game-${new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z")}-${Math.random().toString(36).slice(2, 8)}`,
   );
   const scoringMeta = matchupPatch ?? draftMeta;
+  const scoringMetaRef = useRef(scoringMeta);
+  scoringMetaRef.current = scoringMeta;
+  const draftMetaRef = useRef(draftMeta);
+  draftMetaRef.current = draftMeta;
   const screenDefaulted = useRef(Boolean(screen));
   useEffect(() => {
     if (tournamentMode !== undefined) return;
@@ -3660,6 +3712,21 @@ export function InteractiveDraft({
     [history, observedPicks, theirRoster, tournamentDraftMode],
   );
 
+  const ourHeld = useMemo(
+    () =>
+      playersSeatedOnLocks({
+        locks: seatLocks(
+          history,
+          "our",
+          observedPicks?.ourPicks,
+          observedPicks?.ourPickPlayers,
+        ),
+        roster: homeRoster,
+        claimUnnamed: !tournamentDraftMode,
+      }),
+    [history, observedPicks, homeRoster, tournamentDraftMode],
+  );
+
   const theirRemainingFive = useMemo(() => {
     if (!watchOnly) return [];
     return rebuildTheirRemainingFive({
@@ -3672,8 +3739,84 @@ export function InteractiveDraft({
       openPlayers: observedPicks?.theirOpenPlayers ?? [],
       roster: theirRoster,
       gone,
+      metaTable: scoringMeta,
+      heroPool: allHeroes,
     });
-  }, [watchOnly, history, observedPicks, theirRoster, gone]);
+  }, [watchOnly, history, observedPicks, theirRoster, gone, scoringMeta, allHeroes]);
+
+  const theirLikelyBan = useMemo(() => {
+    if (!watchOnly) return null;
+    const banSlots = slotsFor(history, "their", "ban", 3);
+    const lastOpen = banSlots.findLastIndex((slot) => !slot);
+    if (lastOpen < 0) return null;
+    const field = allHeroes.filter((hero) => {
+      if (isGone(hero, gone)) return false;
+      return (
+        !homeRoster.length || heroMeetsSuggestBar(homeRoster, hero, null)
+      );
+    });
+    if (!field.length) return null;
+    const ourLockedHeroes = history
+      .filter((action) => action.side === "our" && action.kind === "pick")
+      .map((action) => action.hero);
+    const theirLockedHeroes = history
+      .filter((action) => action.side === "their" && action.kind === "pick")
+      .map((action) => action.hero);
+    const isLastStep = stepIndex === DRAFT_ORDER.length - 1;
+    const scored = field
+      .map((hero) => {
+        const sig = comfortSignal(homeRoster, hero, null, ourHeld);
+        return buildPickScorecard({
+          hero,
+          table: scoringMeta,
+          gone,
+          map: map ?? null,
+          ourPickCount: theirPickCount,
+          inPlan: false,
+          fromAlt: false,
+          planRole: null,
+          lockedAllies: ourLockedHeroes,
+          theirLocked: theirLockedHeroes,
+          answeringTeamPool: ourHeroPool,
+          answerPerspective: "theirs",
+          theirLikely: planPicks,
+          banPriority: playableBanPriority,
+          theirRoster: homeRoster,
+          comfort: sig.comfort,
+          comfortWho: sig.who,
+          swapDelta: 0,
+          swapNote: null,
+          takeAndRebuild: false,
+          kind: "ban",
+          lastPick: isLastStep,
+          matchupQueued: matchupPending,
+        });
+      })
+      .sort((a, b) => b.total - a.total || a.hero.localeCompare(b.hero));
+    const top = scored[0];
+    if (!top) return null;
+    const who = comfortSignal(homeRoster, top.hero, null, ourHeld).who;
+    return {
+      hero: top.hero,
+      player: who,
+      slotIndex: lastOpen,
+    };
+  }, [
+    watchOnly,
+    history,
+    gone,
+    allHeroes,
+    homeRoster,
+    scoringMeta,
+    map,
+    theirPickCount,
+    planPicks,
+    playableBanPriority,
+    ourHeroPool,
+    stepIndex,
+    matchupPending,
+    ourHeld,
+  ]);
 
   // Suggesting and grading share these scorers, so taking the top suggestion
   // always grades as the top option open — no hidden better hero in the field.
@@ -4112,6 +4255,138 @@ export function InteractiveDraft({
    * Players whose portrait is still open. Empty after everyone on that side
    * has locked. Null when the screen has not named anyone yet.
    */
+  function playerForOpenHero(hero: string): string | null {
+    const { roster, taken } = pickingSide();
+    const still = playersStillToLock();
+    const owners = playersMeetingSuggestBar(roster, hero, suggestionTaken(taken));
+    if (!owners.length) return null;
+    if (still?.size) {
+      const open = owners.find((owner) =>
+        still.has(owner.player.toLowerCase()),
+      );
+      if (open) return open.player;
+    }
+    return owners[0]?.player ?? null;
+  }
+
+  function watchOurColumnRoster(): {
+    player: string;
+    open: boolean;
+    lockedHero: string | null;
+  }[] {
+    if (!observedPicks) return [];
+    const still = playersStillToLock();
+    const pickPlayers = observedPicks.ourPickPlayers ?? [];
+    const picks = observedPicks.ourPicks ?? [];
+    const openNames = observedPicks.ourOpenPlayers ?? [];
+    const ordered: string[] = [];
+    for (const raw of pickPlayers) {
+      if (!raw) continue;
+      const name = displayPlayer(raw);
+      if (!name) continue;
+      if (!ordered.some((have) => have.toLowerCase() === name.toLowerCase())) {
+        ordered.push(name);
+      }
+    }
+    for (const raw of openNames) {
+      const name = displayPlayer(raw);
+      if (!name) continue;
+      if (!ordered.some((have) => have.toLowerCase() === name.toLowerCase())) {
+        ordered.push(name);
+      }
+    }
+    for (const scout of homeRoster) {
+      const name = displayPlayer(scout.battletag);
+      if (!name) continue;
+      if (!ordered.some((have) => have.toLowerCase() === name.toLowerCase())) {
+        ordered.push(name);
+      }
+      if (ordered.length >= 5) break;
+    }
+    const heroFor = (player: string) => {
+      for (let i = 0; i < pickPlayers.length; i++) {
+        const raw = pickPlayers[i];
+        if (!raw) continue;
+        const tag = displayPlayer(raw);
+        if (!tag || tag.toLowerCase() !== player.toLowerCase()) {
+          continue;
+        }
+        return picks[i] ?? null;
+      }
+      return null;
+    };
+    return ordered.slice(0, 5).map((player) => {
+      const open = still ? still.has(player.toLowerCase()) : true;
+      const lockedHero = open ? null : heroFor(player);
+      return { player, open, lockedHero };
+    });
+  }
+
+  function watchPerPlayerGrid(sugg: Suggestion) {
+    if (!watchOnly || !ours || step?.kind !== "pick") return null;
+    if (!pairWindow && sugg.options[0]?.pairWith) return null;
+    const columns = watchOurColumnRoster().filter((column) => column.open);
+    if (!columns.length) return null;
+    const field = gradeField(sugg);
+    const isLastStep = stepIndex === DRAFT_ORDER.length - 1;
+    const ourLockedHeroes = history
+      .filter((action) => action.side === "our" && action.kind === "pick")
+      .map((action) => action.hero);
+    const theirLockedHeroes = history
+      .filter((action) => action.side === "their" && action.kind === "pick")
+      .map((action) => action.hero);
+    const locked = ourLockedPicks(history, planPicks, homeRoster);
+    const weAnswer = false;
+    const answeringTeamLocked = theirLockedHeroes;
+    return columns.map(({ player, open, lockedHero }) => {
+      if (!open) {
+        return { player, open, lockedHero, options: [] as ScoredOption[] };
+      }
+      const options = field
+        .map((hero) => {
+          const seat = findSeatForCandidate(
+            sugg.planPicks.length ? sugg.planPicks : planPicks,
+            hero,
+          );
+          const sig = comfortSignal(homeRoster, hero, player);
+          const reseat = reseatFor(homeRoster, locked, hero, planPicks);
+          const card = buildPickScorecard({
+            hero,
+            table: scoringMeta,
+            gone,
+            map: map ?? null,
+            ourPickCount,
+            inPlan: Boolean(seat),
+            fromAlt: Boolean(seat?.asAlt),
+            planRole: seat?.seat.role ?? null,
+            lockedAllies: ourLockedHeroes,
+            theirLocked: answeringTeamLocked,
+            answeringTeamPool: ourHeroPool,
+            answerPerspective: weAnswer ? "ours" : "theirs",
+            theirLikely,
+            banPriority: playableBanPriority,
+            theirRoster,
+            comfort: sig.comfort,
+            comfortWho: player,
+            swapDelta: reseat.swapDelta,
+            swapNote: reseat.swapNote,
+            takeAndRebuild: shouldTakeAndRebuild(scoringMeta, hero),
+            kind: "pick",
+            lastPick: isLastStep,
+            unplayed: heroUnplayedBy(homeRoster, hero),
+            matchupQueued: matchupPending,
+          });
+          return {
+            ...withRolesFactor(card, ourLockedHeroes),
+            player,
+          };
+        })
+        .sort((a, b) => b.total - a.total || a.hero.localeCompare(b.hero))
+        .slice(0, 3);
+      return { player, open, lockedHero, options };
+    });
+  }
+
   function playersStillToLock(): Set<string> | null {
     if (!watchOnly || !observedPicks) return null;
     const names = ours
@@ -4296,7 +4571,7 @@ export function InteractiveDraft({
     if (heroKey(chosen.hero) === heroKey(top.hero)) {
       if (!ours && !watchOnly) return base;
       const seen = new Set<string>();
-      const options = [...base.options, ...rankedField].filter((option) => {
+      const options = [...rankedField, ...base.options].filter((option) => {
         if (seen.has(heroKey(option.hero))) return false;
         seen.add(heroKey(option.hero));
         return true;
@@ -4475,7 +4750,41 @@ export function InteractiveDraft({
     ],
   );
   const matchupTargetKey = matchupMissing.join("|");
-  const suggestion = provisional;
+  useEffect(() => {
+    if (!watchOnly || !onSuggestionsGate) {
+      onSuggestionsGate?.(null);
+      return;
+    }
+    if (!matchupPending.length) {
+      onSuggestionsGate(null);
+      return;
+    }
+    onSuggestionsGate({
+      matchupsLoading: true,
+      loadMode: matchupTrack?.loadMode,
+      heroes: matchupPending,
+      heroApiCalls: matchupTrack?.heroApiCalls,
+    });
+  }, [
+    watchOnly,
+    onSuggestionsGate,
+    matchupPending,
+    matchupTrack?.loadMode,
+    matchupTrack?.heroApiCalls,
+  ]);
+  const suggestion = (() => {
+    if (!provisional) return null;
+    const grid = watchPerPlayerGrid(provisional);
+    if (!grid?.length) return provisional;
+    const flat = grid.flatMap((column) => column.options);
+    return {
+      ...provisional,
+      perPlayer: true,
+      perPlayerGrid: grid,
+      options: flat.length ? flat : provisional.options,
+      hero: flat[0]?.hero ?? provisional.hero,
+    };
+  })();
   const logDataGaps = watchOnly || observedPicks != null || Boolean(replay?.length);
   const gapLogKey = useMemo(() => {
     if (!logDataGaps || !suggestion?.options.length) return "";
@@ -4529,26 +4838,35 @@ export function InteractiveDraft({
         },
         body: gapLogKey,
       })
-        .then((res) => {
-          if (res.ok) setGapLogged(true);
-        })
         .catch(() => undefined);
     }, 600);
     return () => window.clearTimeout(timer);
   }, [gapLogKey]);
 
+  const draftMetaPatch = draftMeta?.patch ?? "";
   useEffect(() => {
-    setMatchupPatch(null);
+    setMatchupPatch((prev) => {
+      if (!draftMetaPatch) return prev;
+      if (!prev || prev.patch === draftMetaPatch) return prev;
+      saveSessionMatchups(null);
+      return null;
+    });
     setMatchupPending([]);
     setMatchupError(null);
     setMatchupTrack(null);
-  }, [draftMeta]);
+  }, [draftMetaPatch]);
+
+  const matchupBatchKey = useMemo(() => {
+    const all = matchupTargetKey.split("|").filter(Boolean);
+    return all.slice(0, MATCHUP_FETCH_BATCH).join("|");
+  }, [matchupTargetKey]);
 
   useEffect(() => {
     const all = matchupTargetKey.split("|").filter(Boolean);
     const batch = all.slice(0, MATCHUP_FETCH_BATCH);
-    if (matchupAttempts.current.key !== matchupTargetKey) {
-      matchupAttempts.current = { key: matchupTargetKey, n: 0 };
+    const batchKey = batch.join("|");
+    if (matchupAttempts.current.key !== batchKey) {
+      matchupAttempts.current = { key: batchKey, n: 0 };
     }
     if (!batch.length) {
       setMatchupPending([]);
@@ -4557,18 +4875,39 @@ export function InteractiveDraft({
       );
       return;
     }
-    const ctrl = new AbortController();
+    const alreadyLoaded = matchupFetchQueue(
+      scoringMetaRef.current,
+      batch,
+      matchupScope.priority,
+    );
+    if (!alreadyLoaded.length) {
+      const statsKey = `session:${batchKey}`;
+      if (!matchupLoadStatsRecorded.current.has(statsKey)) {
+        matchupLoadStatsRecorded.current.add(statsKey);
+        recordMatchupLoadBatch("session");
+      }
+      setMatchupPending([]);
+      setMatchupTrack({
+        stage: "scored",
+        heroes: batch,
+        loadMode: "session",
+      });
+      return;
+    }
+    const mainCtrl = new AbortController();
     let cancelled = false;
     let timedOut = false;
     let retryTimer = 0;
     const names = batch.join(", ");
+    const quotaNote =
+      " Heroes Profile still shows plenty of calls left — this is usually our server/browser time limit or a cancelled request.";
     const giveUp = (message: string) => {
       setMatchupError(message);
       setMatchupTrack({ stage: "failed", heroes: batch });
       setMatchupPending([]);
     };
     const retryOrStop = (message: string) => {
-      if (matchupAttempts.current.n >= 2) {
+      if (matchupAttempts.current.n >= 3) {
         giveUp(message);
         return;
       }
@@ -4579,15 +4918,20 @@ export function InteractiveDraft({
     };
     setMatchupPending(batch);
     setMatchupError(null);
-    setMatchupTrack({ stage: "pulling", heroes: all });
+    setMatchupTrack({
+      stage: "pulling",
+      heroes: batch,
+      queueRemaining: Math.max(0, all.length - batch.length),
+    });
     const url = `/api/matchups?heroes=${encodeURIComponent(batch.join("|"))}`;
     const secret = process.env.NEXT_PUBLIC_SCOUT_API_SECRET?.trim();
+    const clientTimeoutMs = 100_000;
     const slowTimer = window.setTimeout(() => {
       timedOut = true;
-      ctrl.abort();
-    }, 80_000);
+      mainCtrl.abort();
+    }, clientTimeoutMs);
     fetch(url, {
-      signal: ctrl.signal,
+      signal: mainCtrl.signal,
       headers: secret ? { "x-scout-secret": secret } : {},
     })
       .then(async (res) => {
@@ -4598,57 +4942,118 @@ export function InteractiveDraft({
           byHero?: DraftMetaTable["byHero"];
           error?: string;
           incomplete?: boolean;
+          fromCache?: boolean;
+          pendingCalls?: number;
+          heroApiCalls?: Record<string, number>;
         };
         try {
           body = JSON.parse(raw) as typeof body;
         } catch {
           retryOrStop(
-            `Storm League timed out before ${names} came back. You can keep drafting; those duos stay at 0.`,
+            `Matchup response was not JSON for ${names}.${quotaNote} Duos stay at 0 until a retry works.`,
           );
           return;
         }
         if (cancelled) return;
         if (!res.ok) {
-          giveUp(body.error || "Matchup fetch failed");
+          giveUp((body.error || "Matchup fetch failed") + quotaNote);
           return;
         }
+        const statsKey = `batch:${batchKey}`;
+        if (!matchupLoadStatsRecorded.current.has(statsKey)) {
+          matchupLoadStatsRecorded.current.add(statsKey);
+          recordMatchupLoadBatch(
+            body.fromCache ? "cache" : "api",
+            body.pendingCalls ?? 0,
+          );
+        }
+        setMatchupTrack((current) =>
+          current?.stage === "pulling" && current.heroes.join("|") === batchKey
+            ? {
+                ...current,
+                loadMode: body.fromCache ? "cache" : "api",
+                pendingCalls: body.pendingCalls,
+                heroApiCalls: body.heroApiCalls,
+              }
+            : current,
+        );
         const rows = body.byHero ?? {};
         if (Object.keys(rows).length) {
-          setMatchupPatch((prev) =>
-            mergeLoadedMatchupRows(prev ?? draftMeta, rows, body.patch ?? ""),
-          );
+          setMatchupPatch((prev) => {
+            const merged = mergeLoadedMatchupRows(
+              prev ?? draftMetaRef.current,
+              rows,
+              body.patch ?? "",
+            );
+            saveSessionMatchups(merged);
+            return merged;
+          });
         }
         const returned = new Set(Object.keys(rows).map((key) => heroKey(key)));
         const failed = batch.filter((hero) => !returned.has(heroKey(hero)));
-        if (body.incomplete && failed.length) {
-          retryOrStop(
-            `Storm League timed out before ${failed.join(", ")} came back. You can keep drafting; those duos stay at 0.`,
-          );
-          return;
-        }
         if (failed.length) {
+          const partial = Object.keys(rows).length > 0;
+          const reason =
+            body.error ||
+            (body.incomplete
+              ? `Server time limit before ${failed.join(", ")} finished`
+              : `No matchup rows returned for ${failed.join(", ")}`);
+          if (body.incomplete && partial) {
+            setMatchupPending([]);
+            setMatchupRetry((n) => n + 1);
+            return;
+          }
           retryOrStop(
-            `Could not load Storm League matchups for ${failed.join(", ")}. Those duos stay at 0.`,
+            `${reason}.${quotaNote} You can keep drafting; those duos stay at 0.`,
           );
           return;
         }
-        setMatchupTrack({ stage: "cached", heroes: batch });
+        setMatchupTrack({
+          stage: "cached",
+          heroes: batch,
+          loadMode: body.fromCache ? "cache" : "api",
+          pendingCalls: body.pendingCalls,
+          heroApiCalls: body.heroApiCalls,
+        });
         setMatchupPending([]);
       })
       .catch((err: unknown) => {
         if (cancelled && !timedOut) return;
         if (err instanceof DOMException && err.name === "AbortError" && !timedOut) return;
         retryOrStop(
-          `Storm League timed out before ${names} came back. You can keep drafting; those duos stay at 0.`,
+          `Matchup fetch stopped for ${names} (browser timeout or network).${quotaNote} Duos stay at 0.`,
         );
       });
     return () => {
       cancelled = true;
-      ctrl.abort();
+      mainCtrl.abort();
       window.clearTimeout(slowTimer);
       window.clearTimeout(retryTimer);
     };
-  }, [matchupTargetKey, draftMeta, matchupRetry]);
+  }, [matchupBatchKey, matchupRetry]);
+
+  /** Merged meta can land without re-running the fetch effect (avoid aborting cache reads). */
+  useEffect(() => {
+    const batch = matchupBatchKey.split("|").filter(Boolean);
+    if (!batch.length) return;
+    if (matchupFetchQueue(scoringMeta, batch).length) return;
+    setMatchupPending((pending) => {
+      if (!pending.length) return pending;
+      const still = matchupFetchQueue(scoringMeta, pending);
+      return still.length ? pending : [];
+    });
+    setMatchupTrack((current) => {
+      if (current?.stage !== "pulling") return current;
+      const batchKeys = new Set(batch.map((h) => heroKey(h)));
+      const sameBatch = current.heroes.every((h) => batchKeys.has(heroKey(h)));
+      if (!sameBatch) return current;
+      return {
+        ...current,
+        stage: "scored",
+        loadMode: current.loadMode ?? "session",
+      };
+    });
+  }, [scoringMeta, matchupBatchKey]);
 
   useEffect(() => {
     if (
@@ -5333,7 +5738,7 @@ export function InteractiveDraft({
         cautionLine: null,
         swapLine: null,
         reason: `Plan heroes are gone — ${fallback} is still up.`,
-        options: [{ ...opt, player: null }],
+        options: [{ ...opt, player: playerForOpenHero(fallback) }],
       };
     }
 
@@ -6254,20 +6659,29 @@ export function InteractiveDraft({
 
   return (
     <div className="relative space-y-4 overflow-visible rounded-md border border-[#2a3a48] bg-[#0f1821] p-4 text-[#e8eef2]">
-      {matchupTrack ? (
+      {matchupTrack &&
+      (!watchOnly || matchupTrack.stage === "failed") ? (
         <MatchupTracker
           track={matchupTrack}
           error={matchupError}
-          onDismiss={() => setMatchupTrack(null)}
+          compact={watchOnly}
+          onDismiss={() => {
+            setMatchupTrack(null);
+            setMatchupError(null);
+          }}
         />
       ) : null}
-      {matchupPending.length > 0 || matchupMissing.length > 0 ? (
+      {!watchOnly &&
+      (matchupPending.length > 0 || matchupMissing.length > 0) ? (
         <BoardStormLeagueLoadBar
           pending={matchupPending}
           queued={matchupMissing}
           failed={
             matchupTrack?.stage === "failed" ? matchupTrack.heroes : []
           }
+          loadMode={matchupTrack?.loadMode}
+          pendingCalls={matchupTrack?.pendingCalls}
+          heroApiCalls={matchupTrack?.heroApiCalls}
         />
       ) : null}
       <div className="flex flex-wrap items-center justify-between gap-2">
@@ -6330,8 +6744,13 @@ export function InteractiveDraft({
         matchupFailed={
           matchupTrack?.stage === "failed" ? matchupTrack.heroes : []
         }
+        likelyBan={theirLikelyBan}
+        likelyPicks={
+          watchOnly
+            ? likelyPicksUnderOpenSlots(theirPicks, theirRemainingFive)
+            : null
+        }
       />
-      {watchOnly ? <TheirRemainingFive seats={theirRemainingFive} /> : null}
       <DraftSideRow
         label={ourLabel}
         bans={ourBans}
@@ -6345,16 +6764,6 @@ export function InteractiveDraft({
           matchupTrack?.stage === "failed" ? matchupTrack.heroes : []
         }
       />
-
-      {screen ? (
-        <ReconstructedDraftOrder
-          actions={screen}
-          weFirst={weFirst}
-          sideKnown={sideKnown}
-          ourLabel={ourLabel}
-          theirLabel={theirLabel}
-        />
-      ) : null}
 
       {remainingBans.length > 0 && (
         <div className="space-y-2">
@@ -6512,14 +6921,7 @@ export function InteractiveDraft({
                 expectedMs={22_000}
                 resetKey={planLoadingLabel}
               />
-            ) : watchOnly && sideKnown ? (
-              <p className="text-sm text-[#c5d4e0]">
-                {tournamentDraftMode
-                  ? "Our ban and pick suggestions use Storm League comfort on whoever is still open. Heroes lock from the shared screen."
-                  : "Our ban and pick suggestions use Storm League comfort on whoever is still open. The player who locks a hero plays it."}
-              </p>
             ) : null}
-
             {shownDeviation && (
               <DeviationCallout
                 note={shownDeviation}
@@ -6570,60 +6972,118 @@ export function InteractiveDraft({
 
             {suggestion && (
               <div className="flex flex-wrap items-start gap-4 rounded-md border border-[var(--accent)]/40 bg-[var(--accent)]/10 px-3 py-3">
-                {gapLogged ? (
-                  <p className="basis-full text-xs font-semibold text-amber-200/90">
-                    These badges are logged in drafts/data-gaps.md.
-                  </p>
-                ) : null}
                 <MissingDuoBanner
                   options={suggestion.options}
                   pending={matchupPending}
                   error={matchupError}
+                  loadMode={matchupTrack?.loadMode}
+                  heroApiCalls={matchupTrack?.heroApiCalls}
                 />
-                <div className="flex flex-wrap items-start gap-3">
-                  {suggestion.options.map((opt, i) => (
-                    <ScoredHeroOption
-                      key={
-                        suggestion.perPlayer && opt.player
-                          ? opt.displayLabel ?? opt.player
-                          : opt.pairWith
-                          ? `${opt.hero}+${opt.pairWith}`
-                          : opt.hero
-                      }
-                      option={opt}
-                      rank={i + 1}
-                      queued={matchupMissing}
-                      failedHeroes={
-                        matchupTrack?.stage === "failed" ? matchupTrack.heroes : []
-                      }
-                      badge={
-                        suggestion.perPlayer && opt.player
-                          ? opt.displayLabel ?? opt.player
-                          : i === 0
-                          ? suggestion.badge
-                          : i === 1
-                            ? opt.pairWith
-                              ? "Alt pair #2"
-                              : "Alt #2"
+                {suggestion.perPlayerGrid ? (
+                  <div
+                    className="grid w-full gap-3"
+                    style={{
+                      gridTemplateColumns: `repeat(${Math.min(
+                        5,
+                        suggestion.perPlayerGrid.length,
+                      )}, minmax(0, 1fr))`,
+                    }}
+                  >
+                    {suggestion.perPlayerGrid.map((column) => (
+                      <div key={column.player} className="min-w-0 space-y-1.5">
+                        <p
+                          className="truncate text-center text-[10px] font-bold uppercase tracking-wide text-[#dfeaf4]"
+                          title={column.player}
+                        >
+                          {column.player}
+                        </p>
+                        <div className="flex flex-col gap-1">
+                          {column.options.length ? (
+                            column.options.map((opt, i) => (
+                              <ScoredHeroOption
+                                key={`${column.player}-${opt.hero}`}
+                                compact
+                                dense
+                                option={opt}
+                                rank={i + 1}
+                                queued={matchupMissing}
+                                failedHeroes={
+                                  matchupTrack?.stage === "failed"
+                                    ? matchupTrack.heroes
+                                    : []
+                                }
+                                badge={i === 0 ? "Top" : `#${i + 1}`}
+                                banned={step?.kind === "ban"}
+                                canLock={!watchOnly}
+                                onLock={() =>
+                                  lock(
+                                    pairCardClickHero(
+                                      opt.hero,
+                                      opt.pairWith,
+                                      pairPick,
+                                    ),
+                                    `${opt.hero} for ${column.player} (${signedPoints(opt.total)})`,
+                                  )
+                                }
+                              />
+                            ))
+                          ) : (
+                            <p className="text-center text-[10px] text-[#5a6b78]">
+                              No picks ranked
+                            </p>
+                          )}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="flex flex-wrap items-start gap-3">
+                    {suggestion.options.map((opt, i) => (
+                      <ScoredHeroOption
+                        key={
+                          suggestion.perPlayer && opt.player
+                            ? opt.displayLabel ?? opt.player
                             : opt.pairWith
-                              ? `Alt pair #${i + 1}`
-                              : `Alt #${i + 1}`
-                      }
-                      banned={step?.kind === "ban"}
-                      canLock={!watchOnly}
-                      onLock={() =>
-                        lock(
-                          pairCardClickHero(opt.hero, opt.pairWith, pairPick),
-                          i === 0
-                            ? suggestion.reason
-                            : opt.pairWith
-                              ? `${opt.hero} then ${opt.pairWith} scored ${opt.total}`
-                              : `${opt.hero} scored ${opt.total}`,
-                        )
-                      }
-                    />
-                  ))}
-                </div>
+                              ? `${opt.hero}+${opt.pairWith}`
+                              : opt.hero
+                        }
+                        option={opt}
+                        rank={i + 1}
+                        queued={matchupMissing}
+                        failedHeroes={
+                          matchupTrack?.stage === "failed"
+                            ? matchupTrack.heroes
+                            : []
+                        }
+                        badge={
+                          suggestion.perPlayer && opt.player
+                            ? opt.displayLabel ?? opt.player
+                            : i === 0
+                              ? suggestion.badge
+                              : i === 1
+                                ? opt.pairWith
+                                  ? "Alt pair #2"
+                                  : "Alt #2"
+                                : opt.pairWith
+                                  ? `Alt pair #${i + 1}`
+                                  : `Alt #${i + 1}`
+                        }
+                        banned={step?.kind === "ban"}
+                        canLock={!watchOnly}
+                        onLock={() =>
+                          lock(
+                            pairCardClickHero(opt.hero, opt.pairWith, pairPick),
+                            i === 0
+                              ? suggestion.reason
+                              : opt.pairWith
+                                ? `${opt.hero} then ${opt.pairWith} scored ${opt.total}`
+                                : `${opt.hero} scored ${opt.total}`,
+                          )
+                        }
+                      />
+                    ))}
+                  </div>
+                )}
                 <div className="min-w-0 flex-1 space-y-2 pt-1">
                   {suggestion.showOurPlan && suggestion.planPicks.length > 0 && (
                     <div className="space-y-1">
@@ -6775,6 +7235,17 @@ export function InteractiveDraft({
           </div>
         )}
       </div>
+
+      {watchOnly && screen ? (
+        <ReconstructedDraftOrder
+          actions={screen}
+          weFirst={weFirst}
+          sideKnown={sideKnown}
+          ourLabel={ourLabel}
+          theirLabel={theirLabel}
+          debug
+        />
+      ) : null}
     </div>
   );
 }
@@ -7443,6 +7914,31 @@ function useDelayedTooltip() {
   };
 }
 
+const TOOLTIP_VIEWPORT_PAD = 12;
+
+/** Max tooltip height in px — pairs with `TOOLTIP_PANEL_SCROLL_CLASS`. */
+function tooltipMaxHeightPx() {
+  return Math.min(520, window.innerHeight - TOOLTIP_VIEWPORT_PAD * 2);
+}
+
+function placeViewportTooltip(x: number, y: number, width: number) {
+  const pad = TOOLTIP_VIEWPORT_PAD;
+  const vw = window.innerWidth;
+  const vh = window.innerHeight;
+  const maxH = tooltipMaxHeightPx();
+  const left = Math.max(pad, Math.min(x - width / 2, vw - width - pad));
+  let top = y + 18;
+  if (top + maxH > vh - pad) {
+    const flipped = y - maxH - 14;
+    top = flipped >= pad ? flipped : pad;
+  }
+  top = Math.min(top, Math.max(pad, vh - pad - maxH));
+  return { left, top };
+}
+
+const TOOLTIP_PANEL_SCROLL_CLASS =
+  "pointer-events-auto fixed z-50 max-h-[min(32.5rem,calc(100vh-1.5rem))] overflow-y-auto overflow-x-hidden overscroll-contain";
+
 function HoverExplain({
   help,
   className,
@@ -7457,20 +7953,8 @@ function HoverExplain({
   const tip = useDelayedTooltip();
 
   const place = (x: number, y: number) => {
-    const width = 352;
-    const estimatedHeight = 148;
-    const pad = 12;
-    const offsetX = 18;
-    const offsetY = 60;
-    const vw = window.innerWidth;
-    const vh = window.innerHeight;
-    let left = x + offsetX;
-    let top = y + offsetY;
-    left = Math.max(pad, Math.min(left, vw - width - pad));
-    if (top + estimatedHeight > vh - pad) {
-      top = Math.max(pad, y - estimatedHeight - 18);
-    }
-    setPos({ left, top });
+    const width = Math.min(352, window.innerWidth - TOOLTIP_VIEWPORT_PAD * 2);
+    setPos(placeViewportTooltip(x, y, width));
   };
 
   const reveal = (x: number, y: number) => {
@@ -7508,7 +7992,7 @@ function HoverExplain({
       </span>
       {open ? (
         <div
-          className="pointer-events-none fixed z-50 w-[min(22rem,calc(100vw-2rem))] whitespace-pre-line rounded-md border border-[#3d5163] bg-[#0f1821] px-3 py-2 text-left text-xs leading-snug text-[#c5d4e0] shadow-xl"
+          className={`${TOOLTIP_PANEL_SCROLL_CLASS} w-[min(22rem,calc(100vw-2rem))] whitespace-pre-line rounded-md border border-[#3d5163] bg-[#0f1821] px-3 py-2 text-left text-xs leading-snug text-[#c5d4e0] shadow-xl`}
           style={{ left: `${pos.left}px`, top: `${pos.top}px` }}
         >
           {help}
@@ -7554,6 +8038,8 @@ function ScoredHeroOption({
   rank,
   badge,
   banned,
+  compact = false,
+  dense = false,
   queued = [],
   failedHeroes = [],
   canLock = true,
@@ -7563,6 +8049,8 @@ function ScoredHeroOption({
   rank: number;
   badge: string;
   banned: boolean;
+  compact?: boolean;
+  dense?: boolean;
   queued?: readonly string[];
   failedHeroes?: readonly string[];
   canLock?: boolean;
@@ -7574,19 +8062,33 @@ function ScoredHeroOption({
   const [showScorecard, setShowScorecard] = useState(false);
   const [scorecardPos, setScorecardPos] = useState({ left: 12, top: 12 });
   const tip = useDelayedTooltip();
+  const scorecardCloseTimer = useRef<number | null>(null);
 
-  const placeScorecard = (x: number, y: number) => {
-    const pad = 12;
-    const width = Math.min(pair ? 704 : 352, window.innerWidth - pad * 2);
-    const left = Math.max(
-      pad,
-      Math.min(x - width / 2, window.innerWidth - width - pad),
-    );
-    setScorecardPos({ left, top: y + 16 });
+  const cancelScorecardClose = () => {
+    if (scorecardCloseTimer.current != null) {
+      window.clearTimeout(scorecardCloseTimer.current);
+    }
+    scorecardCloseTimer.current = null;
   };
 
+  const scheduleScorecardClose = () => {
+    cancelScorecardClose();
+    tip.cancelPending();
+    scorecardCloseTimer.current = window.setTimeout(() => {
+      tip.close();
+      setShowScorecard(false);
+    }, 120);
+  };
+
+  const scorecardWidth = () =>
+    Math.min(
+      pair ? 704 : 352,
+      window.innerWidth - TOOLTIP_VIEWPORT_PAD * 2,
+    );
+
   const revealScorecard = (x: number, y: number) => {
-    placeScorecard(x, y);
+    cancelScorecardClose();
+    setScorecardPos(placeViewportTooltip(x, y, scorecardWidth()));
     setShowScorecard(true);
   };
 
@@ -7614,23 +8116,29 @@ function ScoredHeroOption({
         onClick={canLock ? onLock : undefined}
         onMouseEnter={openScorecard}
         onMouseMove={openScorecard}
-        onMouseLeave={() => {
-          tip.close();
-          setShowScorecard(false);
-        }}
+        onMouseLeave={scheduleScorecardClose}
         onFocus={focusScorecard}
-        onBlur={() => {
-          tip.close();
-          setShowScorecard(false);
-        }}
-        className={`flex w-[12.5rem] flex-col items-center gap-1 rounded-md p-1.5 ${
+        onBlur={scheduleScorecardClose}
+        className={`flex flex-col items-center rounded-md ${
+          dense
+            ? "w-full gap-0 p-0.5"
+            : compact
+              ? "w-full gap-0.5 p-1"
+              : "w-[12.5rem] gap-1 p-1.5"
+        } ${
           canLock ? "transition hover:bg-[#1e3040]/80" : "cursor-default"
         } ${
           primary ? "ring-2 ring-[var(--accent)]" : "ring-1 ring-[#3d5163]"
         }`}
       >
         <span
-          className={`rounded px-1.5 py-0.5 text-[10px] font-bold uppercase tracking-wide ${
+          className={`rounded font-bold uppercase tracking-wide ${
+            dense
+              ? "px-0.5 py-0 text-[7px]"
+              : compact
+                ? "px-1 py-0 text-[8px]"
+                : "px-1.5 py-0.5 text-[10px]"
+          } ${
             primary
               ? "bg-[var(--accent)] text-[var(--accent-ink)]"
               : "bg-[#243444] text-[#c5d4e0]"
@@ -7643,14 +8151,14 @@ function ScoredHeroOption({
             <HeroFace
               hero={option.hero}
               kind="select"
-              size="lg"
+              size={dense || compact ? "sm" : "lg"}
               banned={banned}
             />
             <span className="text-sm font-bold text-[#8aa0b2]">+</span>
             <HeroFace
               hero={pair}
               kind="select"
-              size="lg"
+              size={dense || compact ? "sm" : "lg"}
               banned={banned}
             />
           </div>
@@ -7658,35 +8166,50 @@ function ScoredHeroOption({
           <HeroFace
             hero={option.hero}
             kind="select"
-            size="lg"
+            size={dense || compact ? "sm" : "lg"}
             banned={banned}
           />
         )}
-        <span className="max-w-[9rem] text-center text-sm font-semibold leading-tight text-[#e8eef2]">
+        <span
+          className={`max-w-full truncate text-center font-semibold leading-tight text-[#e8eef2] ${
+            dense
+              ? "text-[9px]"
+              : compact
+                ? "text-[10px]"
+                : "max-w-[9rem] text-sm"
+          }`}
+        >
           {pair ? `${option.hero} + ${pair}` : option.hero}
         </span>
         {pair ? (
-          <span className="max-w-[11rem] text-center text-[11px] leading-tight text-[#9dceb0]">
+          <span
+            className={`max-w-full text-center leading-tight text-[#9dceb0] ${
+              compact ? "text-[9px]" : "max-w-[11rem] text-[11px]"
+            }`}
+          >
             {option.pairCaption ??
               ([option.player, option.pairPlayer].filter(Boolean).join(" · ") ||
                 "then next pick")}
           </span>
-        ) : option.player ? (
+        ) : option.player && !compact ? (
           <span className="max-w-[6.5rem] truncate text-center text-[11px] leading-tight text-[#9dceb0]">
             {option.player}
           </span>
         ) : null}
         <span
-          className={`font-mono text-base font-bold tabular-nums ${
-            option.total >= 0 ? "text-[#9dceb0]" : "text-amber-200/90"
-          }`}
+          className={`font-mono font-bold tabular-nums ${
+            dense ? "text-[9px]" : compact ? "text-[10px]" : "text-base"
+          } ${option.total >= 0 ? "text-[#9dceb0]" : "text-amber-200/90"}`}
         >
           {option.total > 0 ? `+${option.total}` : option.total}
         </span>
       </button>
       {showScorecard ? (
         <div
-          className={`pointer-events-none fixed z-30 rounded-md border border-[#3d5163] bg-[#0f1821] px-3 py-2 shadow-xl ${
+          role="tooltip"
+          onMouseEnter={cancelScorecardClose}
+          onMouseLeave={scheduleScorecardClose}
+          className={`${TOOLTIP_PANEL_SCROLL_CLASS} rounded-md border border-[#3d5163] bg-[#0f1821] px-3 py-2 shadow-xl ${
             pair ? "w-[min(44rem,calc(100vw-2rem))]" : "w-[min(22rem,calc(100vw-2rem))]"
           }`}
           style={{ left: `${scorecardPos.left}px`, top: `${scorecardPos.top}px` }}
@@ -7732,10 +8255,13 @@ const MATCHUP_TRACK_STEPS: { id: MatchupTrackStage; title: string; detail: strin
 export function MatchupTracker({
   track,
   error,
+  compact = false,
   onDismiss,
 }: {
   track: MatchupTrack;
   error: string | null;
+  /** Live share: errors only — per-call progress lives in the pizza tracker. */
+  compact?: boolean;
   onDismiss: () => void;
 }) {
   const failed = track.stage === "failed";
@@ -7743,14 +8269,24 @@ export function MatchupTracker({
     ? 1
     : MATCHUP_TRACK_STEPS.findIndex((step) => step.id === track.stage);
   const fill = track.stage === "scored" ? 100 : (Math.max(0, index) / 3) * 100;
+  const kindLine = matchupLoadKindLine(track.loadMode, track.pendingCalls);
+  const failDetail =
+    error ||
+    "The matchup request finished without rows for these heroes (timeout, rate limit, or Heroes Profile returned nothing). Duo scores stay at 0 until a retry succeeds.";
   const status = failed
-    ? error || "Storm League did not return these duos."
+    ? failDetail
     : track.stage === "pulling"
-      ? `Pulling ${track.heroes.join(", ")}.`
+      ? kindLine
+        ? ""
+        : `Checking cache vs API for ${track.heroes.join(", ")}.`
       : track.stage === "cached"
-        ? "Saved in the draft cache. Scoring the board."
+        ? kindLine
+          ? `${kindLine} Scoring the board.`
+          : "Saved in the draft cache. Scoring the board."
         : track.stage === "scored"
-          ? "These duos are in the score now."
+          ? track.loadMode === "session"
+            ? kindLine ?? "Session cache — duos already scored."
+            : "These duos are in the score now."
           : "These locked duos had no Storm League sample.";
 
   return (
@@ -7804,18 +8340,36 @@ export function MatchupTracker({
             })}
           </ol>
         </div>
-        <p className="mt-5 text-sm font-semibold text-[#e8eef2]">{status}</p>
-        {track.stage === "pulling" ? (
+        {!compact && kindLine && track.stage === "pulling" ? (
+          <p className="mt-4 text-sm font-bold text-[#72d1b1]">{kindLine}</p>
+        ) : null}
+        <p
+          className={`mt-2 text-sm font-semibold ${
+            failed ? "text-red-200" : "text-[#e8eef2]"
+          }`}
+        >
+          {status}
+        </p>
+        {!compact && track.stage === "pulling" ? (
           <div className="mt-3">
-            <TimeLeftBar
-              label={`Pulling Storm League matchups for ${track.heroes.join(", ")}.`}
-              expectedMs={Math.min(80_000, 18_000 + track.heroes.length * 8_000)}
-              resetKey={track.heroes.join("|")}
-              tone="dark"
+            <MatchupHeroLoadBars
+              heroes={track.heroes}
+              loadMode={track.loadMode}
+              heroApiCalls={track.heroApiCalls}
+              resetKeyPrefix={`tracker:${track.loadMode ?? "pull"}`}
+              labelClassName="text-sm font-semibold text-[#72d1b1]"
+              paramsClassName="text-[11px] leading-snug text-[#8aa0b2]"
             />
           </div>
         ) : null}
-        <p className="mt-1 text-sm text-[#c5d4e0]">{track.heroes.join(" · ")}</p>
+        {!compact ? (
+          <p className="mt-1 text-sm text-[#c5d4e0]">
+            {track.heroes.join(" · ")}
+            {(track.queueRemaining ?? 0) > 0
+              ? ` · ${track.queueRemaining} more queued after this batch`
+              : ""}
+          </p>
+        ) : null}
         {failed ? (
           <button
             type="button"
@@ -7861,19 +8415,24 @@ export function BoardStormLeagueLoadBar({
   pending,
   queued,
   failed,
+  loadMode,
+  pendingCalls,
+  heroApiCalls,
 }: {
   pending: readonly string[];
   queued: readonly string[];
   failed: readonly string[];
+  loadMode?: MatchupLoadMode;
+  pendingCalls?: number;
+  heroApiCalls?: Record<string, number>;
 }) {
   const waiting = queued.filter(
     (hero) =>
       !pending.some((name) => heroKey(name) === heroKey(hero)) &&
       !failed.some((name) => heroKey(name) === heroKey(hero)),
   );
-  const label = pending.length
-    ? `Pulling Storm League matchups: ${pending.join(", ")}`
-    : `Storm League queue (${queued.length} hero${queued.length === 1 ? "" : "es"}): ${queued.slice(0, 8).join(", ")}${queued.length > 8 ? "…" : ""}`;
+  const activeHeroes = pending.length ? pending : queued.slice(0, 8);
+  const kindLine = matchupLoadKindLine(loadMode, pendingCalls);
   return (
     <div
       role="status"
@@ -7883,19 +8442,43 @@ export function BoardStormLeagueLoadBar({
       <p className="text-xs font-bold uppercase tracking-wide text-sky-200/90">
         Storm League data loading
       </p>
-      <div className="mt-2">
-        <TimeLeftBar
-          label={label}
-          expectedMs={Math.min(80_000, 16_000 + (pending.length || queued.length) * 7_000)}
-          resetKey={`${pending.join("|")}::${queued.join("|")}`}
+      {kindLine ? (
+        <p className="mt-1 text-sm font-semibold text-sky-100">{kindLine}</p>
+      ) : null}
+      {pending.length > 0 ? (
+        <MatchupHeroLoadBars
+          heroes={pending}
+          loadMode={loadMode}
+          heroApiCalls={heroApiCalls}
+          resetKeyPrefix={`board:${loadMode ?? "q"}`}
           tone="dark"
+          labelClassName="text-sm font-semibold text-sky-100"
+          paramsClassName="text-[11px] leading-snug text-sky-200/75"
         />
-      </div>
-      {waiting.length > 0 ? (
-        <p className="mt-2 text-xs leading-snug text-sky-100/85">
-          Up next: {waiting.slice(0, 10).join(", ")}
-          {waiting.length > 10 ? ` (+${waiting.length - 10} more)` : ""}
+      ) : (
+        <p className="mt-2 text-sm text-sky-100/90">
+          Queued ({queued.length} hero{queued.length === 1 ? "" : "es"}) — waiting
+          for the active batch.
         </p>
+      )}
+      {waiting.length > 0 ? (
+        <div className="mt-2">
+          <p className="text-xs font-semibold uppercase tracking-wide text-sky-200/80">
+            Up next
+          </p>
+          <MatchupHeroLoadLines
+            heroes={waiting.slice(0, 10)}
+            loadMode={loadMode}
+            heroApiCalls={heroApiCalls}
+            className="mt-1 space-y-0.5 text-xs leading-snug text-sky-100/85"
+            itemClassName=""
+          />
+          {waiting.length > 10 ? (
+            <p className="mt-1 text-xs text-sky-100/70">
+              +{waiting.length - 10} more queued
+            </p>
+          ) : null}
+        </div>
       ) : null}
       {failed.length > 0 ? (
         <p className="mt-2 text-xs font-semibold text-red-300">
@@ -7910,10 +8493,14 @@ function MissingDuoBanner({
   options,
   pending,
   error,
+  loadMode,
+  heroApiCalls,
 }: {
   options: ScoredOption[];
   pending: string[];
   error: string | null;
+  loadMode?: MatchupLoadMode;
+  heroApiCalls?: Record<string, number>;
 }) {
   const seen = new Set<string>();
   const entries: { label: string; reason: string }[] = [];
@@ -7936,12 +8523,15 @@ function MissingDuoBanner({
         Matchup data gap
       </p>
       {pending.length > 0 ? (
-        <div className="mt-2">
-          <TimeLeftBar
-            label={`Fetching Storm League matchups for ${pending.join(", ")}.`}
-            expectedMs={Math.min(80_000, 18_000 + pending.length * 8_000)}
-            resetKey={pending.join("|")}
+        <div className="mt-3">
+          <MatchupHeroLoadBars
+            heroes={pending}
+            loadMode={loadMode}
+            heroApiCalls={heroApiCalls}
+            resetKeyPrefix={`gap:${loadMode ?? "pull"}`}
             tone="dark"
+            labelClassName="text-sm font-semibold text-red-100"
+            paramsClassName="text-[11px] leading-snug text-red-200/80"
           />
         </div>
       ) : null}
@@ -8051,36 +8641,48 @@ function breakdownForCurrentSeat(
   };
 }
 
-export function TheirRemainingFive({
-  seats,
+function theirLikelyRoleLabel(role: TheirRemainingSeat["role"]): string {
+  return role === "Ranged" ? "Assassin" : role;
+}
+
+export function LikelyPickProjection({
+  seat,
+  accent,
 }: {
-  seats: readonly TheirRemainingSeat[];
+  seat: TheirRemainingSeat;
+  accent: "ally" | "enemy";
 }) {
-  if (!seats.length) return null;
+  const ring =
+    accent === "enemy" ? "ring-red-400/50" : "ring-teal-400/50";
   return (
-    <section aria-label="Their remaining five" className="space-y-2">
-      <p className="text-xs font-semibold uppercase tracking-wide text-[#8aa0b2]">
-        Their remaining five
-      </p>
-      <ul className="grid gap-x-6 gap-y-1 sm:grid-cols-2">
-        {seats.map((seat, index) => (
-          <li
-            key={`${seat.locked ? "locked" : "open"}-${seat.hero}-${index}`}
-            className={`flex min-w-0 items-baseline gap-2 text-sm ${
-              seat.locked ? "text-[#9dceb0]" : "text-[#e8eef2]"
-            }`}
-          >
-            <span className="w-16 shrink-0 text-xs font-bold uppercase tracking-wide text-[#8aa0b2]">
-              {seat.role}
-            </span>
-            <span className="min-w-0 truncate">
-              {seat.player ? `${seat.player} · ${seat.hero}` : seat.hero}
-              {seat.locked ? " · locked" : ""}
-            </span>
-          </li>
-        ))}
-      </ul>
-    </section>
+    <div
+      className="flex max-w-[4.5rem] flex-col items-center opacity-90"
+      title={`Likely pick: ${seat.hero}${seat.player ? ` (${seat.player})` : ""}`}
+    >
+      <span
+        className="mb-0.5 max-w-full truncate text-center text-[8px] font-bold uppercase tracking-wide text-[#8aa0b2]"
+        title={theirLikelyRoleLabel(seat.role)}
+      >
+        {theirLikelyRoleLabel(seat.role)}
+      </span>
+      <div className={`rounded-sm ring-2 ring-dashed ${ring}`}>
+        <HeroFace hero={seat.hero} kind="draft" size="sm" />
+      </div>
+      <span
+        className="mt-0.5 max-w-full truncate text-center text-[9px] font-semibold text-[#e8eef2]"
+        title={seat.hero}
+      >
+        {seat.hero}
+      </span>
+      {seat.player ? (
+        <span
+          className="max-w-full truncate text-center text-[8px] text-[#9dceb0]"
+          title={seat.player}
+        >
+          {seat.player}
+        </span>
+      ) : null}
+    </div>
   );
 }
 
@@ -8090,21 +8692,26 @@ export function ReconstructedDraftOrder({
   sideKnown,
   ourLabel,
   theirLabel,
+  debug = false,
 }: {
   actions: readonly ReplayAction[];
   weFirst: boolean;
   sideKnown: boolean;
   ourLabel: string;
   theirLabel: string;
+  debug?: boolean;
 }) {
   const { done, next } = reconstructedOrderLines(actions, weFirst, sideKnown);
   const sideName = (side: "our" | "their") => (side === "our" ? ourLabel : theirLabel);
   const sideClass = (side: "our" | "their") =>
     side === "our" ? "text-teal-300/90" : "text-red-300/90";
   return (
-    <section aria-label="Draft order" className="space-y-2">
-      <p className="text-xs font-semibold uppercase tracking-wide text-[#8aa0b2]">
-        Draft order
+    <section
+      aria-label="Draft order"
+      className={`space-y-2 ${debug ? "rounded-md border border-[#2a3a48]/80 bg-[#0f1821]/50 px-3 py-2" : ""}`}
+    >
+      <p className="text-[10px] font-semibold uppercase tracking-wide text-[#5a6b78]">
+        Draft order {debug ? "(debug)" : ""}
       </p>
       {done.length === 0 && sideKnown ? (
         <p className="text-sm text-[#c5d4e0]">Nothing locked yet.</p>
@@ -8165,6 +8772,8 @@ function DraftSideRow({
   table,
   matchupPending = [],
   matchupFailed = [],
+  likelyBan = null,
+  likelyPicks = null,
 }: {
   label: string;
   bans: (BoardAction | null)[];
@@ -8177,6 +8786,12 @@ function DraftSideRow({
   table?: DraftMetaTable | null;
   matchupPending?: readonly string[];
   matchupFailed?: readonly string[];
+  likelyBan?: {
+    hero: string;
+    player: string | null;
+    slotIndex: number;
+  } | null;
+  likelyPicks?: readonly (TheirRemainingSeat | null)[] | null;
 }) {
   const banRing = accent === "enemy" ? "ring-red-700/80" : "ring-teal-700/80";
   const blind = (p: BoardAction | null) =>
@@ -8199,41 +8814,73 @@ function DraftSideRow({
       <div className="flex flex-wrap items-end gap-4">
         <div className="flex gap-1.5">
           {bans.map((b, i) => (
-            <EmptyOrFace
-              key={`ban-${i}`}
-              action={b}
-              banned
-              ring={banRing}
-              placeholder="Ban"
-            />
+            <div key={`ban-${i}`} className="flex flex-col items-center gap-1">
+              <EmptyOrFace
+                action={b}
+                banned
+                ring={banRing}
+                placeholder="Ban"
+              />
+              {likelyBan && !b && i === likelyBan.slotIndex ? (
+                <div
+                  className="flex max-w-[4.5rem] flex-col items-center opacity-90"
+                  title={`Likely ban: ${likelyBan.hero}${likelyBan.player ? ` (${likelyBan.player})` : ""}`}
+                >
+                  <span className="text-center text-[8px] font-bold uppercase tracking-wide text-[#8aa0b2]">
+                    Likely ban
+                  </span>
+                  <div className="rounded-sm ring-2 ring-dashed ring-red-400/50">
+                    <HeroFace hero={likelyBan.hero} kind="draft" size="sm" />
+                  </div>
+                  <span
+                    className="max-w-full truncate text-center text-[9px] font-semibold text-[#e8eef2]"
+                    title={likelyBan.hero}
+                  >
+                    {likelyBan.hero}
+                  </span>
+                  {likelyBan.player ? (
+                    <span
+                      className="max-w-full truncate text-center text-[8px] text-[#9dceb0]"
+                      title={likelyBan.player}
+                    >
+                      {likelyBan.player}
+                    </span>
+                  ) : null}
+                </div>
+              ) : null}
+            </div>
           ))}
         </div>
         <div className="flex gap-1.5">
           {picks.map((p, i) => (
-            <EmptyOrFace
-              key={`pick-${i}`}
-              action={
-                p
-                  ? { ...p, breakdown: breakdownForCurrentSeat(p, roster) }
-                  : p
-              }
-              ring={
-                accent === "enemy" ? "ring-red-500/50" : "ring-teal-500/50"
-              }
-              placeholder="Pick"
-              held={i === heldIndex}
-              blind={blind(p)}
-              slLoadState={
-                p
-                  ? heroStormLeagueLoadState(
-                      table,
-                      p.hero,
-                      matchupPending,
-                      matchupFailed,
-                    )
-                  : "ready"
-              }
-            />
+            <div key={`pick-${i}`} className="flex flex-col items-center gap-1">
+              <EmptyOrFace
+                action={
+                  p
+                    ? { ...p, breakdown: breakdownForCurrentSeat(p, roster) }
+                    : p
+                }
+                ring={
+                  accent === "enemy" ? "ring-red-500/50" : "ring-teal-500/50"
+                }
+                placeholder="Pick"
+                held={i === heldIndex}
+                blind={blind(p)}
+                slLoadState={
+                  p
+                    ? heroStormLeagueLoadState(
+                        table,
+                        p.hero,
+                        matchupPending,
+                        matchupFailed,
+                      )
+                    : "ready"
+                }
+              />
+              {!p && likelyPicks?.[i] ? (
+                <LikelyPickProjection seat={likelyPicks[i]!} accent={accent} />
+              ) : null}
+            </div>
           ))}
         </div>
       </div>
@@ -8242,18 +8889,8 @@ function DraftSideRow({
 }
 
 function placeScorecardNear(x: number, y: number) {
-  const pad = 12;
-  const width = Math.min(352, window.innerWidth - pad * 2);
-  const left = Math.max(
-    pad,
-    Math.min(x - width / 2, window.innerWidth - width - pad),
-  );
-  const estimated = Math.min(520, window.innerHeight - pad * 2);
-  let top = y + 18;
-  if (top + estimated > window.innerHeight - pad) {
-    top = Math.max(pad, y - estimated - 14);
-  }
-  return { left, top };
+  const width = Math.min(352, window.innerWidth - TOOLTIP_VIEWPORT_PAD * 2);
+  return placeViewportTooltip(x, y, width);
 }
 
 function EmptyOrFace({
@@ -8390,7 +9027,7 @@ function EmptyOrFace({
           role="tooltip"
           onMouseEnter={cancelClose}
           onMouseLeave={scheduleClose}
-          className="pointer-events-auto fixed z-50 max-h-[min(32.5rem,calc(100vh-1.5rem))] w-[min(22rem,calc(100vw-2rem))] overflow-y-auto rounded-md border border-[#3d5163] bg-[#0f1821] px-3 py-2 shadow-xl"
+          className={`${TOOLTIP_PANEL_SCROLL_CLASS} w-[min(22rem,calc(100vw-2rem))] rounded-md border border-[#3d5163] bg-[#0f1821] px-3 py-2 shadow-xl`}
           style={{ left: `${pos.left}px`, top: `${pos.top}px` }}
         >
           <p className="mb-1.5 text-[10px] font-bold uppercase tracking-wide text-[#8aa0b2]">

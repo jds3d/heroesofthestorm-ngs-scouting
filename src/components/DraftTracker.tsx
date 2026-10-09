@@ -1,5 +1,11 @@
 "use client";
 
+import { MatchupHeroLoadBars } from "@/components/MatchupHeroLoadBars";
+import {
+  type LiveLoadCallStats,
+  liveLoadTallyLine,
+} from "@/lib/scoring/liveLoadCallStats";
+import type { LiveSuggestionsGate } from "@/lib/scoring/matchupLoadDisplay";
 import { TimeLeftBar } from "@/components/TimeLeftBar";
 
 export type SlTrackStatus = "queued" | "pulling" | "found" | "miss" | "error";
@@ -23,11 +29,17 @@ function stageAt(rows: readonly SlTrackRow[]): number {
   return 2;
 }
 
-function syncActivity(rows: readonly SlTrackRow[]): {
+function syncActivity(
+  rows: readonly SlTrackRow[],
+  suggestionsGate?: LiveSuggestionsGate | null,
+): {
   label: string;
   expectedMs: number;
   progress: number | null;
   resetKey: string;
+  matchupHeroes?: readonly string[];
+  loadMode?: LiveSuggestionsGate["loadMode"];
+  heroApiCalls?: Readonly<Record<string, number>>;
 } | null {
   const pulling = rows.filter(
     (row) => row.status === "queued" || row.status === "pulling",
@@ -55,6 +67,18 @@ function syncActivity(rows: readonly SlTrackRow[]): {
       resetKey: "storm-league",
     };
   }
+  if (suggestionsGate?.matchupsLoading && suggestionsGate.heroes.length) {
+    const n = suggestionsGate.heroes.length;
+    return {
+      label: `Batch ${n} hero${n === 1 ? "" : "es"} — each call below is separate.`,
+      expectedMs: Math.min(80_000, 16_000 + n * 7_000),
+      progress: null,
+      resetKey: `matchups:${suggestionsGate.heroes.join("|")}`,
+      matchupHeroes: suggestionsGate.heroes,
+      loadMode: suggestionsGate.loadMode,
+      heroApiCalls: suggestionsGate.heroApiCalls,
+    };
+  }
   return null;
 }
 
@@ -71,23 +95,47 @@ function statusLine(row: SlTrackRow): string {
 export function DraftTracker({
   rows,
   error,
+  loadTally,
+  suggestionsGate,
 }: {
   rows: readonly SlTrackRow[];
   error?: string | null;
+  loadTally?: LiveLoadCallStats;
+  suggestionsGate?: LiveSuggestionsGate | null;
 }) {
   const stage = stageAt(rows);
   const found = rows.filter((row) => row.status === "found").length;
-  const settled =
+  const slSettled =
     rows.length > 0 &&
     rows.every((row) => row.status === "found" || row.status === "miss" || row.status === "error");
-  const activity = syncActivity(rows);
+  const matchupsLoading = suggestionsGate?.matchupsLoading ?? false;
+  const suggestionsReady = slSettled && !matchupsLoading;
+  const activity = syncActivity(rows, suggestionsGate);
+
+  const tallyLine = loadTally ? liveLoadTallyLine(loadTally) : null;
 
   return (
     <div className="rounded-md border border-[#2a3a48] bg-[#0f1821] px-4 py-3 text-[#e8eef2]">
+      {tallyLine ? (
+        <p
+          className="mb-3 text-xs font-semibold leading-snug text-[#72d1b1]"
+          data-testid="live-load-tally"
+        >
+          {tallyLine}
+        </p>
+      ) : null}
       <ol className="grid grid-cols-3 gap-2">
         {STAGES.map((item, index) => {
-          const done = index < stage || (index === 2 && settled);
-          const current = index === stage && !settled;
+          const done =
+            index < stage ||
+            (index === 1 && slSettled) ||
+            (index === 2 && suggestionsReady);
+          const current =
+            index === 0
+              ? stage === 0
+              : index === 1
+                ? stage >= 1 && !slSettled
+                : slSettled && matchupsLoading;
           return (
             <li key={item.id} className="min-w-0">
               <div className="flex items-center gap-2">
@@ -125,14 +173,18 @@ export function DraftTracker({
                     ? `${rows.length} on screen`
                     : "Reading names"
                   : index === 1
-                    ? settled
+                    ? slSettled
                       ? `${found} of ${rows.length} found`
                       : current
                         ? "All players at once"
                         : "After the names"
-                    : settled
+                    : suggestionsReady
                       ? "Ready"
-                      : "After history"}
+                      : matchupsLoading
+                        ? "Loading matchups"
+                        : slSettled
+                          ? "Waiting on matchups"
+                          : "After history"}
               </p>
             </li>
           );
@@ -141,13 +193,24 @@ export function DraftTracker({
 
       {activity ? (
         <div className="mt-4">
-          <TimeLeftBar
-            label={activity.label}
-            expectedMs={activity.expectedMs}
-            progress={activity.progress}
-            resetKey={activity.resetKey}
-            tone="dark"
-          />
+          {activity.matchupHeroes?.length ? (
+            <MatchupHeroLoadBars
+              heroes={activity.matchupHeroes}
+              loadMode={activity.loadMode}
+              heroApiCalls={activity.heroApiCalls}
+              resetKeyPrefix="pizza"
+              labelClassName="text-xs font-semibold text-[#72d1b1]"
+              paramsClassName="text-[10px] leading-snug text-[#8aa0b2]"
+            />
+          ) : (
+            <TimeLeftBar
+              label={activity.label}
+              expectedMs={activity.expectedMs}
+              progress={activity.progress}
+              resetKey={activity.resetKey}
+              tone="dark"
+            />
+          )}
         </div>
       ) : null}
 

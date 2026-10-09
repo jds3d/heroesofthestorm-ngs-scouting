@@ -1,3 +1,5 @@
+import type { DraftMetaTable } from "@/lib/scoring/draftMeta";
+import { heroDraftMeta } from "@/lib/scoring/draftMeta";
 import { stormLeagueScore } from "@/lib/scoring/comfort";
 import { heroKey } from "@/lib/scoring/heroMeta";
 import {
@@ -38,6 +40,21 @@ function shownName(name: string | null | undefined): string | null {
   return shown || null;
 }
 
+function seatRoleToRequired(role: TheirSeatRole): RequiredRole | undefined {
+  switch (role) {
+    case "Tank":
+      return "tank";
+    case "Healer":
+      return "healer";
+    case "Offlane":
+      return "offlane";
+    case "Ranged":
+      return "ranged damage";
+    default:
+      return undefined;
+  }
+}
+
 function roleWord(role: RequiredRole | undefined): TheirSeatRole {
   switch (role) {
     case "tank":
@@ -69,6 +86,79 @@ function optionsFor(player: PlayerScout, gone: ReadonlySet<string>): HeroOption[
     .sort((a, b) => b.sl - a.sl || a.hero.localeCompare(b.hero));
 }
 
+/** Everyone on their team who has not locked a pick yet (OCR + roster). */
+export function collectTheirUnpickedPlayers(args: {
+  openPlayers: readonly string[];
+  roster: readonly PlayerScout[];
+  locked: readonly { player: string | null }[];
+}): string[] {
+  const lockedNames = new Set(
+    args.locked.map((lock) => nameKey(lock.player)).filter(Boolean),
+  );
+  const seen = new Set<string>();
+  const out: string[] = [];
+  const push = (raw: string | null | undefined) => {
+    const name = shownName(raw);
+    if (!name) return;
+    const key = name.toLowerCase();
+    if (lockedNames.has(key) || seen.has(key)) return;
+    seen.add(key);
+    out.push(name);
+  };
+  for (const name of args.openPlayers) push(name);
+  for (const player of args.roster) push(player.battletag);
+  return out;
+}
+
+/** Map open pick slots (left to right) to projected seats. */
+export function likelyPicksUnderOpenSlots(
+  picks: readonly ({ hero: string } | null)[],
+  seats: readonly TheirRemainingSeat[],
+): (TheirRemainingSeat | null)[] {
+  const open = seats.filter((seat) => !seat.locked);
+  const emptyIndices: number[] = [];
+  picks.forEach((pick, index) => {
+    if (!pick) emptyIndices.push(index);
+  });
+  return picks.map((pick, index) => {
+    if (pick) return null;
+    const order = emptyIndices.indexOf(index);
+    if (order < 0) return null;
+    return open[order] ?? null;
+  });
+}
+
+export function metaHeroForOpenRole(
+  role: TheirSeatRole,
+  gone: ReadonlySet<string>,
+  table: DraftMetaTable | null | undefined,
+  heroes: readonly string[],
+): string {
+  const required = seatRoleToRequired(role);
+  const candidates = heroes
+    .filter((hero) => !gone.has(heroKey(hero)))
+    .filter((hero) =>
+      required ? heroFillsRole(hero, required) : true,
+    )
+    .map((hero) => ({
+      hero,
+      influence: heroDraftMeta(table, hero)?.influence ?? 0,
+    }))
+    .sort(
+      (a, b) =>
+        b.influence - a.influence || a.hero.localeCompare(b.hero),
+    );
+  if (candidates.length) return candidates[0].hero;
+  const any = heroes
+    .filter((hero) => !gone.has(heroKey(hero)))
+    .map((hero) => ({
+      hero,
+      influence: heroDraftMeta(table, hero)?.influence ?? 0,
+    }))
+    .sort((a, b) => b.influence - a.influence);
+  return any[0]?.hero ?? "Raynor";
+}
+
 /** True when every required role this hero can fill is already covered. */
 function fillsCoveredRoleOnly(hero: string, covered: ReadonlySet<RequiredRole>): boolean {
   const fills = REQUIRED_ROLES.filter((role) => heroFillsRole(hero, role));
@@ -86,6 +176,8 @@ export function rebuildTheirRemainingFive(args: {
   roster: readonly PlayerScout[];
   /** Hero keys or display names already banned or picked. */
   gone: ReadonlySet<string>;
+  metaTable?: DraftMetaTable | null;
+  heroPool?: readonly string[];
 }): TheirRemainingSeat[] {
   const goneKeys = new Set([...args.gone].map((hero) => heroKey(hero)));
   for (const lock of args.locked) {
@@ -101,19 +193,17 @@ export function rebuildTheirRemainingFive(args: {
     if (key && !rosterByName.has(key)) rosterByName.set(key, player);
   }
 
-  const open = args.openPlayers
-    .map((name) => shownName(name))
-    .filter((name): name is string => {
-      if (!name) return false;
-      return !lockedNames.has(name.toLowerCase());
-    });
+  const open = collectTheirUnpickedPlayers({
+    openPlayers: args.openPlayers,
+    roster: args.roster,
+    locked: args.locked,
+  });
+  const heroPool = args.heroPool ?? [];
 
-  const rows = open.flatMap((name) => {
+  const rows = open.map((name) => {
     const scout = rosterByName.get(name.toLowerCase());
-    if (!scout) return [];
-    const options = optionsFor(scout, goneKeys);
-    if (!options.length) return [];
-    return [{ player: name, options }];
+    const options = scout ? optionsFor(scout, goneKeys) : [];
+    return { player: name, options };
   });
 
   const taken = new Set<string>();
@@ -163,19 +253,34 @@ export function rebuildTheirRemainingFive(args: {
     if (filled) covered.add(filled);
   }
 
-  const lockedSeats = args.locked
-    .filter((lock) => lock.hero)
-    .map((lock, index) => ({
-      player: shownName(lock.player),
-      hero: lock.hero,
-      role: roleWord(lockedRoles.get(index)),
-      locked: true,
-      sl: 0,
-      comfort: 0,
-      games: 0,
-    }));
-  const openSeats = open
-    .filter((name) => chosen.has(name.toLowerCase()))
+  const roleOrder: Record<TheirSeatRole, number> = {
+    Tank: 0,
+    Healer: 1,
+    Offlane: 2,
+    Ranged: 3,
+    Flex: 4,
+  };
+  for (const name of open) {
+    const key = name.toLowerCase();
+    if (chosen.has(key)) continue;
+    const missingRole = REQUIRED_ROLES.find((role) => !covered.has(role));
+    const role = missingRole ? roleWord(missingRole) : "Flex";
+    const unavailable = new Set([...goneKeys, ...taken]);
+    const hero = metaHeroForOpenRole(
+      role,
+      unavailable,
+      args.metaTable,
+      heroPool,
+    );
+    chosen.set(key, {
+      option: { hero, sl: 0, comfort: 0, games: 0 },
+      role,
+    });
+    taken.add(heroKey(hero));
+    if (missingRole) covered.add(missingRole);
+  }
+
+  return open
     .map((name) => {
       const pick = chosen.get(name.toLowerCase())!;
       return {
@@ -187,6 +292,6 @@ export function rebuildTheirRemainingFive(args: {
         comfort: pick.option.comfort,
         games: pick.option.games,
       };
-    });
-  return [...lockedSeats, ...openSeats];
+    })
+    .sort((a, b) => roleOrder[a.role] - roleOrder[b.role]);
 }

@@ -17,6 +17,7 @@ import {
 } from "@/lib/heroesprofile/replayCache";
 
 export { heroesProfilePlayerUrl, ngsHeroesProfileUrl };
+import { heroKey } from "@/lib/scoring/heroMeta";
 import type { PlayerScout } from "@/lib/scoring/types";
 import type { GlobalHeroStat } from "@/lib/scoring/metaPressure";
 import type {
@@ -1389,11 +1390,40 @@ async function listMajorSubPatches(): Promise<
  * Counts uncached current-minor pulls, plus uncached major-sub stacks when
  * the minor is known to be sparse (never the full multi-year major).
  */
-export async function countPendingMatchupCalls(
-  heroes: string[],
+async function pendingMatchupCallsForHero(
+  hero: string,
+  gameVersion: string,
+  stackKeys: string[],
 ): Promise<number> {
+  const minorKey = matchupsCacheKey("minor", gameVersion, hero);
+  const minorBundle = await getCached<HeroMatchupBundle>(
+    minorKey,
+    GLOBAL_HERO_TTL_MS,
+  );
+  if (!minorBundle) {
+    return 1;
+  }
+  if (!matchupsNeedMoreGames(minorBundle)) return 0;
+  let n = 0;
+  for (const sub of stackKeys) {
+    if (
+      (await getCached(
+        matchupsCacheKey("sub", sub, hero),
+        GLOBAL_HERO_TTL_MS,
+      )) === null
+    ) {
+      n += 1;
+    }
+  }
+  return n;
+}
+
+/** Pending Heroes Profile matchup HTTP calls per hero (heroKey → count). */
+export async function countPendingMatchupCallsByHero(
+  heroes: string[],
+): Promise<Record<string, number>> {
   const gameVersion = await currentGlobalPatch();
-  if (!gameVersion) return 0;
+  if (!gameVersion) return {};
   const unique = [...new Set(heroes.filter(Boolean))];
   const subs = await listMajorSubPatches().catch(() => []);
   const currentSub = majorSubPatchKey(gameVersion);
@@ -1405,31 +1435,24 @@ export async function countPendingMatchupCalls(
     .slice(startIdx, startIdx + MAX_MAJOR_SUB_PATCHES)
     .map((s) => s.key);
 
-  let n = 0;
-  for (const hero of unique) {
-    const minorKey = matchupsCacheKey("minor", gameVersion, hero);
-    const minorBundle = await getCached<HeroMatchupBundle>(
-      minorKey,
-      GLOBAL_HERO_TTL_MS,
-    );
-    if (!minorBundle) {
-      // Minor + up to one current-sub expand if sparse (can't know yet).
-      n += 1;
-      continue;
-    }
-    if (!matchupsNeedMoreGames(minorBundle)) continue;
-    for (const sub of stackKeys) {
-      if (
-        (await getCached(
-          matchupsCacheKey("sub", sub, hero),
-          GLOBAL_HERO_TTL_MS,
-        )) === null
-      ) {
-        n += 1;
-      }
-    }
-  }
-  return n;
+  const out: Record<string, number> = {};
+  await Promise.all(
+    unique.map(async (hero) => {
+      out[heroKey(hero)] = await pendingMatchupCallsForHero(
+        hero,
+        gameVersion,
+        stackKeys,
+      );
+    }),
+  );
+  return out;
+}
+
+export async function countPendingMatchupCalls(
+  heroes: string[],
+): Promise<number> {
+  const byHero = await countPendingMatchupCallsByHero(heroes);
+  return Object.values(byHero).reduce((sum, n) => sum + n, 0);
 }
 
 async function fetchMatchupsForMinorBuilds(
@@ -1523,6 +1546,7 @@ export async function getHeroMatchups(hero: string): Promise<{
  */
 export async function getHeroMatchupsMany(
   heroes: string[],
+  options?: { /** Every hero is served from .cache — skip API pacing. */ cacheOnly?: boolean },
 ): Promise<{
   patch: string;
   byHero: Record<string, HeroMatchupBundle>;
@@ -1535,7 +1559,8 @@ export async function getHeroMatchupsMany(
   let incomplete = false;
   const queue = [...unique];
   const rateRetries = new Map<string, number>();
-  const workers = 2;
+  const cacheOnly = options?.cacheOnly === true;
+  const workers = cacheOnly ? Math.min(4, unique.length) : 2;
   async function worker() {
     while (queue.length) {
       const hero = queue.shift();
@@ -1575,11 +1600,11 @@ export async function getHeroMatchupsMany(
         }
         // Skip failed hero — draft meta degrades to globals-only for them.
       }
-      await sleep(350);
+      if (!cacheOnly) await sleep(350);
     }
   }
   await Promise.all(
-    Array.from({ length: Math.min(workers, unique.length) }, () => worker()),
+    Array.from({ length: Math.min(workers, unique.length || 1) }, () => worker()),
   );
   return { patch, byHero, incomplete };
 }

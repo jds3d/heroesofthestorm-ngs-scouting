@@ -1,6 +1,7 @@
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
+import { heroKey } from "@/lib/scoring/heroMeta";
 import { DraftTracker } from "./DraftTracker";
 import {
   formatTimeLeft,
@@ -68,6 +69,16 @@ describe("time left", () => {
     );
   });
 
+  it("shows API and cache tallies above the stage bar", () => {
+    const html = renderToStaticMarkup(
+      createElement(DraftTracker, {
+        rows: [],
+        loadTally: { apiCalls: 2, cacheCalls: 5 },
+      }),
+    );
+    expect(html).toContain("2 API calls · 5 cache calls before suggestions were ready");
+  });
+
   it("shows a countdown while the draft sync is still reading names", () => {
     const html = renderToStaticMarkup(createElement(DraftTracker, { rows: [] }));
     expect(html).toContain("Reading the map title and the ten player names");
@@ -93,9 +104,31 @@ describe("time left", () => {
     const html = renderToStaticMarkup(
       createElement(DraftTracker, {
         rows: [{ name: "HuckIt", side: "us", status: "found", games: 10 }],
+        suggestionsGate: null,
       }),
     );
     expect(html).not.toContain("progressbar");
     expect(html).toContain("Ready");
+  });
+
+  it("keeps suggestions pending while matchups are still loading", () => {
+    const html = renderToStaticMarkup(
+      createElement(DraftTracker, {
+        rows: [{ name: "HuckIt", side: "us", status: "found", games: 10 }],
+        suggestionsGate: {
+          matchupsLoading: true,
+          loadMode: "api",
+          heroes: ["Qhira", "Johanna"],
+          heroApiCalls: {
+            [heroKey("Qhira")]: 1,
+            [heroKey("Johanna")]: 1,
+          },
+        },
+      }),
+    );
+    expect(html).toContain("Loading matchups");
+    expect(html).not.toContain(">Ready<");
+    expect(html).toContain("API call: Qhira");
+    expect(html).toContain("API call: Johanna");
   });
 });

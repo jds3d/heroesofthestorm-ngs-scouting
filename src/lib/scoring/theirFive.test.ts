@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { playerFromStormLeague } from "@/lib/scoring/comfort";
-import { rebuildTheirRemainingFive } from "@/lib/scoring/theirFive";
+import {
+  likelyPicksUnderOpenSlots,
+  rebuildTheirRemainingFive,
+} from "@/lib/scoring/theirFive";
 import type { SourceHeroStat } from "@/lib/scoring/types";
 
 function sl(wins: number, losses: number): SourceHeroStat {
@@ -34,6 +37,39 @@ const volskayaBans = new Set([
   "Leoric",
 ]);
 
+describe("likelyPicksUnderOpenSlots", () => {
+  it("lines projections up under empty pick slots left to right", () => {
+    const seats = [
+      {
+        player: "pokes",
+        hero: "Varian",
+        role: "Tank" as const,
+        locked: false,
+        sl: 1,
+        comfort: 1,
+        games: 10,
+      },
+      {
+        player: "Regenbogen",
+        hero: "Ragnaros",
+        role: "Offlane" as const,
+        locked: false,
+        sl: 1,
+        comfort: 1,
+        games: 10,
+      },
+    ];
+    const slots = likelyPicksUnderOpenSlots(
+      [{ hero: "A" }, { hero: "B" }, null, null, null],
+      seats,
+    );
+    expect(slots[0]).toBeNull();
+    expect(slots[2]?.hero).toBe("Varian");
+    expect(slots[3]?.hero).toBe("Ragnaros");
+    expect(slots[4]).toBeNull();
+  });
+});
+
 describe("rebuildTheirRemainingFive", () => {
   it("fills the Volskaya seat that still needs offlane and drops banned and picked heroes", () => {
     const five = rebuildTheirRemainingFive({
@@ -58,10 +94,6 @@ describe("rebuildTheirRemainingFive", () => {
     });
 
     expect(five.map((seat) => [seat.role, seat.player, seat.hero, seat.locked])).toEqual([
-      ["Flex", "dgcy023", "Thrall", true],
-      ["Healer", "Hoss", "Brightwing", true],
-      ["Ranged", "Cinema", "Nazeebo", true],
-      ["Tank", "Silver", "Stitches", true],
       ["Offlane", "SKilleen", "Sonya", false],
     ]);
   });
@@ -91,6 +123,39 @@ describe("rebuildTheirRemainingFive", () => {
       hero: "Raynor",
       role: "Ranged",
     });
+    expect(five).toHaveLength(2);
+  });
+
+  it("still projects every open player when one has no storm league pool", () => {
+    const five = rebuildTheirRemainingFive({
+      locked: [
+        { hero: "Brightwing", player: "AmateurDead" },
+        { hero: "Abathur", player: "vsierra01" },
+      ],
+      openPlayers: ["Regenbogen", "pokes"],
+      roster: [
+        scout("Regenbogen", [["Ragnaros", 30, 10]]),
+        scout("pokes", [["Varian", 22, 8]]),
+        scout("SirWatsonll", []),
+      ],
+      gone: new Set(["Brightwing", "Abathur", "Hogger", "Xal'atath"]),
+      heroPool: [
+        "Varian",
+        "Ragnaros",
+        "Valla",
+        "Jaina",
+        "Raynor",
+        "Johanna",
+      ],
+    });
+
+    expect(five).toHaveLength(3);
+    expect(five.map((seat) => seat.player).sort()).toEqual([
+      "Regenbogen",
+      "SirWatsonll",
+      "pokes",
+    ]);
+    expect(five.every((seat) => seat.hero && !seat.locked)).toBe(true);
   });
 
   it("rebuilds again after the next lock and will not seat someone who already locked", () => {
@@ -108,7 +173,6 @@ describe("rebuildTheirRemainingFive", () => {
       gone: new Set(["Stitches"]),
     });
     expect(before.map((seat) => [seat.player, seat.hero])).toEqual([
-      ["Silver", "Stitches"],
       ["SKilleen", "Leoric"],
       ["Cinema", "Nazeebo"],
     ]);
@@ -123,8 +187,6 @@ describe("rebuildTheirRemainingFive", () => {
       gone: new Set(["Stitches", "Nazeebo", "Leoric"]),
     });
     expect(after.map((seat) => [seat.player, seat.hero, seat.role])).toEqual([
-      ["Silver", "Stitches", "Tank"],
-      ["Cinema", "Nazeebo", "Ranged"],
       ["SKilleen", "Falstad", "Flex"],
     ]);
   });

@@ -17,6 +17,14 @@ import {
   rosterTagsPresent,
   type LiveDraft,
 } from "@/lib/lobby/screenLobby";
+import {
+  addLiveLoadCallStats,
+  getLiveLoadCallStats,
+  resetLiveLoadCallStats,
+  subscribeLiveLoadCallStats,
+  type LiveLoadCallStats,
+} from "@/lib/scoring/liveLoadCallStats";
+import type { LiveSuggestionsGate } from "@/lib/scoring/matchupLoadDisplay";
 
 type LeagueTeam = {
   name: string;
@@ -148,6 +156,11 @@ export function ScoutApp() {
   const [statsNote, setStatsNote] = useState<string | null>(null);
   const [slTrack, setSlTrack] = useState<SlTrackRow[]>([]);
   const [slTrackError, setSlTrackError] = useState<string | null>(null);
+  const [liveLoadTally, setLiveLoadTally] = useState<LiveLoadCallStats>(() =>
+    getLiveLoadCallStats(),
+  );
+  const [suggestionsGate, setSuggestionsGate] =
+    useState<LiveSuggestionsGate | null>(null);
   const [stormHome, setStormHome] = useState<PlayerScout[]>([]);
   const [stormTheirs, setStormTheirs] = useState<PlayerScout[]>([]);
   const [watchMeta, setWatchMeta] = useState<DraftMetaTable | null>(null);
@@ -238,6 +251,7 @@ export function ScoutApp() {
       setStormTheirs([]);
       setSlTrack([]);
       setSlTrackError(null);
+      setSuggestionsGate(null);
       setTournamentDraft(false);
     }
   }, [sharing]);
@@ -305,6 +319,17 @@ export function ScoutApp() {
   }, [slNameKey]);
 
   useEffect(() => {
+    if (!sharing) {
+      resetLiveLoadCallStats();
+      setLiveLoadTally({ apiCalls: 0, cacheCalls: 0 });
+      return;
+    }
+    return subscribeLiveLoadCallStats(() =>
+      setLiveLoadTally(getLiveLoadCallStats()),
+    );
+  }, [sharing]);
+
+  useEffect(() => {
     if (!sharing) return;
     void syncLocalReplays();
   }, [sharing]);
@@ -316,7 +341,10 @@ export function ScoutApp() {
       .then(async (res) => {
         const data = (await res.json()) as DraftMetaTable & { error?: string };
         if (!res.ok || !data.byHero) return;
-        if (!cancelled) setWatchMeta(data);
+        if (!cancelled) {
+          setWatchMeta(data);
+          addLiveLoadCallStats({ cacheCalls: 1 });
+        }
       })
       .catch(() => undefined);
     return () => {
@@ -360,9 +388,15 @@ export function ScoutApp() {
             const slData = (await slRes.json()) as {
               players?: PlayerScout[];
               error?: string;
+              apiCalls?: number;
+              cacheCalls?: number;
             };
             if (!slRes.ok) throw new Error(slData.error ?? "Storm League lookup failed");
             if (cancelled) return;
+            addLiveLoadCallStats({
+              apiCalls: slData.apiCalls ?? 0,
+              cacheCalls: slData.cacheCalls ?? 0,
+            });
             const player = slData.players?.[0];
             const games = player
               ? player.topHeroes.reduce(
@@ -957,7 +991,12 @@ export function ScoutApp() {
 
       {sharing && !report ? (
         <div className="space-y-3">
-          <DraftTracker rows={slTrack} error={slTrackError} />
+          <DraftTracker
+            rows={slTrack}
+            error={slTrackError}
+            loadTally={liveLoadTally}
+            suggestionsGate={suggestionsGate}
+          />
           {draftSaved ? (
             <p className="text-sm text-[var(--muted)]">Saved drafts/{draftSaved}</p>
           ) : null}
@@ -988,6 +1027,7 @@ export function ScoutApp() {
             watchOnly
             stormLeagueOnly
             planLoadingLabel={livePlanLoadingLabel}
+            onSuggestionsGate={setSuggestionsGate}
             tournamentMode={tournamentDraft}
             onTournamentModeChange={setTournamentDraft}
           />

@@ -112,8 +112,71 @@ const HERO_DRAFT_SLUG: Record<string, string> = {
   "Xal'atath": "xalatath",
 };
 
-const CDN =
+export const HERO_PORTRAIT_CDN =
   "https://cdn.jsdelivr.net/gh/HeroesToolChest/heroes-images@main/heroesimages/heroportraits";
+
+/** Same repo as {@link HERO_PORTRAIT_CDN}; used by `sync:portraits` (jsDelivr rate-limits bulk fetch). */
+export const HERO_PORTRAIT_RAW =
+  "https://raw.githubusercontent.com/HeroesToolChest/heroes-images/main/heroesimages/heroportraits";
+
+const CDN = HERO_PORTRAIT_CDN;
+
+const SELECT_SLUG: Record<string, string> = {
+  l90etc: "etc",
+  falstad: "gryphon_rider",
+  amazon: "d2amazonf",
+  barbarian: "femalebarbarian",
+  demonhunter: "demonhunter",
+  nexushunter: "nexus2",
+};
+
+/** In-game select button slug for a draft portrait slug. */
+export function heroSelectPortraitSlug(draftSlug: string): string {
+  return SELECT_SLUG[draftSlug] ?? draftSlug;
+}
+
+/** Unique draft portrait slugs (one file per hero in `public/heroes/`). */
+export function uniqueDraftPortraitSlugs(): string[] {
+  return [...new Set(Object.values(HERO_DRAFT_SLUG))].sort();
+}
+
+function localDraftPortraitPath(draftSlug: string): string {
+  return `/heroes/draft/${draftSlug}.png`;
+}
+
+function localSelectPortraitPath(selectSlug: string): string {
+  return `/heroes/select/${selectSlug}.png`;
+}
+
+function cdnDraftPortraitUrl(draftSlug: string): string {
+  return `${CDN}/storm_ui_glues_draft_portrait_${draftSlug}.png`;
+}
+
+function cdnSelectPortraitUrl(selectSlug: string): string {
+  return `${CDN}/storm_ui_ingame_heroselect_btn_${selectSlug}.png`;
+}
+
+/**
+ * Portrait URLs to try in order: local `public/heroes/` first, then CDN.
+ * Select faces also try the local draft strip if the circle art is missing.
+ */
+export function heroPortraitUrlCandidates(
+  hero: string,
+  kind: "draft" | "select",
+): string[] {
+  const draftSlug = heroDraftSlug(hero);
+  if (!draftSlug) return [];
+  const selectSlug = heroSelectPortraitSlug(draftSlug);
+  if (kind === "draft") {
+    return [localDraftPortraitPath(draftSlug), cdnDraftPortraitUrl(draftSlug)];
+  }
+  return [
+    localSelectPortraitPath(selectSlug),
+    localDraftPortraitPath(draftSlug),
+    cdnSelectPortraitUrl(selectSlug),
+    cdnDraftPortraitUrl(draftSlug),
+  ];
+}
 
 /** Unique display names for the interactive hero picker (one per portrait slug). */
 export function allDraftHeroes(): string[] {
@@ -143,27 +206,13 @@ export function heroDraftSlug(hero: string): string | null {
 
 /** Tall HotS draft-strip portrait (bans / pick board). */
 export function heroDraftPortraitUrl(hero: string): string | null {
-  const slug = heroDraftSlug(hero);
-  if (!slug) return null;
-  return `${CDN}/storm_ui_glues_draft_portrait_${slug}.png`;
+  return heroPortraitUrlCandidates(hero, "draft")[0] ?? null;
 }
 
 /** Circular hero-select face (suggestion buttons). */
 export function heroSelectPortraitUrl(hero: string): string | null {
-  const draft = heroDraftSlug(hero);
-  if (!draft) return null;
-  const selectSlug = SELECT_SLUG[draft] ?? draft;
-  return `${CDN}/storm_ui_ingame_heroselect_btn_${selectSlug}.png`;
+  return heroPortraitUrlCandidates(hero, "select")[0] ?? null;
 }
-
-const SELECT_SLUG: Record<string, string> = {
-  l90etc: "etc",
-  falstad: "gryphon_rider",
-  amazon: "d2amazonf",
-  barbarian: "femalebarbarian",
-  demonhunter: "demonhunter",
-  nexushunter: "nexus2",
-};
 
 function preferDraftName(name: string, current: string): boolean {
   if (name.includes("'") && !current.includes("'")) return true;

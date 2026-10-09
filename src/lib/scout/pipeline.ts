@@ -1,4 +1,5 @@
 import { leagueConfig, stormLeagueWindows } from "@/config/league";
+import { cacheHas } from "@/lib/cache";
 import { isScoutBudgetExceeded } from "@/lib/scout/budget";
 import {
   HeroesProfileError,
@@ -81,6 +82,24 @@ function heroRowsToSourceMap(rows: NgsHeroRow[]): Map<string, SourceHeroStat> {
     });
   }
   return out;
+}
+
+async function countStormLeagueHeroAllCalls(
+  battletag: string,
+): Promise<{ apiCalls: number; cacheCalls: number }> {
+  const windows = stormLeagueWindows();
+  const gameType = "Storm League";
+  const keys = [
+    `hp-v1-hero-all-${battletag}-${gameType}-${windows.historyStart}`,
+    `hp-v1-hero-all-${battletag}-${gameType}-${windows.recentStart}`,
+  ];
+  let apiCalls = 0;
+  let cacheCalls = 0;
+  for (const key of keys) {
+    if (await cacheHas(key)) cacheCalls += 1;
+    else apiCalls += 1;
+  }
+  return { apiCalls, cacheCalls };
 }
 
 async function loadWindowedMode(
@@ -450,15 +469,28 @@ async function loadOneStormLeaguePlayer(shown: string): Promise<PlayerScout> {
 
 export async function loadStormLeaguePlayers(
   tags: string[],
-): Promise<PlayerScout[]> {
+): Promise<{
+  players: PlayerScout[];
+  apiCalls: number;
+  cacheCalls: number;
+}> {
   const seen = new Set<string>();
   const jobs: Promise<PlayerScout>[] = [];
+  let apiCalls = 0;
+  let cacheCalls = 0;
   for (const raw of tags) {
     const shown = raw.trim();
     const name = shown.split("#")[0]?.trim().toLowerCase() ?? "";
     if (!name || seen.has(name)) continue;
     seen.add(name);
+    const tag = shown.includes("#") ? shown : replayBattletag(shown);
+    if (tag) {
+      const counts = await countStormLeagueHeroAllCalls(tag);
+      apiCalls += counts.apiCalls;
+      cacheCalls += counts.cacheCalls;
+    }
     jobs.push(loadOneStormLeaguePlayer(shown));
   }
-  return Promise.all(jobs);
+  const players = await Promise.all(jobs);
+  return { players, apiCalls, cacheCalls };
 }

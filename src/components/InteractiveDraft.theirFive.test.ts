@@ -1,23 +1,32 @@
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
-import { MatchupTracker, MissingDataBadge, TheirRemainingFive } from "./InteractiveDraft";
+import {
+  LikelyPickProjection,
+  MatchupTracker,
+  MissingDataBadge,
+} from "./InteractiveDraft";
 
-describe("Their remaining five", () => {
-  it("lists locked heroes and the role still open", () => {
+describe("Likely pick projection", () => {
+  it("labels ranged damage as assassin", () => {
     const html = renderToStaticMarkup(
-      createElement(TheirRemainingFive, {
-        seats: [
-          { player: "Silver", hero: "Stitches", role: "Tank", locked: true, sl: 0, comfort: 0, games: 0 },
-          { player: "SKilleen", hero: "Leoric", role: "Offlane", locked: false, sl: 1, comfort: 1, games: 18 },
-        ],
+      createElement(LikelyPickProjection, {
+        accent: "enemy",
+        seat: {
+          player: "Cinema",
+          hero: "Valla",
+          role: "Ranged",
+          locked: false,
+          sl: 1,
+          comfort: 1,
+          games: 12,
+        },
       }),
     );
-    expect(html).toContain("Their remaining five");
-    expect(html).toContain("Silver · Stitches");
-    expect(html).toContain("locked");
-    expect(html).toContain("SKilleen · Leoric");
-    expect(html).toContain("Offlane");
+    expect(html).toContain("Assassin");
+    expect(html).toContain("Valla");
+    expect(html).toContain("Cinema");
+    expect(html).toContain("ring-dashed");
   });
 });
 

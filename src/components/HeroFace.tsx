@@ -1,10 +1,7 @@
 "use client";
 
-import { useState } from "react";
-import {
-  heroDraftPortraitUrl,
-  heroSelectPortraitUrl,
-} from "@/lib/scoring/heroPortrait";
+import { useEffect, useMemo, useState } from "react";
+import { heroPortraitUrlCandidates } from "@/lib/scoring/heroPortrait";
 
 type FaceKind = "draft" | "select";
 
@@ -23,9 +20,19 @@ export function HeroFace({
   label?: string;
   title?: string;
 }) {
-  const [failed, setFailed] = useState(false);
-  const url =
-    kind === "draft" ? heroDraftPortraitUrl(hero) : heroSelectPortraitUrl(hero);
+  const [srcIndex, setSrcIndex] = useState(0);
+  const [exhausted, setExhausted] = useState(false);
+  const urls = useMemo(
+    () => heroPortraitUrlCandidates(hero, kind),
+    [hero, kind],
+  );
+  const url = exhausted ? null : (urls[srcIndex] ?? null);
+
+  useEffect(() => {
+    setSrcIndex(0);
+    setExhausted(false);
+  }, [hero, kind, urls]);
+
   const dims =
     size === "lg"
       ? kind === "draft"
@@ -46,13 +53,22 @@ export function HeroFace({
           kind === "select" ? "rounded-full ring-2 ring-[#3d5163]" : "rounded-sm"
         }`}
       >
-        {url && !failed ? (
+        {url ? (
           // eslint-disable-next-line @next/next/no-img-element
           <img
+            key={url}
             src={url}
             alt={hero}
             className="h-full w-full object-cover object-top"
-            onError={() => setFailed(true)}
+            loading="lazy"
+            decoding="async"
+            onError={() => {
+              if (srcIndex + 1 < urls.length) {
+                setSrcIndex((i) => i + 1);
+                return;
+              }
+              setExhausted(true);
+            }}
           />
         ) : (
           <span className="flex h-full w-full items-center justify-center px-1 text-center text-[10px] font-semibold leading-tight text-[#c5d4e0]">
