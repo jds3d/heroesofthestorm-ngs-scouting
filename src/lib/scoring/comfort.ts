@@ -38,8 +38,8 @@ const SL_WR_PRIOR_GAMES = 10;
 const SL_SCALE = 0.3;
 
 /** Comfort → interactive pick/ban scorecard points (0–1 comfort scale). */
-export const COMFORT_PICK_MULTIPLIER = 80;
-export const COMFORT_PICK_CAP = 32;
+export const COMFORT_PICK_MULTIPLIER = 110;
+export const COMFORT_PICK_CAP = 44;
 
 /** Seat assignment / plan solver weight on raw comfort (~0–0.35). */
 export const COMFORT_PLAN_WEIGHT = 2;
@@ -289,6 +289,12 @@ export function heroUnplayedBy(roster: PlayerScout[], hero: string): boolean {
 
 /** Scorecard penalty for a pick nobody on the five plays. */
 export const UNPLAYED_PICK_PENALTY = -30;
+
+/**
+ * When a pick is scored for a named seat and that player is under the suggest
+ * bar on the hero, pull it below meta-only noise.
+ */
+export const BELOW_BAR_SEAT_PENALTY = -34;
 
 export function filterBanList(
   roster: PlayerScout[],

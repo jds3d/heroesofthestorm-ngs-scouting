@@ -408,6 +408,14 @@ export function heroAlliesLoaded(
   return row.allySamples.length > 0 || row.synergiesWith.length > 0;
 }
 
+/** Open plan seat labels — not real heroes; never fetch or score matchup lines. */
+export function isPlanPlaceholderHero(hero: string): boolean {
+  const h = hero?.trim();
+  if (!h) return true;
+  if (h.startsWith("Flex")) return true;
+  return heroRole(h) === "Unknown";
+}
+
 /** Display names whose matchup payload is not in the table yet. */
 export function heroesMissingMatchupLoad(
   table: DraftMetaTable | null | undefined,
@@ -428,8 +436,7 @@ export function matchupFetchQueue(
   const seen = new Set<string>();
   const out: string[] = [];
   const push = (hero: string) => {
-    // Plan seats use "Flex" / "Flex ban" when no hero is chosen yet.
-    if (!hero || heroRole(hero) === "Unknown") return;
+    if (isPlanPlaceholderHero(hero)) return;
     const key = heroKey(hero);
     if (seen.has(key)) return;
     seen.add(key);
@@ -567,6 +574,7 @@ export function duoMissingLine(
 ): string | null {
   // Both teams cannot lock the same hero. A likely-five mirror is not a gap.
   if (heroKey(subject) === heroKey(other)) return null;
+  if (isPlanPlaceholderHero(subject) || isPlanPlaceholderHero(other)) return null;
   const label = verb === "into" ? `into ${other}` : `with ${other}`;
   const pendingKey = (name: string) =>
     pending?.has(name) || pending?.has(heroKey(name)) || false;
@@ -773,6 +781,7 @@ function uniqueOthers(hero: string, others: readonly string[]): string[] {
   const self = heroKey(hero);
   const seen = new Set<string>();
   return others.filter((h) => {
+    if (isPlanPlaceholderHero(h)) return false;
     const k = heroKey(h);
     if (k === self || seen.has(k)) return false;
     seen.add(k);

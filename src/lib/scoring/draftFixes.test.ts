@@ -50,6 +50,7 @@ import {
   duoMissingLine,
   enemyDuos,
   heroesMissingMatchupLoad,
+  LIKELY_MATCHUP_DUO,
   MATCHUP_DUO,
   mergeLoadedMatchupRows,
   matchupFetchQueue,
@@ -462,6 +463,46 @@ describe("duo scoring", () => {
         ["Samuro", "Anduin"],
       ),
     ).toEqual(["Samuro", "Anduin", "Garrosh", "Junkrat", "Deathwing", "Gul'dan"]);
+  });
+
+  it("skips open Flex plan seats in vs-likely matchup lines", () => {
+    const table = buildDraftMetaTable({
+      patch: "test",
+      global: [
+        {
+          hero: "Stitches",
+          winRate: 52,
+          influence: 10,
+          popularity: 20,
+          banRate: 0,
+          pickRate: 0,
+          games: 4000,
+        },
+        {
+          hero: "Muradin",
+          winRate: 50,
+          influence: 0,
+          popularity: 10,
+          banRate: 0,
+          pickRate: 0,
+          games: 4000,
+        },
+      ],
+      matchups: {
+        Stitches: [
+          { hero: "Muradin", wins: 55, losses: 45, games: 200, enemyWinRate: 45 },
+        ],
+        Muradin: [
+          { hero: "Stitches", wins: 45, losses: 55, games: 200, enemyWinRate: 55 },
+        ],
+      },
+    });
+    const duos = enemyDuos(table, "Stitches", ["Muradin", "Flex"]);
+    const result = scoreDuos(duos, LIKELY_MATCHUP_DUO, "into", ["Muradin", "Flex"], (enemy) =>
+      duoMissingLine(table, "Stitches", enemy, "into"),
+    );
+    expect(result.lines.some((line) => /into Flex/i.test(line))).toBe(false);
+    expect(result.lines.some((line) => line.startsWith("into Muradin:"))).toBe(true);
   });
 
   it("does not flag a hero as missing data into itself", () => {
@@ -1000,6 +1041,14 @@ describe("opponent draft explanations", () => {
     expect(
       explainTheirLikelyBan("Tricky Gooses", "Tyrael", "Polarus", "dive"),
     ).toContain("Tyrael is an anti-dive counter, so Tricky Gooses should remove it");
+  });
+
+  it("explains imminent top picks on the enemy likely ban chip", () => {
+    expect(
+      explainTheirLikelyBan("Them", "Falstad", null, "dive", {
+        imminentPick: true,
+      }),
+    ).toContain("strongest imminent pick");
   });
 
   it("removes the future opposing-ban expectation while we are choosing our own ban", () => {

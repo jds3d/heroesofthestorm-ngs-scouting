@@ -25,6 +25,7 @@ import {
   pairStructureProjection,
   pairSideBreakdown,
   pairSuggestionCautionLine,
+  pairHeldBoardIndex,
   resolvePairPickSelection,
   stepHeading,
   undoCount,
@@ -313,6 +314,30 @@ describe("resolvePairPickSelection", () => {
 
     expect(msg).toContain("Why not the other heroes: Whitemane + Tyrael?");
     expect(msg).toContain("Whitemane + Kaelthas fits better because");
+  });
+});
+
+describe("pairHeldBoardIndex", () => {
+  it("does not project a held hero into an empty seat when it is already on the board", () => {
+    const slots = [
+      { side: "our", kind: "pick", ordinal: 1, hero: "Qhira", player: "a" },
+      { side: "our", kind: "pick", ordinal: 2, hero: "Muradin", player: "b" },
+      { side: "our", kind: "pick", ordinal: 3, hero: "Zagara", player: "c" },
+      {
+        side: "our",
+        kind: "pick",
+        ordinal: 4,
+        hero: "Ragnaros",
+        player: "PangitMoDiba",
+      },
+      null,
+    ] as const;
+    expect(pairHeldBoardIndex(slots, "Ragnaros")).toBe(-1);
+  });
+
+  it("uses the first open seat when the held hero is not on the board yet", () => {
+    const slots = [null, null, null, null, null] as const;
+    expect(pairHeldBoardIndex(slots, "Ragnaros")).toBe(0);
   });
 });
 
@@ -613,7 +638,7 @@ describe("locked and likely matchups", () => {
       swapNote: "Beachyman takes Maiev from HuckIt (seat comfort 40 → 12)",
     });
     const swap = card.factors.find((factor) => factor.id === "swap");
-    expect(swap?.points).toBe(-22);
+    expect(swap?.points).toBe(-31);
     expect(swap?.detail).toContain("Beachyman takes Maiev");
   });
 });

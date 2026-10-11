@@ -252,6 +252,17 @@ export function scoreFive(args: {
  * Standard scale on the share of comparable options a lock beat: top 10% is
  * an A, the next 10% a B, and anything that didn't beat 60% of options is an F.
  */
+/** Collapse A+/A/A- into A for headline badges. */
+export function simpleLetterGrade(
+  grade: LetterGrade,
+): "A" | "B" | "C" | "D" | "F" {
+  if (grade.startsWith("A")) return "A";
+  if (grade.startsWith("B")) return "B";
+  if (grade.startsWith("C")) return "C";
+  if (grade === "D") return "D";
+  return "F";
+}
+
 export function percentileToGrade(percentile: number): LetterGrade {
   if (percentile >= 97) return "A+";
   if (percentile >= 93) return "A";
@@ -358,7 +369,7 @@ function gradeSide(args: {
   });
   const percentile = steps.length
     ? Math.round(steps.reduce((sum, s) => sum + s.percentile, 0) / steps.length)
-    : 100;
+    : clamp(Math.round(args.scored.quality), 0, 100);
   return {
     label: args.label,
     grade: percentileToGrade(percentile),

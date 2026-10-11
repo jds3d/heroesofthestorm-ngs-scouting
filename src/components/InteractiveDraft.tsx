@@ -35,6 +35,7 @@ import {
 } from "@/lib/scoring/draftPlan";
 import {
   gradeFinishedDraft,
+  simpleLetterGrade,
   type DraftReportCard,
   type DraftStepScore,
   type LetterGrade,
@@ -50,6 +51,7 @@ import {
   formatCounter,
   heroDraftMeta,
   duoMissingLine,
+  isPlanPlaceholderHero,
   isFlexibleAnchorRole,
   isMapSpecialist,
   isOfflanePlanRole,
@@ -95,6 +97,8 @@ import {
   type DraftSwap,
   type LockedPick,
 } from "@/lib/scoring/draftSwap";
+import { metaBanPriority } from "@/lib/scoring/adapt";
+import type { GlobalHeroStat } from "@/lib/scoring/metaPressure";
 import {
   BELOW_BAR_SEAT_PENALTY,
   COMFORT_PICK_CAP,
@@ -850,6 +854,22 @@ export function pairSeededPairOptions<T extends {
   return (ranked.length > 0 ? ranked : normalizedFallback).slice(0, 3);
 }
 
+/** Slot index for a held pair hero on the board, or -1 if it is already shown. */
+export function pairHeldBoardIndex(
+  slots: readonly (BoardAction | null)[],
+  heldHero: string | null | undefined,
+): number {
+  if (!heldHero) return -1;
+  if (
+    slots.some(
+      (slot) => slot && heroKey(slot.hero) === heroKey(heldHero),
+    )
+  ) {
+    return -1;
+  }
+  return slots.indexOf(null);
+}
+
 export function resolvePairPickSelection(args: {
   current: string[];
   hero: string;
@@ -1094,6 +1114,7 @@ export function buildPickScorecard(args: {
       : args.theirLikely
           .map((pick) => pick.hero)
           .filter((enemy) => {
+            if (isPlanPlaceholderHero(enemy)) return false;
             const key = heroKey(enemy);
             if (key === self || lockedKeys.has(key) || isGone(enemy, args.gone)) return false;
             if (likelySeen.has(key)) return false;
@@ -1458,12 +1479,18 @@ export function explainTheirLikelyBan(
   hero: string,
   player: string | null,
   archetype: string,
+  opts?: { imminentPick?: boolean },
 ): string {
   const base = `Likely ban: ${hero}${player ? ` (${player})` : ""}.`;
-  if (
-    archetype === "dive" &&
-    divePlaybook.antiDiveHeroes.some((name) => heroKey(name) === heroKey(hero))
-  ) {
+  const antiDive =
+    divePlaybook.antiDiveHeroes.some((name) => heroKey(name) === heroKey(hero));
+  if (opts?.imminentPick && antiDive) {
+    return `${base} ${hero} is our strongest imminent pick and an anti-dive answer — ${theirLabel} should remove it before we lock it.`;
+  }
+  if (opts?.imminentPick) {
+    return `${base} ${hero} is our top scoring pick on the board right now — ${theirLabel} should ban it before we take it.`;
+  }
+  if (archetype === "dive" && antiDive) {
     return `${base} ${hero} is an anti-dive counter, so ${theirLabel} should remove it to keep the dive shell live.`;
   }
   return base;
@@ -2050,6 +2077,26 @@ function slotsFor(
 }
 
 /** Heroes already locked on screen that the turn order has not placed yet. */
+function lockedSeatsFromPickSlots(
+  slots: readonly (BoardAction | null)[],
+): { hero: string; player: string | null }[] {
+  return slots
+    .filter(
+      (slot): slot is BoardAction =>
+        Boolean(slot?.hero && slot.hero !== UNSEEN_BAN),
+    )
+    .map((slot) => ({
+      hero: slot.hero,
+      player: displayPlayer(slot.player),
+    }));
+}
+
+function countFilledSlots(slots: readonly (BoardAction | null)[]): number {
+  return slots.filter(
+    (slot) => slot && slot.hero && slot.hero !== UNSEEN_BAN,
+  ).length;
+}
+
 function fillUnplacedLocks(
   slots: (BoardAction | null)[],
   heroes: readonly string[],
@@ -2479,16 +2526,19 @@ function theyMightTake(
   banPriority: { hero: string; reason: string }[],
   theirRoster: PlayerScout[],
 ): { who: string | null; via: "likely" | "deny" } | null {
-  const who = theirOwnerName(hero, theirLikely);
+  const matched = matchTheirPlanSeat(hero, theirLikely);
+  const who =
+    matched
+      ? displayPlayer(matched.seat.player)
+      : theirOwnerName(hero, theirLikely);
   if (
     theirRoster.length &&
     !heroMeetsSuggestBar(theirRoster, hero, who)
   ) {
     return null;
   }
-  const likely = theirLikely.find((p) => heroKey(p.hero) === heroKey(hero));
-  if (likely) {
-    return { who: displayPlayer(likely.player), via: "likely" };
+  if (matched) {
+    return { who, via: "likely" };
   }
   const deny = banPriority.find((b) => heroKey(b.hero) === heroKey(hero));
   if (deny) return { who: null, via: "deny" };
@@ -3386,6 +3436,271 @@ function ourLockedPicks(
   return out;
 }
 
+const THEIR_LIKELY_BAN_ANTI_DIVE_BONUS = 16;
+const PEEL_LOCK_HEROES = [
+  "Brightwing",
+  "Abathur",
+  "Anduin",
+  "Uther",
+  "Tyrael",
+] as const;
+
+function heroIsAntiDiveBan(hero: string): boolean {
+  return (divePlaybook.antiDiveHeroes as readonly string[]).some(
+    (name) => heroKey(name) === heroKey(hero),
+  );
+}
+
+function weShowDiveThreat(ourLockedHeroes: readonly string[]): boolean {
+  return ourLockedHeroes.some(
+    (h) =>
+      shouldTakeAndRebuild(null, h) ||
+      (divePlaybook.lateDiveAssassins as readonly string[]).some(
+        (d) => heroKey(d) === heroKey(h),
+      ),
+  );
+}
+
+function theirLockedShowsPeel(theirLockedHeroes: readonly string[]): boolean {
+  return theirLockedHeroes.some((h) =>
+    PEEL_LOCK_HEROES.some((p) => heroKey(p) === heroKey(h)),
+  );
+}
+
+export type ComputeTheirLikelyBanArgs = {
+  field: string[];
+  gone: Set<string>;
+  homeRoster: PlayerScout[];
+  planPicks: DraftCompPick[];
+  ourLockedHeroes: string[];
+  theirLockedHeroes: string[];
+  ourHeroPool: string[];
+  scoringMeta: DraftMetaTable | null | undefined;
+  map: string | null;
+  ourPickCount: number;
+  ourBanPriority: { hero: string; reason: string }[];
+  isLastStep: boolean;
+  matchupQueued?: readonly string[];
+  ourHeld: ReadonlySet<string>;
+  /** Open US portraits still to lock; drives imminent-pick scoring per seat. */
+  openOurPlayers: string[];
+  archetype: string | null;
+};
+
+function maxImminentOurPickTotal(
+  args: ComputeTheirLikelyBanArgs,
+  hero: string,
+): number {
+  const rosterPlayers = args.homeRoster
+    .map((row) => displayPlayer(row.battletag))
+    .filter((name): name is string => Boolean(name));
+  const players =
+    args.openOurPlayers.length > 0 ? args.openOurPlayers : rosterPlayers;
+  const scoreFor = (player: string | null): number => {
+    const seat = findSeatForCandidate(args.planPicks, hero, player);
+    const sig = comfortSignal(args.homeRoster, hero, player, args.ourHeld);
+    return buildPickScorecard({
+      hero,
+      table: args.scoringMeta,
+      gone: args.gone,
+      map: args.map,
+      ourPickCount: args.ourPickCount,
+      inPlan: Boolean(seat),
+      fromAlt: Boolean(seat?.asAlt),
+      planRole: seat?.seat.role ?? null,
+      lockedAllies: args.ourLockedHeroes,
+      theirLocked: args.theirLockedHeroes,
+      answeringTeamPool: args.ourHeroPool,
+      answerPerspective: "theirs",
+      theirLikely: args.planPicks,
+      banPriority: args.ourBanPriority,
+      theirRoster: args.homeRoster,
+      comfort: sig.comfort,
+      comfortWho: player,
+      swapDelta: 0,
+      swapNote: null,
+      takeAndRebuild: shouldTakeAndRebuild(args.scoringMeta, hero),
+      kind: "pick",
+      lastPick: args.isLastStep,
+      matchupQueued: args.matchupQueued,
+    }).total;
+  };
+  if (!players.length) return scoreFor(null);
+  let max = -Infinity;
+  for (const player of players) {
+    max = Math.max(max, scoreFor(player));
+  }
+  return max;
+}
+
+export type ObservedPicksBanCheck = {
+  ourBans?: readonly string[];
+  theirBans?: readonly string[];
+} | null;
+
+/** True once a ban is on the board (history or OCR), not merely an empty template. */
+export function draftBoardHasStarted(
+  historyLength: number,
+  observed: ObservedPicksBanCheck,
+): boolean {
+  if (historyLength > 0) return true;
+  for (const list of [observed?.ourBans, observed?.theirBans]) {
+    if (!list?.length) continue;
+    if (list.some((h) => h && h !== UNSEEN_BAN)) return true;
+  }
+  return false;
+}
+
+function globalStatsFromMeta(table: DraftMetaTable | null): GlobalHeroStat[] {
+  if (!table?.byHero) return [];
+  return Object.values(table.byHero).map((row) => ({
+    hero: row.hero,
+    influence: row.influence,
+    popularity: row.popularity,
+    banRate: row.banRate,
+    pickRate: row.pickRate,
+    winRate: row.winRate,
+    games: row.games,
+  }));
+}
+
+/** Ban list for live share before a scout report exists. */
+export function livePlayableBanPriority(
+  roster: PlayerScout[],
+  bans: { hero: string; reason: string }[],
+  playerFor: (hero: string) => string | null,
+  scoringMeta: DraftMetaTable | null,
+): { hero: string; reason: string }[] {
+  const fromList = filterBanList(roster, bans, playerFor);
+  if (fromList.length) return fromList;
+  const global = globalStatsFromMeta(scoringMeta);
+  if (!global.length) return [];
+  if (roster.length) {
+    const metaBans = metaBanPriority(roster, global);
+    if (metaBans.length) {
+      return metaBans.map((ban) => ({ hero: ban.hero, reason: ban.reason }));
+    }
+  }
+  return global
+    .sort((a, b) => b.influence - a.influence)
+    .slice(0, 20)
+    .map((stat) => ({
+      hero: stat.hero,
+      reason: `Strong in Storm League (${stat.influence} influence) — ban while player pools are still loading.`,
+    }));
+}
+
+export function stormLeagueBlocksSuggestion(args: {
+  stormLeagueOnly: boolean;
+  metaReady: boolean;
+  homeRosterCount: number;
+  step: { side: "fp" | "sp"; kind: "ban" | "pick" } | null;
+  weFirst: boolean;
+}): boolean {
+  if (!args.stormLeagueOnly) return false;
+  if (!args.metaReady) return true;
+  if (args.homeRosterCount >= 4) return false;
+  if (!args.step) return true;
+  const ours = (args.step.side === "fp") === args.weFirst;
+  return !(ours && args.step.kind === "ban");
+}
+
+export function shouldPredictTheirLikelyBan(args: {
+  watchOnly: boolean;
+  sideKnown: boolean;
+  planLoadingLabel?: string | null;
+  historyLength: number;
+  observed: ObservedPicksBanCheck;
+}): boolean {
+  if (!args.watchOnly) return false;
+  if (!args.sideKnown) return false;
+  if (args.planLoadingLabel) return false;
+  return draftBoardHasStarted(args.historyLength, args.observed);
+}
+
+/** Watch board: which hero the enemy is most likely to ban against us. */
+export function computeTheirLikelyBan(
+  args: ComputeTheirLikelyBanArgs,
+): {
+  hero: string;
+  imminentPick: boolean;
+  antiDive: boolean;
+} | null {
+  if (!args.field.length) return null;
+  const imminentByKey = new Map<string, number>();
+  let topImminent = -Infinity;
+  let topImminentHero: string | null = null;
+  for (const hero of args.field) {
+    const imminent = maxImminentOurPickTotal(args, hero);
+    imminentByKey.set(heroKey(hero), imminent);
+    if (imminent > topImminent) {
+      topImminent = imminent;
+      topImminentHero = hero;
+    }
+  }
+
+  const diveThreat = weShowDiveThreat(args.ourLockedHeroes);
+  const peel = theirLockedShowsPeel(args.theirLockedHeroes);
+  const antiDiveContext =
+    diveThreat && (peel || args.archetype === "dive");
+
+  const scored = args.field
+    .map((hero) => {
+      const seat = findSeatForCandidate(args.planPicks, hero);
+      const banSig = comfortSignal(
+        args.homeRoster,
+        hero,
+        null,
+        args.ourHeld,
+      );
+      const ban = buildPickScorecard({
+        hero,
+        table: args.scoringMeta,
+        gone: args.gone,
+        map: args.map,
+        ourPickCount: args.ourPickCount,
+        inPlan: Boolean(seat),
+        fromAlt: Boolean(seat?.asAlt),
+        planRole: seat?.seat.role ?? null,
+        lockedAllies: args.ourLockedHeroes,
+        theirLocked: args.theirLockedHeroes,
+        answeringTeamPool: args.ourHeroPool,
+        answerPerspective: "theirs",
+        theirLikely: args.planPicks,
+        banPriority: args.ourBanPriority,
+        theirRoster: args.homeRoster,
+        comfort: banSig.comfort,
+        comfortWho: null,
+        swapDelta: 0,
+        swapNote: null,
+        takeAndRebuild: false,
+        kind: "ban",
+        lastPick: args.isLastStep,
+        matchupQueued: args.matchupQueued,
+      });
+      const imminent = imminentByKey.get(heroKey(hero)) ?? 0;
+      const antiDive =
+        antiDiveContext && heroIsAntiDiveBan(hero)
+          ? THEIR_LIKELY_BAN_ANTI_DIVE_BONUS
+          : 0;
+      const total = ban.total + imminent + antiDive;
+      return { hero, total, imminent, antiDive };
+    })
+    .sort((a, b) => b.total - a.total || a.hero.localeCompare(b.hero));
+
+  const top = scored[0];
+  if (!top) return null;
+  const imminentPick =
+    topImminentHero != null &&
+    heroKey(top.hero) === heroKey(topImminentHero) &&
+    top.imminent > 0;
+  return {
+    hero: top.hero,
+    imminentPick,
+    antiDive: top.antiDive > 0,
+  };
+}
+
 export function InteractiveDraft({
   tree,
   weFirst,
@@ -3633,10 +3948,21 @@ export function InteractiveDraft({
 
   const playableBanPriority = useMemo(
     () =>
-      filterBanList(theirRoster, banPriority, (h) =>
-        theirOwnerName(h, theirLikely),
+      livePlayableBanPriority(
+        theirRoster,
+        banPriority,
+        (h) => theirOwnerName(h, theirLikely),
+        scoringMeta,
       ),
-    [theirRoster, banPriority, theirLikely],
+    [theirRoster, banPriority, theirLikely, scoringMeta],
+  );
+
+  const ourPlayableBanPriority = useMemo(
+    () =>
+      filterBanList(homeRoster, banPriority, (h) =>
+        theirOwnerName(h, planPicks),
+      ),
+    [homeRoster, banPriority, planPicks],
   );
 
   // One player per hero — specialist locks can steal earlier flex seats.
@@ -3745,7 +4071,17 @@ export function InteractiveDraft({
   }, [watchOnly, history, observedPicks, theirRoster, gone, scoringMeta, allHeroes]);
 
   const theirLikelyBan = useMemo(() => {
-    if (!watchOnly) return null;
+    if (
+      !shouldPredictTheirLikelyBan({
+        watchOnly,
+        sideKnown,
+        planLoadingLabel,
+        historyLength: history.length,
+        observed: observedPicks,
+      })
+    ) {
+      return null;
+    }
     const banSlots = slotsFor(history, "their", "ban", 3);
     const lastOpen = banSlots.findLastIndex((slot) => !slot);
     if (lastOpen < 0) return null;
@@ -3763,59 +4099,62 @@ export function InteractiveDraft({
       .filter((action) => action.side === "their" && action.kind === "pick")
       .map((action) => action.hero);
     const isLastStep = stepIndex === DRAFT_ORDER.length - 1;
-    const scored = field
-      .map((hero) => {
-        const sig = comfortSignal(homeRoster, hero, null, ourHeld);
-        return buildPickScorecard({
-          hero,
-          table: scoringMeta,
-          gone,
-          map: map ?? null,
-          ourPickCount: theirPickCount,
-          inPlan: false,
-          fromAlt: false,
-          planRole: null,
-          lockedAllies: ourLockedHeroes,
-          theirLocked: theirLockedHeroes,
-          answeringTeamPool: ourHeroPool,
-          answerPerspective: "theirs",
-          theirLikely: planPicks,
-          banPriority: playableBanPriority,
-          theirRoster: homeRoster,
-          comfort: sig.comfort,
-          comfortWho: sig.who,
-          swapDelta: 0,
-          swapNote: null,
-          takeAndRebuild: false,
-          kind: "ban",
-          lastPick: isLastStep,
-          matchupQueued: matchupPending,
-        });
-      })
-      .sort((a, b) => b.total - a.total || a.hero.localeCompare(b.hero));
-    const top = scored[0];
-    if (!top) return null;
-    const who = comfortSignal(homeRoster, top.hero, null, ourHeld).who;
+    const openOurPlayers = (observedPicks?.ourOpenPlayers ?? [])
+      .map((name) => displayPlayer(name))
+      .filter((name): name is string => Boolean(name));
+    const picked = computeTheirLikelyBan({
+      field,
+      gone,
+      homeRoster,
+      planPicks,
+      ourLockedHeroes,
+      theirLockedHeroes,
+      ourHeroPool,
+      scoringMeta,
+      map: map ?? null,
+      ourPickCount,
+      ourBanPriority: ourPlayableBanPriority,
+      isLastStep,
+      matchupQueued: matchupPending,
+      ourHeld,
+      openOurPlayers,
+      archetype: theirArchetype ?? null,
+    });
+    if (!picked) return null;
+    const archetype =
+      theirArchetype?.trim().toLowerCase() || "flex";
     return {
-      hero: top.hero,
-      player: who,
+      hero: picked.hero,
+      player: null,
       slotIndex: lastOpen,
+      title: explainTheirLikelyBan(
+        theirLabel,
+        picked.hero,
+        null,
+        archetype,
+        { imminentPick: picked.imminentPick },
+      ),
     };
   }, [
     watchOnly,
+    sideKnown,
+    planLoadingLabel,
     history,
     gone,
     allHeroes,
     homeRoster,
     scoringMeta,
     map,
-    theirPickCount,
+    ourPickCount,
     planPicks,
-    playableBanPriority,
+    ourPlayableBanPriority,
     ourHeroPool,
     stepIndex,
     matchupPending,
     ourHeld,
+    observedPicks,
+    theirArchetype,
+    theirLabel,
   ]);
 
   // Suggesting and grading share these scorers, so taking the top suggestion
@@ -5081,10 +5420,19 @@ export function InteractiveDraft({
   }, [matchupTrack]);
 
   function baseSuggestion(): Suggestion | null {
-    if (stormLeagueOnly) {
-      const metaReady =
-        scoringMeta?.byHero && Object.keys(scoringMeta.byHero).length > 0;
-      if (!metaReady || homeRoster.length < 4) return null;
+    const metaReady = Boolean(
+      scoringMeta?.byHero && Object.keys(scoringMeta.byHero).length > 0,
+    );
+    if (
+      stormLeagueBlocksSuggestion({
+        stormLeagueOnly,
+        metaReady,
+        homeRosterCount: homeRoster.length,
+        step,
+        weFirst,
+      })
+    ) {
+      return null;
     }
     if (!step) return null;
     const ours =
@@ -5982,24 +6330,79 @@ export function InteractiveDraft({
     };
   }
 
+  const watchOurPickSlots = useMemo(
+    () =>
+      watchOnly
+        ? fillUnplacedLocks(
+            slotsFor(stampedHistory, "our", "pick", 5),
+            observedPicks?.ourPicks ?? [],
+            observedPicks?.ourPickPlayers ?? [],
+            "our",
+          )
+        : slotsFor(stampedHistory, "our", "pick", 5),
+    [watchOnly, stampedHistory, observedPicks],
+  );
+
+  const watchTheirPickSlots = useMemo(
+    () =>
+      watchOnly
+        ? fillUnplacedLocks(
+            slotsFor(stampedHistory, "their", "pick", 5),
+            observedPicks?.theirPicks ?? [],
+            observedPicks?.theirPickPlayers ?? [],
+            "their",
+          )
+        : slotsFor(stampedHistory, "their", "pick", 5),
+    [watchOnly, stampedHistory, observedPicks],
+  );
+
+  const draftBoardFull = useMemo(() => {
+    const ourBansFilled = countFilledSlots(
+      slotsFor(stampedHistory, "our", "ban", 3),
+    );
+    const theirBansFilled = countFilledSlots(
+      slotsFor(stampedHistory, "their", "ban", 3),
+    );
+    return (
+      ourBansFilled === 3 &&
+      theirBansFilled === 3 &&
+      countFilledSlots(watchOurPickSlots) === 5 &&
+      countFilledSlots(watchTheirPickSlots) === 5
+    );
+  }, [stampedHistory, watchOurPickSlots, watchTheirPickSlots]);
+
+  const draftComplete = done || (watchOnly && draftBoardFull);
+
   const endSwaps = useMemo(() => {
-    if (!done || !homeRoster.length) return [];
+    if (!draftComplete || !homeRoster.length) return [];
+    const locked =
+      ourLockedPicks(history, planPicks, homeRoster).length >= 5
+        ? ourLockedPicks(history, planPicks, homeRoster)
+        : lockedSeatsFromPickSlots(watchOurPickSlots);
     return findEndDraftSwaps({
       home: homeRoster,
-      locked: ourLockedPicks(history, planPicks, homeRoster),
+      locked,
     });
-  }, [done, homeRoster, history, planPicks]);
+  }, [draftComplete, homeRoster, history, planPicks, watchOurPickSlots]);
 
   /** Fantasy-football style grades + win% once all ten locks land. */
   const draftReport = useMemo((): DraftReportCard | null => {
-    if (!done) return null;
-    const ourLocked = ourLockedPicks(history, planPicks, homeRoster);
-    const theirLocked = history
+    if (!draftComplete) return null;
+    const ourFromHistory = ourLockedPicks(history, planPicks, homeRoster);
+    const ourLocked =
+      ourFromHistory.length >= 5
+        ? ourFromHistory
+        : lockedSeatsFromPickSlots(watchOurPickSlots);
+    const theirFromHistory = history
       .filter((a) => a.side === "their" && a.kind === "pick")
       .map((a) => ({
         hero: a.hero,
         player: displayPlayer(a.player),
       }));
+    const theirLocked =
+      theirFromHistory.length >= 5
+        ? theirFromHistory
+        : lockedSeatsFromPickSlots(watchTheirPickSlots);
     if (ourLocked.length < 5 || theirLocked.length < 5) return null;
     const steps = collectReportSteps(history, (index) => {
       const action = history[index];
@@ -6051,7 +6454,7 @@ export function InteractiveDraft({
       theirLabel,
     });
   }, [
-    done,
+    draftComplete,
     history,
     planPicks,
     homeRoster,
@@ -6068,11 +6471,13 @@ export function InteractiveDraft({
     theirLabel,
     ourMmr,
     theirMmr,
+    watchOurPickSlots,
+    watchTheirPickSlots,
   ]);
 
   /** Heal we locked as comfort/deny — talents + teamfight script at the end. */
   const healDenyEnd = useMemo(() => {
-    if (!done) return null;
+    if (!draftComplete) return null;
     const ourHeals = history.filter(
       (a) =>
         a.side === "our" &&
@@ -6108,10 +6513,10 @@ export function InteractiveDraft({
       ourFive,
       theirFive,
     };
-  }, [done, history, theirLikely, playableBanPriority, theirRoster]);
+  }, [draftComplete, history, theirLikely, playableBanPriority, theirRoster]);
 
   const compTalents = useMemo(() => {
-    if (!done) return [];
+    if (!draftComplete) return [];
     const ourPicks = stampedHistory.filter((a) => a.side === "our" && a.kind === "pick");
     const ourFive = ourPicks.map((a) => a.hero);
     const theirFive = stampedHistory
@@ -6123,7 +6528,7 @@ export function InteractiveDraft({
         player: displayPlayer(a.player ?? null),
       })),
     );
-  }, [done, stampedHistory]);
+  }, [draftComplete, stampedHistory]);
 
   const remainingBans = playableBanPriority.filter(
     (b) => !isGone(b.hero, gone),
@@ -6575,25 +6980,11 @@ export function InteractiveDraft({
 
   const ourBans = slotsFor(history, "our", "ban", 3);
   const theirBans = slotsFor(history, "their", "ban", 3);
-  const ourPicks = watchOnly
-    ? fillUnplacedLocks(
-        slotsFor(stampedHistory, "our", "pick", 5),
-        observedPicks?.ourPicks ?? [],
-        observedPicks?.ourPickPlayers ?? [],
-        "our",
-      )
-    : slotsFor(stampedHistory, "our", "pick", 5);
-  const theirPicks = watchOnly
-    ? fillUnplacedLocks(
-        slotsFor(stampedHistory, "their", "pick", 5),
-        observedPicks?.theirPicks ?? [],
-        observedPicks?.theirPickPlayers ?? [],
-        "their",
-      )
-    : slotsFor(stampedHistory, "their", "pick", 5);
+  const ourPicks = watchOurPickSlots;
+  const theirPicks = watchTheirPickSlots;
   const heldHero = pairWindow ? pairPick[0] : undefined;
   const heldSlots = ours ? ourPicks : theirPicks;
-  const heldIndex = heldHero ? heldSlots.indexOf(null) : -1;
+  const heldIndex = pairHeldBoardIndex(heldSlots, heldHero);
   if (heldHero && heldIndex >= 0) {
     heldSlots[heldIndex] = {
       side: ours ? "our" : "their",
@@ -6811,14 +7202,20 @@ export function InteractiveDraft({
         </p>
       )}
       <div className="rounded-md border border-[#3d5163] bg-[#162230] px-4 py-4">
-        {done ? (
+        {draftComplete ? (
           <div className="space-y-3">
             <p className="text-sm font-semibold text-[#9dceb0]">
               {watchOnly
                 ? "Draft complete. Grade and win chance are from the heroes on screen."
                 : "Draft walk complete. Undo if something was logged wrong."}
             </p>
-            {draftReport && <DraftReportCardView report={draftReport} />}
+            {draftReport ? (
+              <DraftReportCardView report={draftReport} />
+            ) : (
+              <p className="text-sm text-[#c5d4e0]">
+                Waiting for all ten picks to show on the board before grading.
+              </p>
+            )}
             {shownDeviation && (
               <DeviationCallout
                 note={shownDeviation}
@@ -7250,6 +7647,40 @@ export function InteractiveDraft({
   );
 }
 
+function DraftLetterBadge({
+  label,
+  grade,
+  accent,
+}: {
+  label: string;
+  grade: LetterGrade;
+  accent: "ally" | "enemy";
+}) {
+  const letter = simpleLetterGrade(grade);
+  const ring =
+    accent === "ally" ? "border-teal-500/50" : "border-red-500/50";
+  const text =
+    accent === "ally" ? "text-teal-200" : "text-red-200";
+  return (
+    <div className="flex flex-col items-center gap-1 text-center">
+      <p className="text-[10px] font-bold uppercase tracking-wide text-[#8aa0b2]">
+        {label}
+      </p>
+      <div
+        className={`flex h-16 w-16 items-center justify-center rounded-lg border-2 bg-[#0f1821] ${ring}`}
+        title={`Draft grade ${grade}`}
+      >
+        <span className={`text-4xl font-black tabular-nums leading-none ${text}`}>
+          {letter}
+        </span>
+      </div>
+      <p className="text-[11px] font-semibold tabular-nums text-[#c5d4e0]">
+        {grade}
+      </p>
+    </div>
+  );
+}
+
 function gradeTone(grade: LetterGrade): string {
   if (grade.startsWith("A")) return "border-emerald-500/50 bg-emerald-950/40 text-emerald-200";
   if (grade.startsWith("B")) return "border-sky-500/45 bg-sky-950/35 text-sky-200";
@@ -7300,6 +7731,24 @@ function WinChance({
 function DraftReportCardView({ report }: { report: DraftReportCard }) {
   return (
     <div className="space-y-3 rounded-md border border-[#3d5163] bg-[#0f1821] px-3 py-3">
+      <div
+        className="flex flex-wrap items-center justify-center gap-6 border-b border-[#2a3a48] pb-4"
+        aria-label="Draft letter grades"
+      >
+        <DraftLetterBadge
+          label={report.ours.label}
+          grade={report.ours.grade}
+          accent="ally"
+        />
+        <p className="text-xs font-bold uppercase tracking-wide text-[#5a6b78]">
+          vs
+        </p>
+        <DraftLetterBadge
+          label={report.theirs.label}
+          grade={report.theirs.grade}
+          accent="enemy"
+        />
+      </div>
       <div className="flex flex-wrap items-end justify-between gap-3">
         <div>
           <p className="text-[10px] font-bold uppercase tracking-wide text-[#8aa0b2]">
@@ -8790,6 +9239,7 @@ function DraftSideRow({
     hero: string;
     player: string | null;
     slotIndex: number;
+    title?: string;
   } | null;
   likelyPicks?: readonly (TheirRemainingSeat | null)[] | null;
 }) {
@@ -8824,7 +9274,10 @@ function DraftSideRow({
               {likelyBan && !b && i === likelyBan.slotIndex ? (
                 <div
                   className="flex max-w-[4.5rem] flex-col items-center opacity-90"
-                  title={`Likely ban: ${likelyBan.hero}${likelyBan.player ? ` (${likelyBan.player})` : ""}`}
+                  title={
+                    likelyBan.title ??
+                    `Likely ban: ${likelyBan.hero}${likelyBan.player ? ` (${likelyBan.player})` : ""}`
+                  }
                 >
                   <span className="text-center text-[8px] font-bold uppercase tracking-wide text-[#8aa0b2]">
                     Likely ban

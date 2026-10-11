@@ -1,7 +1,11 @@
 import { describe, expect, it } from "vitest";
 import {
+  BELOW_BAR_SEAT_PENALTY,
+  COMFORT_PICK_CAP,
+  COMFORT_PICK_MULTIPLIER,
   COMFORT_SUGGEST_MIN,
   comfortMeetsSuggestBar,
+  comfortPickPoints,
   buildPlayerComfort,
   comfortFromSources,
   fallbackPoolScore,
@@ -141,6 +145,13 @@ describe("suggest bar", () => {
 
   it("uses UI score 15 as the minimum raw comfort", () => {
     expect(COMFORT_SUGGEST_MIN).toBe(0.15);
+  });
+
+  it("scales comfort into pick points with a hard cap", () => {
+    expect(comfortPickPoints(0.15)).toBe(
+      Math.min(COMFORT_PICK_CAP, 0.15 * COMFORT_PICK_MULTIPLIER),
+    );
+    expect(BELOW_BAR_SEAT_PENALTY).toBeLessThan(0);
   });
 
   it("allows core heroes and blocks off-pool shells", () => {
