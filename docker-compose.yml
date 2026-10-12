@@ -12,9 +12,12 @@ services:
       - .env.local
     environment:
       NODE_ENV: production
+      # Path inside the container (bind mount below).
+      HOTS_REPLAY_DIR: /replays
     volumes:
       - ./.cache:/app/.cache
       - ./drafts:/app/drafts
+      - ${HOTS_REPLAY_HOST_DIR:?Set HOTS_REPLAY_HOST_DIR in .env.local to your HotS Multiplayer replays folder}:/replays:ro
     restart: unless-stopped
 
   tunnel:

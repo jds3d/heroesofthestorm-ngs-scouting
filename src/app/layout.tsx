@@ -1,6 +1,9 @@
 import type { Metadata } from "next";
 import { Fraunces, Source_Sans_3 } from "next/font/google";
+import { scheduleReplaySyncOnStartup } from "@/lib/replay/startupSync";
 import "./globals.css";
+
+scheduleReplaySyncOnStartup();
 
 const display = Fraunces({
   variable: "--font-display",

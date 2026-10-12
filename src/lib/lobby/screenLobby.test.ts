@@ -3,13 +3,16 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { decodePng } from "@/lib/lobby/pngImage";
 import {
+  NO_BAN,
   UNSEEN_BAN,
   actionsFromObserved,
   inferFirstPick,
+  firstPickFromObservedBoard,
   bannerTurn,
   colorfulFraction,
   firstBanSideFromStatus,
   openSeatPlayers,
+  reorderOurPicksForDraftZip,
   portraitFilled,
   readSlotPlate,
   readsBySlot,
@@ -29,6 +32,9 @@ import {
   heroesFromColumn,
   nameFromPlate,
   namesFromOcrLines,
+  draftLobbyLikelyOnFrame,
+  liveDraftBoardFull,
+  EMPTY_LIVE_DRAFT,
   draftLobbySeen,
   mapFromTitle,
   menuScreenSeen,
@@ -56,6 +62,7 @@ import {
   borderLooksLocked,
   borderLooksLockedSamples,
   DRAFT_PLATE_SLOTS,
+  DRAFT_SLOT_NAMES,
   portraitIsLocked,
   portraitTeamRim,
   rememberHeroes,
@@ -66,6 +73,28 @@ import {
   snapToRoster,
   turnFromOcr,
 } from "./screenLobby";
+
+describe("reorderOurPicksForDraftZip", () => {
+  it("puts Lunara before Tyrael when the banner lists Tyrael higher", () => {
+    const row = reorderOurPicksForDraftZip(
+      ["Whitemane", "Falstad", "Tyrael", "Lunara"],
+      ["HuckIt", "LiuMei", "Kalel", "Lochen"],
+    );
+    expect(row.heroes).toEqual(["Whitemane", "Falstad", "Lunara", "Tyrael"]);
+  });
+});
+
+describe("firstPickFromObservedBoard", () => {
+  it("reads Battlefield bans when firstPick was never pinned", () => {
+    expect(
+      firstPickFromObservedBoard({
+        firstPick: null,
+        ourBans: [NO_BAN, "Xal'atath", NO_BAN],
+        theirBans: ["Qhira", NO_BAN, "Johanna"],
+      }),
+    ).toBe("us");
+  });
+});
 
 describe("openSeatPlayers", () => {
   it("keeps every unlocked name and drops a player who already locked", () => {
@@ -183,12 +212,47 @@ describe("draft locks from the screen", () => {
   it("treats a bright rim as locked and a dark rim as still open", () => {
     expect(borderLooksLocked([30, 40, 180, 200, 210, 190, 205, 170, 40, 35])).toBe(true);
     expect(borderLooksLocked([20, 30, 25, 40, 35, 30, 28, 32, 22, 26])).toBe(false);
-    const locked = { blue: 28, red: 0 };
-    const hover = { blue: 7, red: 0 };
-    expect(portraitIsLocked({ phase: "ban", faceFilled: true, teamRim: locked })).toBe(false);
-    expect(portraitIsLocked({ phase: "pick", faceFilled: true, teamRim: hover })).toBe(false);
-    expect(portraitIsLocked({ phase: null, faceFilled: true, teamRim: locked })).toBe(true);
-    expect(portraitIsLocked({ phase: "pick", faceFilled: false, teamRim: locked })).toBe(false);
+    expect(
+      portraitIsLocked({
+        phase: "ban",
+        faceFilled: true,
+        plate: "locked",
+        ally: true,
+      }),
+    ).toBe(false);
+    expect(
+      portraitIsLocked({
+        phase: "pick",
+        faceFilled: true,
+        plate: "shown",
+        ally: true,
+      }),
+    ).toBe(false);
+    expect(
+      portraitIsLocked({
+        phase: "pick",
+        faceFilled: true,
+        plate: "locked",
+        ally: true,
+        heroOnPlate: true,
+      }),
+    ).toBe(true);
+    expect(
+      portraitIsLocked({
+        phase: "pick",
+        faceFilled: false,
+        plate: "locked",
+        ally: true,
+      }),
+    ).toBe(false);
+    expect(
+      portraitIsLocked({
+        phase: "pick",
+        faceFilled: false,
+        ally: false,
+        heroOnPlate: true,
+      }),
+    ).toBe(true);
   });
 
   it("leaves the Alterac Tyrande hover unlocked", () => {
@@ -201,7 +265,7 @@ describe("draft locks from the screen", () => {
       const i = (py * image.width + px) * 4;
       return { r: image.data[i] ?? 0, g: image.data[i + 1] ?? 0, b: image.data[i + 2] ?? 0 };
     };
-    const locked = (box: (typeof DRAFT_PLATE_SLOTS.left)[number]) => {
+    const boxRgb = (box: (typeof DRAFT_PLATE_SLOTS.left)[number]) => {
       const x = Math.round(box.x * image.width);
       const y = Math.round(box.y * image.height);
       const w = Math.round(box.w * image.width);
@@ -212,14 +276,31 @@ describe("draft locks from the screen", () => {
           pixels.push(pixelAt(x + col, y + row));
         }
       }
-      return portraitIsLocked({
-        phase: "pick",
-        faceFilled: portraitFilled(pixels),
-        teamRim: portraitTeamRim(image.width, image.height, box, pixelAt),
-      });
+      return pixels;
     };
-    expect(DRAFT_PLATE_SLOTS.left.map(locked)).toEqual([true, false, true, true, true]);
-    expect(DRAFT_PLATE_SLOTS.right.map(locked)).toEqual([true, false, true, true, true]);
+    const locked = (
+      portrait: (typeof DRAFT_PLATE_SLOTS.left)[number],
+      name: (typeof DRAFT_SLOT_NAMES.left)[number],
+      ally: boolean,
+      heroOnPlate: boolean,
+    ) =>
+      portraitIsLocked({
+        phase: "pick",
+        faceFilled: portraitFilled(boxRgb(portrait)),
+        plate: plateFill(boxRgb(name), ally),
+        ally,
+        heroOnPlate,
+      });
+    expect(
+      DRAFT_PLATE_SLOTS.left.map((box, index) =>
+        locked(box, DRAFT_SLOT_NAMES.left[index], true, index !== 1),
+      ),
+    ).toEqual([true, false, true, true, true]);
+    expect(
+      DRAFT_PLATE_SLOTS.right.map((box, index) =>
+        locked(box, DRAFT_SLOT_NAMES.right[index], false, index !== 1),
+      ),
+    ).toEqual([true, false, true, true, true]);
   });
 
   it("keeps the Volskaya highlight unlocked and the colored rims locked", () => {
@@ -232,7 +313,7 @@ describe("draft locks from the screen", () => {
       const i = (py * image.width + px) * 4;
       return { r: image.data[i] ?? 0, g: image.data[i + 1] ?? 0, b: image.data[i + 2] ?? 0 };
     };
-    const locked = (box: (typeof DRAFT_PLATE_SLOTS.left)[number]) => {
+    const boxRgb = (box: (typeof DRAFT_PLATE_SLOTS.left)[number]) => {
       const x = Math.round(box.x * image.width);
       const y = Math.round(box.y * image.height);
       const w = Math.round(box.w * image.width);
@@ -241,14 +322,31 @@ describe("draft locks from the screen", () => {
       for (let row = 0; row < h; row++) {
         for (let col = 0; col < w; col++) pixels.push(pixelAt(x + col, y + row));
       }
-      return portraitIsLocked({
-        phase: "pick",
-        faceFilled: portraitFilled(pixels),
-        teamRim: portraitTeamRim(image.width, image.height, box, pixelAt),
-      });
+      return pixels;
     };
-    expect(DRAFT_PLATE_SLOTS.left.map(locked)).toEqual([true, false, true, false, true]);
-    expect(DRAFT_PLATE_SLOTS.right.map(locked)).toEqual([true, true, false, true, true]);
+    const locked = (
+      portrait: (typeof DRAFT_PLATE_SLOTS.left)[number],
+      name: (typeof DRAFT_SLOT_NAMES.left)[number],
+      ally: boolean,
+      heroOnPlate: boolean,
+    ) =>
+      portraitIsLocked({
+        phase: "pick",
+        faceFilled: portraitFilled(boxRgb(portrait)),
+        plate: plateFill(boxRgb(name), ally),
+        ally,
+        heroOnPlate,
+      });
+    expect(
+      DRAFT_PLATE_SLOTS.left.map((box, index) =>
+        locked(box, DRAFT_SLOT_NAMES.left[index], true, index !== 1 && index !== 2 && index !== 3),
+      ),
+    ).toEqual([true, false, false, false, true]);
+    expect(
+      DRAFT_PLATE_SLOTS.right.map((box, index) =>
+        locked(box, DRAFT_SLOT_NAMES.right[index], false, index !== 2),
+      ),
+    ).toEqual([true, true, false, true, true]);
   });
 
   it("treats a blue or red team glow as locked and a dim purple background as open", () => {
@@ -450,6 +548,23 @@ describe("draft locks from the screen", () => {
     ]);
   });
 
+  it("waits for a mid-ban hex read when opening bans were already read from the screen", () => {
+    const actions = actionsFromObserved({
+      weFirst: true,
+      firstPick: "us",
+      phase: null,
+      map: "Battlefield of Eternity",
+      ourBans: [NO_BAN, "Xal'atath"],
+      theirBans: ["Qhira", NO_BAN],
+      ourPicks: ["Whitemane", "Falstad", "Lunara"],
+      theirPicks: ["Diablo", "Alarak"],
+      ourPickPlayers: [],
+      theirPickPlayers: [],
+    });
+    expect(actions).toHaveLength(9);
+    expect(actions.filter((a) => a.hero === UNSEEN_BAN)).toHaveLength(0);
+  });
+
   it("fills the second ban round when the first pick wave is locked and the client is picking", () => {
     const actions = actionsFromObserved({
       weFirst: false,
@@ -507,6 +622,42 @@ describe("draft locks from the screen", () => {
     expect(
       inferFirstPick({ ourPicks: 0, theirPicks: 0, phase: "pick", turnSide: "our" }),
     ).toBe(null);
+  });
+
+  it("knows when a live draft board is full", () => {
+    const full = {
+      ...EMPTY_LIVE_DRAFT,
+      ourBans: ["A", NO_BAN, "B"],
+      theirBans: ["C", "D", "E"],
+      ourPicks: ["1", "2", "3", "4", "5"],
+      theirPicks: ["6", "7", "8", "9", "0"],
+    };
+    expect(liveDraftBoardFull(full)).toBe(true);
+    expect(
+      liveDraftBoardFull({
+        ...full,
+        ourPicks: ["1", "2", "3", "4", UNSEEN_BAN],
+      }),
+    ).toBe(false);
+    expect(liveDraftBoardFull({ ...EMPTY_LIVE_DRAFT })).toBe(false);
+  });
+
+  it("detects a likely draft lobby from pixels without OCR", () => {
+    expect(
+      draftLobbyLikelyOnFrame({ titleBrightShare: 0.02, banSlots: [] }),
+    ).toBe(false);
+    expect(
+      draftLobbyLikelyOnFrame({
+        titleBrightShare: 0.05,
+        banSlots: [],
+      }),
+    ).toBe(true);
+    expect(
+      draftLobbyLikelyOnFrame({
+        titleBrightShare: 0,
+        banSlots: [{ filled: false, passed: true }],
+      }),
+    ).toBe(true);
   });
 
   it("waits for a draft and ignores the Storm League menu", () => {
@@ -637,12 +788,16 @@ describe("draft locks from the screen", () => {
     const white = Array.from({ length: 80 }, () => ({ r: 210, g: 206, b: 198 }));
     const blue = Array.from({ length: 80 }, () => ({ r: 40, g: 90, b: 190 }));
     const dark = Array.from({ length: 80 }, () => ({ r: 8, g: 6, b: 16 }));
-    const warmLock = Array.from({ length: 80 }, () => ({ r: 170, g: 90, b: 40 }));
+    const warmLock = Array.from({ length: 80 }, () => ({ r: 210, g: 150, b: 120 }));
+    const enemyOpen = Array.from({ length: 80 }, () => ({ r: 96, g: 24, b: 28 }));
+    const enemyLock = Array.from({ length: 80 }, () => ({ r: 228, g: 178, b: 188 }));
     expect(plateFill(white)).toBe("locked");
     expect(plateFill(blue)).toBe("shown");
     expect(plateFill(dark)).toBe("empty");
     expect(plateFill(warmLock)).toBe("locked");
     expect(plateFill([])).toBe("empty");
+    expect(plateFill(enemyOpen, false)).toBe("shown");
+    expect(plateFill(enemyLock, false)).toBe("locked");
   });
 
   it("counts a ban hex only when a face is in it", () => {
@@ -710,6 +865,22 @@ describe("draft locks from the screen", () => {
     expect(
       bansFromHexFaces([null, null, null], [false, false, false], ["Valla", "Johanna"]),
     ).toEqual(["Valla", "Johanna"]);
+    expect(
+      bansFromHexFaces(
+        [null, "Xal'atath", null],
+        [false, true, false],
+        [],
+        [true, false, false],
+      ),
+    ).toEqual([NO_BAN, "Xal'atath"]);
+    expect(
+      bansFromHexFaces(
+        ["Qhira", null, null],
+        [true, false, false],
+        [],
+        [false, true, false],
+      ),
+    ).toEqual(["Qhira", NO_BAN]);
   });
 
   it("matches a saved portrait and keeps a second view of that hero", () => {

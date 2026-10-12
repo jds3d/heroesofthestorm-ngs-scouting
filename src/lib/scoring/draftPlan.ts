@@ -2459,8 +2459,10 @@ export function mapBriefForSelectedMap(
  * Pre-bans: FP, SP, FP, SP
  * Picks: FP 1 → SP 2+3 → FP 4+5
  * Mid-bans: SP, FP
- * Picks: SP 6+7 (their 3rd+4th heroes) → FP 8+9 → SP 10 (last)
+ * Picks: SP 3rd+4th heroes → FP 4th+5th → SP 5th (last). Five per team.
  */
+export const MAX_DRAFT_PICKS_PER_SIDE = 5;
+
 export const DRAFT_ORDER: { side: "fp" | "sp"; kind: "ban" | "pick" }[] = [
   { side: "fp", kind: "ban" },
   { side: "sp", kind: "ban" },

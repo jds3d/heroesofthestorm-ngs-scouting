@@ -2,11 +2,64 @@
   {
     "hero": "Hogger",
     "file": "hogger-alterac-2.png",
-    "source": "draft lobby alterac 2.png"
+    "source": "draft lobby alterac 2.png",
+    "side": "right",
+    "slot": 0
   },
   {
     "hero": "Whitemane",
     "file": "whitemane-alterac-2.png",
-    "source": "draft lobby alterac 2.png"
+    "source": "draft lobby alterac 2.png",
+    "side": "right",
+    "slot": 2
+  },
+  {
+    "hero": "Xal'atath",
+    "file": "xalatath-battlefield.png",
+    "source": "battlefield.png",
+    "side": "left",
+    "slot": 1
+  },
+  {
+    "hero": "Qhira",
+    "file": "qhira-braxis-1.png",
+    "source": "braxis 1.png",
+    "side": "left",
+    "slot": 0
+  },
+  {
+    "hero": "Anub'arak",
+    "file": "anubarak-braxis-1.png",
+    "source": "braxis 1.png",
+    "side": "right",
+    "slot": 0
+  },
+  {
+    "hero": "Cassia",
+    "file": "cassia-braxis-2.png",
+    "source": "braxis 2.png",
+    "side": "left",
+    "slot": 0
+  },
+  {
+    "hero": "Chen",
+    "file": "chen-braxis-2.png",
+    "source": "braxis 2.png",
+    "side": "left",
+    "slot": 1
+  },
+  {
+    "hero": "Sylvanas",
+    "file": "sylvanas-braxis-2.png",
+    "source": "braxis 2.png",
+    "side": "left",
+    "slot": 2
+  },
+  {
+    "hero": "Tyrande",
+    "file": "tyrande-braxis-2.png",
+    "source": "braxis 2.png",
+    "side": "right",
+    "slot": 2
   }
 ]

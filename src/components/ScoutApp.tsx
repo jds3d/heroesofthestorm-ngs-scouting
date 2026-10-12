@@ -12,6 +12,7 @@ import { InteractiveDraft } from "@/components/InteractiveDraft";
 import {
   actionsFromObserved,
   EMPTY_LIVE_DRAFT,
+  firstPickFromObservedBoard,
   heroFromPlateText,
   rosterTagsForLobby,
   rosterTagsPresent,
@@ -151,6 +152,8 @@ export function ScoutApp() {
   const [review, setReview] = useState<ReviewGame | null>(null);
   const [liveDraft, setLiveDraft] = useState<LiveDraft | null>(null);
   const [sharing, setSharing] = useState(false);
+  const [screenWatchIdlePaused, setScreenWatchIdlePaused] = useState(false);
+  const resumeScreenWatchRef = useRef<(() => void) | null>(null);
   const [lobbyNames, setLobbyNames] = useState<string[]>([]);
   const [screenOurNames, setScreenOurNames] = useState<string[]>([]);
   const [statsNote, setStatsNote] = useState<string | null>(null);
@@ -182,13 +185,17 @@ export function ScoutApp() {
   const scoutingSelf = selected !== "" && selected === homeName;
   const lineupsReady =
     ourFive.length === 5 && (scoutingSelf || theirFive.length === 5);
+  const liveFirstPick = useMemo(
+    () => (liveDraft ? firstPickFromObservedBoard(liveDraft) : null),
+    [liveDraft],
+  );
   const liveScreen = useMemo(() => {
-    if (!liveDraft) return null;
+    if (!liveDraft || !liveFirstPick) return null;
     return actionsFromObserved({
       ...liveDraft,
-      weFirst: liveDraft.firstPick === "us",
+      weFirst: liveFirstPick === "us",
     });
-  }, [liveDraft]);
+  }, [liveDraft, liveFirstPick]);
 
   const weekGroups = useMemo(() => opponentsByWeek(teams), [teams]);
 
@@ -253,6 +260,7 @@ export function ScoutApp() {
       setSlTrackError(null);
       setSuggestionsGate(null);
       setTournamentDraft(false);
+      setScreenWatchIdlePaused(false);
     }
   }, [sharing]);
 
@@ -785,6 +793,28 @@ export function ScoutApp() {
 
   return (
     <div className="flex w-full flex-col">
+      {sharing && screenWatchIdlePaused ? (
+        <div
+          className="sticky top-0 z-50 flex flex-wrap items-center justify-between gap-3 border-b border-amber-500/40 bg-gradient-to-r from-amber-950 via-[#1a1208] to-amber-950 px-4 py-3 shadow-md sm:px-6"
+          role="status"
+        >
+          <div className="min-w-0 space-y-0.5">
+            <p className="text-xs font-bold uppercase tracking-[0.28em] text-amber-400">
+              Paused
+            </p>
+            <p className="text-sm text-amber-100/85">
+              No draft changes on screen for 60 seconds — screen watch is off to save CPU.
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={() => resumeScreenWatchRef.current?.()}
+            className="shrink-0 rounded-md border border-amber-400/60 bg-amber-500/15 px-4 py-2 text-sm font-semibold text-amber-50 transition hover:bg-amber-500/25"
+          >
+            Resume watching
+          </button>
+        </div>
+      ) : null}
     <div className="mx-auto flex w-full max-w-none flex-col gap-8 px-4 py-10 sm:px-6 lg:px-8">
       {!sharing && (
       <header className="space-y-3">
@@ -828,6 +858,8 @@ export function ScoutApp() {
           onDraft={setLiveDraft}
           onWatchingChange={setSharing}
           resetEpoch={watchReset}
+          onIdlePausedChange={setScreenWatchIdlePaused}
+          resumeRef={resumeScreenWatchRef}
         />
         {!sharing && (
         <>
@@ -1011,8 +1043,8 @@ export function ScoutApp() {
           ) : null}
           <InteractiveDraft
             tree={{ id: "live", title: "Live draft", detail: "Read from the shared screen." }}
-            weFirst={liveDraft?.firstPick === "us"}
-            sideKnown={liveDraft?.firstPick != null}
+            weFirst={liveFirstPick === "us"}
+            sideKnown={liveFirstPick != null}
             screen={liveScreen}
             observedPicks={liveDraft}
             ourLabel="Us"

@@ -225,7 +225,7 @@ export function buildAdaptPlan(
         recommendations.push({
           priority: 4,
           title: `SL surprise: ${h.hero}`,
-          detail: `${p.battletag.split("#")[0]} cooks ${h.hero} in Storm League but rarely shows it in NGS — treat as a blind threat, prefer banning off NGS signals first.`,
+          detail: `${p.battletag.split("#")[0]} cooks ${h.hero} in Storm League but rarely shows it in NGS — treat as an unscouted threat, prefer banning off NGS signals first.`,
         });
       }
     }

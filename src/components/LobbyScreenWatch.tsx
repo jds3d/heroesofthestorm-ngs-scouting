@@ -1,9 +1,9 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type MutableRefObject } from "react";
 import { TimeLeftBar } from "@/components/TimeLeftBar";
 import { heroKey } from "@/lib/scoring/heroMeta";
-import { matchBanPixels } from "@/lib/lobby/banFace";
+import { banHexPassed, inferSandwichedMutedBan, matchBanPixels } from "@/lib/lobby/banFace";
 import type { Worker } from "tesseract.js";
 import {
   DRAFT_BAN_HEXES,
@@ -23,9 +23,11 @@ import {
   matchPortrait,
   portraitVector,
   inferFirstPick,
+  firstPickFromBanBoard,
   pickCountsFit,
   PARTY_NAME_ROW,
   openSeatPlayers,
+  reorderOurPicksForDraftZip,
   portraitFilled,
   plateFill,
   portraitIsLocked,
@@ -48,6 +50,8 @@ import {
   snapToRoster,
   takeNewLocks,
   turnFromOcr,
+  draftLobbyLikelyOnFrame,
+  liveDraftBoardFull,
   watchPhase,
   type DraftBox,
   type PlateFill,
@@ -55,15 +59,33 @@ import {
   type OpenTurn,
   type Rgb,
 } from "@/lib/lobby/screenLobby";
+import {
+  WATCH_IDLE_PAUSE_MS,
+  allBanSlotSignals,
+  draftWatchFingerprintKey,
+  watchIdlePauseDue,
+} from "@/lib/lobby/watchFingerprint";
 
 type Phase = "idle" | "watching" | "reading";
 type Box = { x: number; y: number; w: number; h: number; rotate: number };
+
+/** Full parse while a draft is active. Slower tick when only pixel-gating. */
+const WATCH_TICK_DRAFT_MS = 2000;
+const WATCH_TICK_IDLE_MS = 6000;
 
 function readHex(
   ctx: CanvasRenderingContext2D,
   frame: HTMLCanvasElement,
   box: DraftBox,
-): { filled: boolean; vector: number[] | null; hero: string | null } {
+): {
+  filled: boolean;
+  passed: boolean;
+  vector: number[] | null;
+  hero: string | null;
+  pixels: Rgb[];
+  width: number;
+  height: number;
+} {
   const x = Math.max(0, Math.round(box.x * frame.width));
   const y = Math.max(0, Math.round(box.y * frame.height));
   const w = Math.max(1, Math.min(frame.width - x, Math.round(box.w * frame.width)));
@@ -72,16 +94,21 @@ function readHex(
   try {
     data = ctx.getImageData(x, y, w, h).data;
   } catch {
-    return { filled: false, vector: null, hero: null };
+    return { filled: false, passed: false, vector: null, hero: null, pixels: [], width: 0, height: 0 };
   }
   const pixels: Rgb[] = [];
   for (let i = 0; i < data.length; i += 4) {
     pixels.push({ r: data[i] ?? 0, g: data[i + 1] ?? 0, b: data[i + 2] ?? 0 });
   }
+  const filled = banHexFilled(pixels);
   return {
-    filled: banHexFilled(pixels),
+    filled,
+    passed: !filled && banHexPassed(pixels, w, h),
     vector: portraitVector(pixels, w, h),
-    hero: banHexFilled(pixels) ? matchBanPixels(pixels, w, h) : null,
+    hero: filled ? matchBanPixels(pixels, w, h) : null,
+    pixels,
+    width: w,
+    height: h,
   };
 }
 
@@ -267,6 +294,8 @@ export function LobbyScreenWatch({
   onWatchingChange,
   onReplaySync,
   resetEpoch = 0,
+  onIdlePausedChange,
+  resumeRef,
 }: {
   ourNames: string[];
   /** Battletags the OCR names can snap onto (both lineups). */
@@ -280,6 +309,10 @@ export function LobbyScreenWatch({
   onReplaySync?: () => void | Promise<void>;
   /** Bump to drop the last game and read the current screen from scratch. */
   resetEpoch?: number;
+  /** True while auto-paused after no on-screen draft changes. */
+  onIdlePausedChange?: (paused: boolean) => void;
+  /** Parent calls `.current()` to resume after idle pause. */
+  resumeRef?: MutableRefObject<(() => void) | null>;
 }) {
   const [phase, setPhase] = useState<Phase>("idle");
   const [status, setStatus] = useState(
@@ -287,8 +320,10 @@ export function LobbyScreenWatch({
   );
   const [names, setNames] = useState<string[]>([]);
   const streamRef = useRef<MediaStream | null>(null);
+  const videoRef = useRef<HTMLVideoElement | null>(null);
   const timerRef = useRef<number | null>(null);
   const workerRef = useRef<Worker | null>(null);
+  const hiddenRef = useRef(false);
   const busyRef = useRef(false);
   const epochRef = useRef(0);
   const appliedReset = useRef(0);
@@ -307,6 +342,9 @@ export function LobbyScreenWatch({
   const facesRef = useRef<FaceRow[]>([]);
   const frameSavedRef = useRef(false);
   const inDraftRef = useRef(false);
+  const watchFingerprintRef = useRef("");
+  const stableSinceRef = useRef(0);
+  const idlePausedRef = useRef(false);
   const onReplaySyncRef = useRef(onReplaySync);
   const leftNamesRef = useRef<string[]>([]);
   const rightNamesRef = useRef<string[]>([]);
@@ -353,13 +391,85 @@ export function LobbyScreenWatch({
     };
   }, []);
 
-  function stopWatch() {
+  function clearWatchTimer() {
     if (timerRef.current != null) {
       window.clearInterval(timerRef.current);
       timerRef.current = null;
     }
+  }
+
+  function setIdlePaused(paused: boolean) {
+    idlePausedRef.current = paused;
+    onIdlePausedChange?.(paused);
+  }
+
+  function enterIdlePause() {
+    if (idlePausedRef.current) return;
+    clearWatchTimer();
+    setIdlePaused(true);
+    setPhase("watching");
+    setStatus(
+      `Paused — no draft changes for ${WATCH_IDLE_PAUSE_MS / 1000}s. Resume when the draft moves again.`,
+    );
+  }
+
+  function resumeIdleWatch() {
+    if (!streamRef.current || !videoRef.current || !workerRef.current) return;
+    setIdlePaused(false);
+    stableSinceRef.current = Date.now();
+    setStatus("Watching the main screen.");
+    armWatchTimer();
+    void readFrame(videoRef.current, workerRef.current);
+  }
+
+  if (resumeRef) resumeRef.current = resumeIdleWatch;
+
+  function armWatchTimer() {
+    clearWatchTimer();
+    const video = videoRef.current;
+    const worker = workerRef.current;
+    if (!video || !worker || hiddenRef.current || !streamRef.current) return;
+    if (idlePausedRef.current) return;
+    const ms = inDraftRef.current ? WATCH_TICK_DRAFT_MS : WATCH_TICK_IDLE_MS;
+    timerRef.current = window.setInterval(() => {
+      void readFrame(video, worker);
+    }, ms);
+  }
+
+  useEffect(() => {
+    const onVisibility = () => {
+      hiddenRef.current = document.visibilityState === "hidden";
+      if (phase === "idle") return;
+      if (hiddenRef.current) {
+        if (timerRef.current != null) {
+          window.clearInterval(timerRef.current);
+          timerRef.current = null;
+        }
+        setStatus((prev) =>
+          prev.includes("tab in background")
+            ? prev
+            : `${prev.replace(/ \(paused — scout tab in background\)$/, "")} (paused — scout tab in background)`,
+        );
+        return;
+      }
+      setStatus((prev) =>
+        prev.replace(/ \(paused — scout tab in background\)$/, ""),
+      );
+      armWatchTimer();
+      const video = videoRef.current;
+      const worker = workerRef.current;
+      if (video && worker) void readFrame(video, worker);
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => document.removeEventListener("visibilitychange", onVisibility);
+  }, [phase]);
+
+  function stopWatch() {
+    clearWatchTimer();
+    setIdlePaused(false);
     for (const track of streamRef.current?.getTracks() ?? []) track.stop();
     streamRef.current = null;
+    videoRef.current = null;
     const worker = workerRef.current;
     workerRef.current = null;
     void worker?.terminate();
@@ -535,7 +645,7 @@ async function readLobby(
       const box = portraitBoxes[index];
       const nameBox = nameBoxes[index];
       if (!read.hero || !box || !nameBox || !ctx || !pixelAt) return [];
-      const plate = plateFill(sampleBox(ctx, frame, nameBox));
+      const plate = plateFill(sampleBox(ctx, frame, nameBox), ally);
       return [
         {
           hero: read.hero,
@@ -556,7 +666,7 @@ async function readLobby(
     return reads.flatMap((read, index) => {
       const nameBox = nameBoxes[index];
       if (!read.hero || !nameBox) return [];
-      if (plateFill(sampleBox(ctx, frame, nameBox)) !== "shown") return [];
+      if (plateFill(sampleBox(ctx, frame, nameBox), true) !== "shown") return [];
       return [read.hero];
     });
   };
@@ -570,7 +680,7 @@ async function readLobby(
     leftSlots: slots(true, leftReads, DRAFT_PLATE_SLOTS.left, DRAFT_SLOT_NAMES.left),
     rightSlots: slots(false, rightReads, DRAFT_PLATE_SLOTS.right, DRAFT_SLOT_NAMES.right),
     leftShown: shownHeroes(leftReads, DRAFT_SLOT_NAMES.left),
-    rightShown: shownHeroes(rightReads, DRAFT_SLOT_NAMES.right),
+    rightShown: [],
     leftReads,
     rightReads,
     picksLeft: [],
@@ -591,6 +701,9 @@ async function readLobby(
 
   function clearObserved() {
     inDraftRef.current = false;
+    watchFingerprintRef.current = "";
+    stableSinceRef.current = 0;
+    setIdlePaused(false);
     announcedPicksRef.current = [];
     lastKeyRef.current = "";
     lastOursKeyRef.current = "";
@@ -618,18 +731,55 @@ async function readLobby(
     clearObserved();
   }, [resetEpoch]);
 
+  function titleBrightShare(
+    ctx: CanvasRenderingContext2D,
+    frame: HTMLCanvasElement,
+  ): number {
+    const { pixels } = sampleRegion(ctx, frame, DRAFT_TITLE_BOX);
+    if (!pixels.length) return 0;
+    const bright = pixels.filter((p) => p.r + p.g + p.b > 200).length;
+    return bright / pixels.length;
+  }
+
   async function readFrame(video: HTMLVideoElement, worker: Worker) {
     if (busyRef.current || video.readyState < 2) return;
+    if (hiddenRef.current) return;
+    if (idlePausedRef.current) return;
     const epoch = epochRef.current;
     busyRef.current = true;
-    setPhase("reading");
     try {
       const frame = document.createElement("canvas");
       frame.width = video.videoWidth;
       frame.height = video.videoHeight;
-      const ctx = frame.getContext("2d");
+      const ctx = frame.getContext("2d", { willReadFrequently: true });
       if (!ctx) return;
       ctx.drawImage(video, 0, 0);
+      const fingerprint = draftWatchFingerprintKey(ctx, frame);
+      const banSlots = allBanSlotSignals(ctx, frame);
+      const lobbyLikely = draftLobbyLikelyOnFrame({
+        titleBrightShare: titleBrightShare(ctx, frame),
+        banSlots,
+      });
+      if (!inDraftRef.current && !lobbyLikely) {
+        watchFingerprintRef.current = "";
+        if (lastKeyRef.current || lastOursKeyRef.current) forgetNames();
+        setStatus(
+          "Watching the main screen. No draft lobby visible — checking slowly.",
+        );
+        return;
+      }
+      if (
+        inDraftRef.current &&
+        watchFingerprintRef.current &&
+        fingerprint === watchFingerprintRef.current
+      ) {
+        const stableMs = Date.now() - stableSinceRef.current;
+        if (watchIdlePauseDue(stableMs)) {
+          enterIdlePause();
+        }
+        return;
+      }
+      setPhase("reading");
       const roster = rosterRef.current;
       const titleText = await readColumn(frame, worker, DRAFT_TITLE_BOX);
       const centerText = await readColumn(frame, worker, DRAFT_TURN_BOX);
@@ -666,6 +816,8 @@ async function readLobby(
       const partyText = await readColumn(frame, worker, PARTY_NAME_ROW);
       const leftHexes = DRAFT_BAN_HEXES.left.map((hex) => readHex(ctx, frame, hex));
       const rightHexes = DRAFT_BAN_HEXES.right.map((hex) => readHex(ctx, frame, hex));
+      inferSandwichedMutedBan(leftHexes);
+      inferSandwichedMutedBan(rightHexes);
       const lobby = await lobbyPromise;
       const rapidCenter = (lobby?.center ?? []).map((line) => line.text).join("\n");
       const centerSource = rapidCenter.trim() ? rapidCenter : centerText;
@@ -704,9 +856,9 @@ async function readLobby(
             portraitIsLocked({
               phase: platePhase,
               faceFilled: row.faceFilled,
-              teamRim: row.teamRim,
               plate: row.plate,
               ally: row.ally,
+              heroOnPlate: true,
             }),
           ),
         );
@@ -845,11 +997,13 @@ async function readLobby(
         namedHexes(ourHexes),
         ourHexes.map((hex) => hex.filled),
         draft.ourBans,
+        ourHexes.map((hex) => hex.passed),
       );
       const theirBans = bansFromHexFaces(
         namedHexes(theirHexes),
         theirHexes.map((hex) => hex.filled),
         draft.theirBans,
+        theirHexes.map((hex) => hex.passed),
       );
       const phase = banner.phase ?? centerRead.phase ?? fromSlots ?? (slotted ? "pick" : draft.phase);
       if (banPhase && !picksStartedRef.current) {
@@ -857,6 +1011,10 @@ async function readLobby(
         theirPicks = [];
       }
       let firstPick = draft.firstPick;
+      if (!firstPick) {
+        const fromBanBoard = firstPickFromBanBoard(ourBans, theirBans);
+        if (fromBanBoard) firstPick = fromBanBoard;
+      }
       if (
         !firstPick &&
         ourPicks.length + theirPicks.length === 0 &&
@@ -898,6 +1056,15 @@ async function readLobby(
         if (ourBans.length > 0 && theirBans.length === 0) firstPick = "us";
         else if (theirBans.length > 0 && ourBans.length === 0) firstPick = "them";
       }
+      if (
+        firstPick === "them" &&
+        theirPicks.length === 0 &&
+        (ourPicks.length > 0 ||
+          (lobby &&
+            (usOnLeft ? lobby.leftReads : lobby.rightReads).some((read) => read.hero)))
+      ) {
+        firstPick = "us";
+      }
       if (ourPicks.length + theirPicks.length > 0) {
         const usFits = pickCountsFit(true, ourPicks.length, theirPicks.length);
         const themFits = pickCountsFit(false, ourPicks.length, theirPicks.length);
@@ -922,18 +1089,6 @@ async function readLobby(
       if (!map) map = mapFromTitle(titleText);
       const seatCtx = frame.getContext("2d");
       const seatPixels = seatCtx ? framePixelAt(seatCtx, frame) : null;
-      const lockedFlags = (boxes: readonly DraftBox[], nameBoxes: readonly DraftBox[], ally: boolean) =>
-        boxes.map((box, index) => {
-          if (!seatCtx || !seatPixels) return false;
-          const nameBox = nameBoxes[index];
-          return portraitIsLocked({
-            phase: platePhase,
-            faceFilled: portraitFilled(sampleBox(seatCtx, frame, box)),
-            teamRim: portraitTeamRim(frame.width, frame.height, box, seatPixels),
-            plate: nameBox ? plateFill(sampleBox(seatCtx, frame, nameBox)) : undefined,
-            ally,
-          });
-        });
       const namedSeats = (
         reads: readonly { player: string | null }[],
       ) =>
@@ -942,23 +1097,56 @@ async function readLobby(
         }));
       const ourReads = usOnLeft ? lobby?.leftReads ?? [] : lobby?.rightReads ?? [];
       const theirReads = usOnLeft ? lobby?.rightReads ?? [] : lobby?.leftReads ?? [];
+      const lockedFlags = (
+        boxes: readonly DraftBox[],
+        nameBoxes: readonly DraftBox[],
+        ally: boolean,
+        reads: readonly { hero: string | null; player: string | null }[],
+      ) =>
+        boxes.map((box, index) => {
+          if (!seatCtx || !seatPixels) return false;
+          const nameBox = nameBoxes[index];
+          const read = reads[index];
+          return portraitIsLocked({
+            phase: platePhase,
+            faceFilled: portraitFilled(sampleBox(seatCtx, frame, box)),
+            plate: nameBox
+              ? plateFill(sampleBox(seatCtx, frame, nameBox), ally)
+              : undefined,
+            ally,
+            heroOnPlate: Boolean(read?.hero),
+          });
+        });
       const ourBoxes = usOnLeft ? DRAFT_PLATE_SLOTS.left : DRAFT_PLATE_SLOTS.right;
       const theirBoxes = usOnLeft ? DRAFT_PLATE_SLOTS.right : DRAFT_PLATE_SLOTS.left;
       const ourNameBoxes = usOnLeft ? DRAFT_SLOT_NAMES.left : DRAFT_SLOT_NAMES.right;
       const theirNameBoxes = usOnLeft ? DRAFT_SLOT_NAMES.right : DRAFT_SLOT_NAMES.left;
       const ourOpenPlayers =
         lobby && ourReads.some((read) => read.player)
-          ? openSeatPlayers(namedSeats(ourReads), lockedFlags(ourBoxes, ourNameBoxes, true))
+          ? openSeatPlayers(
+              namedSeats(ourReads),
+              lockedFlags(ourBoxes, ourNameBoxes, true, ourReads),
+            )
           : draft.ourOpenPlayers ?? [];
       const theirOpenPlayers =
         lobby && theirReads.some((read) => read.player)
-          ? openSeatPlayers(namedSeats(theirReads), lockedFlags(theirBoxes, theirNameBoxes, false))
+          ? openSeatPlayers(
+              namedSeats(theirReads),
+              lockedFlags(theirBoxes, theirNameBoxes, false, theirReads),
+            )
           : draft.theirOpenPlayers ?? [];
+      let ourPickPlayers = ourLocked?.players ?? draft.ourPickPlayers;
+      let theirPickPlayers = theirLocked?.players ?? draft.theirPickPlayers;
+      if (allowPicks && firstPick && slotted) {
+        const ourZip = reorderOurPicksForDraftZip(ourPicks, ourPickPlayers);
+        ourPicks = ourZip.heroes;
+        ourPickPlayers = ourZip.players;
+      }
       const nextDraft: LiveDraft = {
         ourPicks,
         theirPicks,
-        ourPickPlayers: ourLocked?.players ?? draft.ourPickPlayers,
-        theirPickPlayers: theirLocked?.players ?? draft.theirPickPlayers,
+        ourPickPlayers,
+        theirPickPlayers,
         ourOpenPlayers,
         theirOpenPlayers,
         ourBans,
@@ -970,6 +1158,11 @@ async function readLobby(
       if (epoch !== epochRef.current) return;
       draftRef.current = nextDraft;
       onDraftRef.current(nextDraft);
+      if (liveDraftBoardFull(nextDraft)) {
+        stopWatch();
+        setStatus("Draft complete. Screen watch stopped.");
+        return;
+      }
 
       const partyNames = partyNamesFromText(partyText).map((name) => snapToRoster(name, roster));
       const inParty =
@@ -1009,11 +1202,16 @@ async function readLobby(
             : who,
         );
       }
+      watchFingerprintRef.current = fingerprint;
+      stableSinceRef.current = Date.now();
     } catch {
       setStatus("Could not read that frame. The watch is still running.");
     } finally {
       busyRef.current = false;
-      if (streamRef.current) setPhase("watching");
+      if (streamRef.current) {
+        setPhase("watching");
+        armWatchTimer();
+      }
     }
   }
 
@@ -1034,6 +1232,8 @@ async function readLobby(
     openTurnRef.current = null;
     picksStartedRef.current = false;
     inDraftRef.current = false;
+    watchFingerprintRef.current = "";
+    stableSinceRef.current = 0;
     onDraftRef.current(draftRef.current);
     setNames([]);
     setPhase("watching");
@@ -1075,12 +1275,16 @@ async function readLobby(
         tessedit_char_whitelist: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'",
       });
       workerRef.current = worker;
+      videoRef.current = video;
+      hiddenRef.current = document.visibilityState === "hidden";
       setPhase("watching");
-      setStatus("Watching the main screen.");
-      void readFrame(video, worker);
-      timerRef.current = window.setInterval(() => {
-        void readFrame(video, worker);
-      }, 2000);
+      setStatus(
+        hiddenRef.current
+          ? "Watching the main screen. (paused — scout tab in background)"
+          : "Watching the main screen.",
+      );
+      armWatchTimer();
+      if (!hiddenRef.current) void readFrame(video, worker);
     } catch (err) {
       stopWatch();
       const denied = err instanceof DOMException && err.name === "NotAllowedError";

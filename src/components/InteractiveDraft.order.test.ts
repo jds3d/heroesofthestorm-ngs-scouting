@@ -135,7 +135,7 @@ describe("reconstructed draft order", () => {
         theirLabel: "Them",
       }),
     );
-    expect(html).toContain("Waiting to see who bans first.");
+    expect(html).not.toContain("Waiting to see who bans first.");
     expect(html).toContain("Unseen");
     expect(html).not.toContain("Next");
   });

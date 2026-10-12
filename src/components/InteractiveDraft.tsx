@@ -9,8 +9,10 @@ import {
   type MouseEvent,
   type ReactNode,
 } from "react";
+import { createPortal } from "react-dom";
 import type { ReplayAction } from "@/lib/review/replayDraft";
-import { UNSEEN_BAN } from "@/lib/lobby/screenLobby";
+import { NO_BAN, UNSEEN_BAN } from "@/lib/lobby/screenLobby";
+import { HeroFace, NoBanBanFace } from "@/components/HeroFace";
 import type { DataGapDraft } from "@/lib/draft/dataGapLog";
 import { criticalTalentsFor } from "@/config/compCriticalTalents";
 import { divePlaybook, chooseDivePivot } from "@/config/divePlaybook";
@@ -20,6 +22,7 @@ import {
 } from "@/config/healDenyPlaybook";
 import {
   DRAFT_ORDER,
+  MAX_DRAFT_PICKS_PER_SIDE,
   explainCompHoles,
   extractLaneSplitNote,
   fillPlanHoles,
@@ -106,11 +109,13 @@ import {
   COMFORT_SUGGEST_MIN,
   comfortMeetsSuggestBar,
   comfortPickPoints,
+  comfortSourceDetail,
   filterBanList,
   heroMeetsSuggestBar,
   heroUnplayedBy,
   pairHasDistinctOwners,
   playerComfortOn,
+  playerHeroGames,
   playersMeetingSuggestBar,
   anySuggestablePair,
   type SlHeroSuggestion,
@@ -154,7 +159,6 @@ import {
   roleMatchedPair,
   roleMatchedSingle,
 } from "@/lib/scoring/roleBenchmark";
-import { HeroFace } from "@/components/HeroFace";
 
 type StepScore = {
   best: number;
@@ -1030,6 +1034,8 @@ export function buildPickScorecard(args: {
   answerPerspective?: "ours" | "theirs";
   /** Opponent roster — deny/contest only applies to heroes they actually play. */
   theirRoster?: PlayerScout[];
+  /** Team making this pick — used to count seat games vs unplayed penalties. */
+  teamRoster?: PlayerScout[];
   /** Nobody on the five that would play this hero has it on record. */
   unplayed?: boolean;
   /** Heroes whose Storm League bundle is in the current pull batch. */
@@ -1219,11 +1225,24 @@ export function buildPickScorecard(args: {
       : `each live counter min(8, 0.8 × edge over normal loss rate × sample confidence); sum ${answerPts.toFixed(2)} capped at -22 → ${Math.round(answerValue)}`,
   );
 
+  const seatGames =
+    args.comfortWho && args.teamRoster?.length
+      ? playerHeroGames(args.teamRoster, args.hero, args.comfortWho)
+      : 0;
   const comfortPts = comfortPickPoints(args.comfort);
   const comfortDetail = args.comfortWho
-    ? args.comfort > 0
-      ? `${args.comfortWho} · seat comfort ${(args.comfort * 100).toFixed(0)}`
-      : `${args.comfortWho} · no recorded comfort on ${args.hero}`
+    ? args.teamRoster?.length
+      ? comfortSourceDetail(
+          args.teamRoster,
+          args.hero,
+          args.comfortWho,
+          args.comfort,
+        )
+      : seatGames > 0 && args.comfort < COMFORT_SUGGEST_MIN
+        ? `${args.comfortWho} · ${seatGames}g · low comfort ${(args.comfort * 100).toFixed(0)}`
+        : args.comfort > 0
+          ? `${args.comfortWho} · seat comfort ${(args.comfort * 100).toFixed(0)}`
+          : `${args.comfortWho} · no recorded games on ${args.hero}`
     : "No strong comfort signal";
   addFactor(
     factors,
@@ -1237,14 +1256,15 @@ export function buildPickScorecard(args: {
   if (
     args.kind === "pick" &&
     args.comfortWho &&
-    args.comfort < COMFORT_SUGGEST_MIN
+    args.comfort < COMFORT_SUGGEST_MIN &&
+    seatGames <= 0
   ) {
     addFactor(
       factors,
       "below-bar",
       "Not on player pool",
       BELOW_BAR_SEAT_PENALTY,
-      `${args.comfortWho} is under the ${(COMFORT_SUGGEST_MIN * 100).toFixed(0)} comfort bar on ${args.hero} — do not suggest a blind pick for that seat.`,
+      `${args.comfortWho} has no logged games on ${args.hero} in the loaded sample — do not suggest that seat for this hero.`,
       `flat ${BELOW_BAR_SEAT_PENALTY} when a named seat is below the suggest bar`,
     );
   }
@@ -1255,7 +1275,7 @@ export function buildPickScorecard(args: {
       "unplayed",
       "Unplayed",
       UNPLAYED_PICK_PENALTY,
-      `Nobody on this five has ${args.hero} on record — whoever is left over plays it blind.`,
+      `Nobody on this five has ${args.hero} on record — whoever is left has to fill that hero.`,
       `flat ${UNPLAYED_PICK_PENALTY} because no roster player has ever logged ${args.hero}`,
     );
   }
@@ -2289,6 +2309,15 @@ function ordinalWord(n: number): string {
   return `${n}${suffix}`;
 }
 
+function pickStepWords(ordinal: number, pair: boolean): string {
+  const first = Math.min(Math.max(ordinal, 1), MAX_DRAFT_PICKS_PER_SIDE);
+  if (!pair || first >= MAX_DRAFT_PICKS_PER_SIDE) {
+    return `${ordinalWord(first)} pick`;
+  }
+  const second = Math.min(first + 1, MAX_DRAFT_PICKS_PER_SIDE);
+  return `${ordinalWord(first)} + ${ordinalWord(second)} picks`;
+}
+
 /** e.g. "Our 2nd + 3rd picks — tap the two heroes we lock". */
 export function stepHeading(args: {
   ours: boolean;
@@ -2303,16 +2332,17 @@ export function stepHeading(args: {
     if (args.kind === "ban") {
       return `${side} ${ordinalWord(args.ordinal)} ban — waiting for it on screen`;
     }
-    if (args.pair) {
-      return `${side} ${ordinalWord(args.ordinal)} + ${ordinalWord(args.ordinal + 1)} picks — waiting for them on screen`;
-    }
-    return `${side} ${ordinalWord(args.ordinal)} pick — waiting for it on screen`;
+    return `${side} ${pickStepWords(args.ordinal, args.pair)} — waiting for them on screen`;
   }
   if (args.kind === "ban") {
     return `${side} ${ordinalWord(args.ordinal)} ban — tap the hero ${who} ban${args.ours ? "" : "ned"}`;
   }
-  if (args.pair) {
-    return `${side} ${ordinalWord(args.ordinal)} + ${ordinalWord(args.ordinal + 1)} picks — tap the two heroes ${who} lock${args.ours ? "" : "ed"}`;
+  if (args.kind === "pick") {
+    const label = pickStepWords(args.ordinal, args.pair);
+    const tap = args.pair
+      ? `tap the two heroes ${who} lock${args.ours ? "" : "ed"}`
+      : `tap the hero ${who} lock${args.ours ? "" : "ed"}`;
+    return `${side} ${label} — ${tap}`;
   }
   return `${side} ${ordinalWord(args.ordinal)} pick — tap the hero ${who} lock${args.ours ? "" : "ed"}`;
 }
@@ -3546,7 +3576,7 @@ export function draftBoardHasStarted(
   if (historyLength > 0) return true;
   for (const list of [observed?.ourBans, observed?.theirBans]) {
     if (!list?.length) continue;
-    if (list.some((h) => h && h !== UNSEEN_BAN)) return true;
+    if (list.some((h) => h && h !== UNSEEN_BAN && h !== NO_BAN)) return true;
   }
   return false;
 }
@@ -3903,7 +3933,9 @@ export function InteractiveDraft({
         ...observedPicks.ourBans,
         ...observedPicks.theirBans,
       ]) {
-        if (hero && hero !== UNSEEN_BAN) keys.add(heroKey(hero));
+        if (hero && hero !== UNSEEN_BAN && hero !== NO_BAN) {
+          keys.add(heroKey(hero));
+        }
       }
     }
     return keys;
@@ -4276,6 +4308,7 @@ export function InteractiveDraft({
             kind,
             lastPick: isLastStep,
             unplayed: kind === "pick" && heroUnplayedBy(theirRoster, h),
+            teamRoster: kind === "pick" ? theirRoster : undefined,
             matchupQueued: matchupPending,
           }),
           player: kind === "ban" ? null : seatWho,
@@ -4341,6 +4374,7 @@ export function InteractiveDraft({
         kind,
         lastPick: isLastStep,
         unplayed: kind === "pick" && heroUnplayedBy(homeRoster, h),
+        teamRoster: kind === "pick" ? homeRoster : undefined,
         matchupQueued: matchupPending,
       });
       return {
@@ -4713,6 +4747,7 @@ export function InteractiveDraft({
             kind: "pick",
             lastPick: isLastStep,
             unplayed: heroUnplayedBy(homeRoster, hero),
+            teamRoster: homeRoster,
             matchupQueued: matchupPending,
           });
           return {
@@ -6550,7 +6585,7 @@ export function InteractiveDraft({
     // A screen lock still has to be written, or the walk stops at the first pick.
     if (fromWatch ? goneKeys(history).has(heroKey(hero)) : isGone(hero, gone)) return;
 
-    if (pairWindow && step.kind === "pick") {
+    if (pairWindow && step.kind === "pick" && !fromWatch) {
       const selected = resolvePairPickSelection({
         current: pairPick,
         hero,
@@ -6601,7 +6636,7 @@ export function InteractiveDraft({
           assembled.pairFactors,
           "second",
         );
-        // A blind last double (Yrel with nobody on record) often has no
+        // An unplayed last double (Yrel with nobody on record) often has no
         // suggestable benchmark pair. Still grade the lock, or picks 4 and 5
         // never land on the report card.
         const chosenPair = {
@@ -6873,7 +6908,7 @@ export function InteractiveDraft({
 
   const screenCursor = useRef(0);
   const screenHadLocks = useRef(false);
-  const screenIndex = history.length + pairPick.length;
+  const screenIndex = history.length + (watchOnly ? 0 : pairPick.length);
   useEffect(() => {
     if (replay || !screen) return;
     if (screen.length === 0) {
@@ -6899,7 +6934,8 @@ export function InteractiveDraft({
         }
         const heroArrived =
           action.hero === UNSEEN_BAN &&
-          fromScreen.hero !== UNSEEN_BAN;
+          fromScreen.hero !== UNSEEN_BAN &&
+          fromScreen.hero !== action.hero;
         const plated = platePlayer(action.side, action.hero);
         const playerArrived =
           (heroKey(action.hero) === heroKey(fromScreen.hero) &&
@@ -6922,7 +6958,7 @@ export function InteractiveDraft({
     if (screenIndex !== screenCursor.current || screenIndex >= screen.length || !step) return;
     const next = screen[screenIndex];
     if (next.kind !== step.kind || next.side !== (ours ? "our" : "their")) return;
-    if (next.hero === UNSEEN_BAN) {
+    if (next.hero === UNSEEN_BAN || next.hero === NO_BAN) {
       screenCursor.current = screenIndex + 1;
       setHistory((prev) => [
         ...prev,
@@ -6932,9 +6968,12 @@ export function InteractiveDraft({
           ordinal:
             prev.filter((action) => action.side === next.side && action.kind === "ban").length +
             1,
-          hero: UNSEEN_BAN,
+          hero: next.hero,
           player: null,
-          reason: "Already locked before it was on screen",
+          reason:
+            next.hero === NO_BAN
+              ? "No ban on the shared screen"
+              : "Already locked before it was on screen",
         },
       ]);
       return;
@@ -6982,7 +7021,8 @@ export function InteractiveDraft({
   const theirBans = slotsFor(history, "their", "ban", 3);
   const ourPicks = watchOurPickSlots;
   const theirPicks = watchTheirPickSlots;
-  const heldHero = pairWindow ? pairPick[0] : undefined;
+  const heldHero =
+    watchOnly || !pairWindow ? undefined : pairPick[0];
   const heldSlots = ours ? ourPicks : theirPicks;
   const heldIndex = pairHeldBoardIndex(heldSlots, heldHero);
   if (heldHero && heldIndex >= 0) {
@@ -7036,7 +7076,7 @@ export function InteractiveDraft({
     );
   }, [watchOnly, deviationNote, history, scoringMeta, homeRoster, theirRoster, map]);
 
-  const stepLabel = !sideKnown
+  const stepLabel = !sideKnown && history.length === 0
     ? "Waiting to see who bans first"
     : !step
     ? null
@@ -7075,11 +7115,12 @@ export function InteractiveDraft({
           heroApiCalls={matchupTrack?.heroApiCalls}
         />
       ) : null}
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <p className="text-xs font-semibold uppercase tracking-wide text-[#8aa0b2]">
-          Live draft board
-        </p>
-        <div className="flex flex-wrap items-center gap-2">
+      <div className="space-y-1">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <p className="text-xs font-semibold uppercase tracking-wide text-[#8aa0b2]">
+            Live draft board
+          </p>
+          <div className="flex flex-wrap items-center gap-2">
           <label className="inline-flex items-center gap-2 rounded-md border border-[#3d5163] bg-[#162230] px-2.5 py-1.5 text-xs font-medium text-[#dfeaf4]">
             <input
               type="checkbox"
@@ -7120,6 +7161,7 @@ export function InteractiveDraft({
               </button>
             </>
           )}
+        </div>
         </div>
       </div>
 
@@ -7307,7 +7349,7 @@ export function InteractiveDraft({
                 Step {stepIndex + 1} / {DRAFT_ORDER.length}
               </p>
             </div>
-            {watchOnly && !sideKnown ? (
+            {watchOnly && !sideKnown && history.length === 0 ? (
               <p className="text-sm text-[#c5d4e0]">
                 Who bans first comes from the screen. Waiting for Enemy Ban means their turn.
               </p>
@@ -8319,6 +8361,10 @@ function DeviationWhyHeader({
 
 /** Pointer must rest this long before a hover card opens. Usual tooltip delay. */
 const TOOLTIP_HOVER_MS = 400;
+/** Time to move from trigger onto the floating panel (gap + browser chrome). */
+const TOOLTIP_CLOSE_MS = 450;
+/** Keep scrollable panels above Chrome's screen-share notification bar. */
+const TOOLTIP_BOTTOM_CHROME_PAD = 56;
 
 function useDelayedTooltip() {
   const timer = useRef<number | null>(null);
@@ -8365,24 +8411,101 @@ function useDelayedTooltip() {
 
 const TOOLTIP_VIEWPORT_PAD = 12;
 
+function tooltipViewportBottomPad() {
+  return TOOLTIP_VIEWPORT_PAD + TOOLTIP_BOTTOM_CHROME_PAD;
+}
+
 /** Max tooltip height in px — pairs with `TOOLTIP_PANEL_SCROLL_CLASS`. */
 function tooltipMaxHeightPx() {
-  return Math.min(520, window.innerHeight - TOOLTIP_VIEWPORT_PAD * 2);
+  return Math.min(
+    520,
+    window.innerHeight - TOOLTIP_VIEWPORT_PAD - tooltipViewportBottomPad(),
+  );
 }
 
 function placeViewportTooltip(x: number, y: number, width: number) {
   const pad = TOOLTIP_VIEWPORT_PAD;
+  const bottomPad = tooltipViewportBottomPad();
   const vw = window.innerWidth;
   const vh = window.innerHeight;
   const maxH = tooltipMaxHeightPx();
   const left = Math.max(pad, Math.min(x - width / 2, vw - width - pad));
   let top = y + 18;
-  if (top + maxH > vh - pad) {
+  if (top + maxH > vh - bottomPad) {
     const flipped = y - maxH - 14;
     top = flipped >= pad ? flipped : pad;
   }
-  top = Math.min(top, Math.max(pad, vh - pad - maxH));
+  top = Math.min(top, Math.max(pad, vh - bottomPad - maxH));
   return { left, top };
+}
+
+function useTooltipDismiss(onClose: () => void) {
+  const timer = useRef<number | null>(null);
+  const overTrigger = useRef(false);
+  const overPanel = useRef(false);
+
+  const cancelClose = () => {
+    if (timer.current != null) window.clearTimeout(timer.current);
+    timer.current = null;
+  };
+
+  const tryClose = () => {
+    cancelClose();
+    timer.current = window.setTimeout(() => {
+      if (!overTrigger.current && !overPanel.current) onClose();
+    }, TOOLTIP_CLOSE_MS);
+  };
+
+  useEffect(() => cancelClose, []);
+
+  return {
+    cancelClose,
+    onTriggerEnter: () => {
+      overTrigger.current = true;
+      cancelClose();
+    },
+    onTriggerLeave: () => {
+      overTrigger.current = false;
+      tryClose();
+    },
+    onPanelEnter: () => {
+      overPanel.current = true;
+      cancelClose();
+    },
+    onPanelLeave: () => {
+      overPanel.current = false;
+      tryClose();
+    },
+  };
+}
+
+function ViewportTooltipPortal({
+  open,
+  pos,
+  className,
+  dismiss,
+  children,
+}: {
+  open: boolean;
+  pos: { left: number; top: number };
+  className: string;
+  dismiss: ReturnType<typeof useTooltipDismiss>;
+  children: ReactNode;
+}) {
+  if (!open) return null;
+  const panel = (
+    <div
+      role="tooltip"
+      onMouseEnter={dismiss.onPanelEnter}
+      onMouseLeave={dismiss.onPanelLeave}
+      className={className}
+      style={{ left: `${pos.left}px`, top: `${pos.top}px` }}
+    >
+      {children}
+    </div>
+  );
+  if (typeof document === "undefined") return panel;
+  return createPortal(panel, document.body);
 }
 
 const TOOLTIP_PANEL_SCROLL_CLASS =
@@ -8400,6 +8523,11 @@ function HoverExplain({
   const [open, setOpen] = useState(false);
   const [pos, setPos] = useState({ left: 12, top: 12 });
   const tip = useDelayedTooltip();
+  const close = () => {
+    tip.close();
+    setOpen(false);
+  };
+  const dismiss = useTooltipDismiss(close);
 
   const place = (x: number, y: number) => {
     const width = Math.min(352, window.innerWidth - TOOLTIP_VIEWPORT_PAD * 2);
@@ -8412,10 +8540,12 @@ function HoverExplain({
   };
 
   const onMouse = (event: MouseEvent<HTMLSpanElement>) => {
+    dismiss.onTriggerEnter();
     tip.hover(event.clientX, event.clientY, reveal);
   };
 
   const onFocus = (event: FocusEvent<HTMLSpanElement>) => {
+    dismiss.cancelClose();
     const rect = event.currentTarget.getBoundingClientRect();
     tip.focus(rect.left + rect.width / 2, rect.bottom, reveal);
   };
@@ -8428,25 +8558,23 @@ function HoverExplain({
         onMouseEnter={onMouse}
         onMouseMove={onMouse}
         onMouseLeave={() => {
-          tip.close();
-          setOpen(false);
+          dismiss.onTriggerLeave();
+          tip.cancelPending();
+          if (!open) tip.close();
         }}
         onFocus={onFocus}
-        onBlur={() => {
-          tip.close();
-          setOpen(false);
-        }}
+        onBlur={close}
       >
         {children}
       </span>
-      {open ? (
-        <div
-          className={`${TOOLTIP_PANEL_SCROLL_CLASS} w-[min(22rem,calc(100vw-2rem))] whitespace-pre-line rounded-md border border-[#3d5163] bg-[#0f1821] px-3 py-2 text-left text-xs leading-snug text-[#c5d4e0] shadow-xl`}
-          style={{ left: `${pos.left}px`, top: `${pos.top}px` }}
-        >
-          {help}
-        </div>
-      ) : null}
+      <ViewportTooltipPortal
+        open={open}
+        pos={pos}
+        dismiss={dismiss}
+        className={`${TOOLTIP_PANEL_SCROLL_CLASS} w-[min(22rem,calc(100vw-2rem))] whitespace-pre-line rounded-md border border-[#3d5163] bg-[#0f1821] px-3 py-2 text-left text-xs leading-snug text-[#c5d4e0] shadow-xl`}
+      >
+        {help}
+      </ViewportTooltipPortal>
     </>
   );
 }
@@ -8511,23 +8639,11 @@ function ScoredHeroOption({
   const [showScorecard, setShowScorecard] = useState(false);
   const [scorecardPos, setScorecardPos] = useState({ left: 12, top: 12 });
   const tip = useDelayedTooltip();
-  const scorecardCloseTimer = useRef<number | null>(null);
-
-  const cancelScorecardClose = () => {
-    if (scorecardCloseTimer.current != null) {
-      window.clearTimeout(scorecardCloseTimer.current);
-    }
-    scorecardCloseTimer.current = null;
+  const closeScorecard = () => {
+    tip.close();
+    setShowScorecard(false);
   };
-
-  const scheduleScorecardClose = () => {
-    cancelScorecardClose();
-    tip.cancelPending();
-    scorecardCloseTimer.current = window.setTimeout(() => {
-      tip.close();
-      setShowScorecard(false);
-    }, 120);
-  };
+  const dismiss = useTooltipDismiss(closeScorecard);
 
   const scorecardWidth = () =>
     Math.min(
@@ -8536,12 +8652,13 @@ function ScoredHeroOption({
     );
 
   const revealScorecard = (x: number, y: number) => {
-    cancelScorecardClose();
+    dismiss.cancelClose();
     setScorecardPos(placeViewportTooltip(x, y, scorecardWidth()));
     setShowScorecard(true);
   };
 
   const openScorecard = (event: MouseEvent<HTMLButtonElement>) => {
+    dismiss.onTriggerEnter();
     tip.hover(event.clientX, event.clientY, revealScorecard);
   };
 
@@ -8565,9 +8682,13 @@ function ScoredHeroOption({
         onClick={canLock ? onLock : undefined}
         onMouseEnter={openScorecard}
         onMouseMove={openScorecard}
-        onMouseLeave={scheduleScorecardClose}
+        onMouseLeave={() => {
+          dismiss.onTriggerLeave();
+          tip.cancelPending();
+          if (!showScorecard) tip.close();
+        }}
         onFocus={focusScorecard}
-        onBlur={scheduleScorecardClose}
+        onBlur={closeScorecard}
         className={`flex flex-col items-center rounded-md ${
           dense
             ? "w-full gap-0 p-0.5"
@@ -8653,43 +8774,40 @@ function ScoredHeroOption({
           {option.total > 0 ? `+${option.total}` : option.total}
         </span>
       </button>
-      {showScorecard ? (
-        <div
-          role="tooltip"
-          onMouseEnter={cancelScorecardClose}
-          onMouseLeave={scheduleScorecardClose}
-          className={`${TOOLTIP_PANEL_SCROLL_CLASS} rounded-md border border-[#3d5163] bg-[#0f1821] px-3 py-2 shadow-xl ${
-            pair ? "w-[min(44rem,calc(100vw-2rem))]" : "w-[min(22rem,calc(100vw-2rem))]"
-          }`}
-          style={{ left: `${scorecardPos.left}px`, top: `${scorecardPos.top}px` }}
-        >
-          <p className="mb-1.5 text-[10px] font-bold uppercase tracking-wide text-[#8aa0b2]">
-            Score breakdown · total {option.total}
-            {pair ? ` · lock ${option.hero} first` : ""}
-          </p>
-          {pair ? (
-            <>
-              <ScoreFactorList factors={pairFactors} />
-              <div className="mt-2 grid grid-cols-2 gap-2">
-                <div className="border border-teal-500/35 bg-teal-950/20 px-2 py-1.5">
-                  <p className="mb-1 text-[10px] font-bold uppercase tracking-wide text-[#9dceb0]">
-                    {option.hero}
-                  </p>
-                  <ScoreFactorList factors={option.firstSoloFactors ?? []} />
-                </div>
-                <div className="border border-teal-500/35 bg-teal-950/20 px-2 py-1.5">
-                  <p className="mb-1 text-[10px] font-bold uppercase tracking-wide text-[#9dceb0]">
-                    {pair}
-                  </p>
-                  <ScoreFactorList factors={option.secondSoloFactors ?? []} />
-                </div>
+      <ViewportTooltipPortal
+        open={showScorecard}
+        pos={scorecardPos}
+        dismiss={dismiss}
+        className={`${TOOLTIP_PANEL_SCROLL_CLASS} rounded-md border border-[#3d5163] bg-[#0f1821] px-3 py-2 shadow-xl ${
+          pair ? "w-[min(44rem,calc(100vw-2rem))]" : "w-[min(22rem,calc(100vw-2rem))]"
+        }`}
+      >
+        <p className="mb-1.5 text-[10px] font-bold uppercase tracking-wide text-[#8aa0b2]">
+          Score breakdown · total {option.total}
+          {pair ? ` · lock ${option.hero} first` : ""}
+        </p>
+        {pair ? (
+          <>
+            <ScoreFactorList factors={pairFactors} />
+            <div className="mt-2 grid grid-cols-2 gap-2">
+              <div className="border border-teal-500/35 bg-teal-950/20 px-2 py-1.5">
+                <p className="mb-1 text-[10px] font-bold uppercase tracking-wide text-[#9dceb0]">
+                  {option.hero}
+                </p>
+                <ScoreFactorList factors={option.firstSoloFactors ?? []} />
               </div>
-            </>
-          ) : (
-            <ScoreFactorList factors={option.factors} />
-          )}
-        </div>
-      ) : null}
+              <div className="border border-teal-500/35 bg-teal-950/20 px-2 py-1.5">
+                <p className="mb-1 text-[10px] font-bold uppercase tracking-wide text-[#9dceb0]">
+                  {pair}
+                </p>
+                <ScoreFactorList factors={option.secondSoloFactors ?? []} />
+              </div>
+            </div>
+          </>
+        ) : (
+          <ScoreFactorList factors={option.factors} />
+        )}
+      </ViewportTooltipPortal>
     </div>
   );
 }
@@ -9005,6 +9123,12 @@ function MissingDuoBanner({
   );
 }
 
+function duoLineStillLoading(text: string): boolean {
+  return /fetching Storm League|matchups not loaded|ally matchups not loaded|queued/i.test(
+    text,
+  );
+}
+
 function ScoreFactorList({ factors }: { factors: ScoreFactor[] }) {
   return (
     <ul className="space-y-1">
@@ -9013,6 +9137,9 @@ function ScoreFactorList({ factors }: { factors: ScoreFactor[] }) {
         const missing = lines.filter((line) => missingDuoLabel(line));
         const present = lines.filter((line) => !missingDuoLabel(line));
         const detailMissing = missingDuoLabel(factor.detail) !== null;
+        const detailLoading = detailMissing && duoLineStillLoading(factor.detail);
+        const missingSettled = missing.filter((line) => !duoLineStillLoading(line));
+        const missingLoadingLines = missing.filter((line) => duoLineStillLoading(line));
         return (
           <li key={factor.id} className="text-xs leading-snug text-[#c5d4e0]">
             <span className="flex justify-between gap-2 font-semibold text-[#e8eef2]">
@@ -9030,7 +9157,13 @@ function ScoreFactorList({ factors }: { factors: ScoreFactor[] }) {
               </span>
             </span>
             {detailMissing ? (
-              <span className="mt-1 block rounded border-2 border-red-500 bg-red-950 px-1.5 py-1 text-[11px] font-bold text-red-100">
+              <span
+                className={`mt-1 block rounded border px-1.5 py-1 text-[11px] leading-snug ${
+                  detailLoading
+                    ? "border-[#3d5163] bg-[#162230] text-[#c5d4e0]"
+                    : "border-[#3d5163] bg-[#0f1821] text-[#8aa0b2]"
+                }`}
+              >
                 {factor.detail}
               </span>
             ) : (
@@ -9043,17 +9176,19 @@ function ScoreFactorList({ factors }: { factors: ScoreFactor[] }) {
                 ))}
               </ul>
             ) : null}
-            {missing.length ? (
-              <div className="mt-1 rounded border-2 border-red-500 bg-red-950 px-2 py-1.5 text-[11px] font-bold leading-snug text-red-50">
-                <p className="uppercase tracking-wide text-red-300">
-                  No matchup data — scored as 0
-                </p>
-                <ul className="mt-0.5">
-                  {missing.map((line) => (
-                    <li key={line}>{line}</li>
-                  ))}
-                </ul>
-              </div>
+            {missingLoadingLines.length ? (
+              <ul className="mt-0.5 space-y-px pl-2 font-mono text-[10.5px] text-[#8aa0b2]">
+                {missingLoadingLines.map((line) => (
+                  <li key={line}>{line}</li>
+                ))}
+              </ul>
+            ) : null}
+            {missingSettled.length ? (
+              <ul className="mt-0.5 space-y-px pl-2 font-mono text-[10.5px] text-[#8aa0b2]">
+                {missingSettled.map((line) => (
+                  <li key={line}>{line}</li>
+                ))}
+              </ul>
             ) : null}
           </li>
         );
@@ -9165,7 +9300,7 @@ export function ReconstructedDraftOrder({
       {done.length === 0 && sideKnown ? (
         <p className="text-sm text-[#c5d4e0]">Nothing locked yet.</p>
       ) : null}
-      {!sideKnown ? (
+      {!sideKnown && done.length === 0 ? (
         <p className="text-sm text-[#c5d4e0]">Waiting to see who bans first.</p>
       ) : null}
       {done.length > 0 || next ? (
@@ -9186,7 +9321,9 @@ export function ReconstructedDraftOrder({
                 }`}
                 title={row.hero ? undefined : "Ban already locked before it was on screen"}
               >
-                {row.hero ?? "Unseen"}
+                {row.hero === NO_BAN
+                  ? "No ban"
+                  : row.hero ?? "Unseen"}
               </span>
               {row.player ? (
                 <span className="min-w-0 truncate text-[#c5d4e0]">{row.player}</span>
@@ -9230,7 +9367,6 @@ function DraftSideRow({
   /** Slot showing the first hero of a double pick that is not locked yet. */
   heldIndex?: number;
   accent: "ally" | "enemy";
-  /** This side's five — marks seats whose owner has no games on the hero. */
   roster?: PlayerScout[];
   table?: DraftMetaTable | null;
   matchupPending?: readonly string[];
@@ -9244,14 +9380,6 @@ function DraftSideRow({
   likelyPicks?: readonly (TheirRemainingSeat | null)[] | null;
 }) {
   const banRing = accent === "enemy" ? "ring-red-700/80" : "ring-teal-700/80";
-  const blind = (p: BoardAction | null) =>
-    Boolean(
-      p &&
-        p.kind === "pick" &&
-        p.player &&
-        roster.length &&
-        playerComfortOn(roster, p.hero, displayPlayer(p.player)) <= 0,
-    );
   return (
     <div className="space-y-2">
       <p
@@ -9318,7 +9446,6 @@ function DraftSideRow({
                 }
                 placeholder="Pick"
                 held={i === heldIndex}
-                blind={blind(p)}
                 slLoadState={
                   p
                     ? heroStormLeagueLoadState(
@@ -9352,7 +9479,6 @@ function EmptyOrFace({
   ring,
   placeholder,
   held,
-  blind,
   slLoadState = "ready",
 }: {
   action: BoardAction | null;
@@ -9360,30 +9486,22 @@ function EmptyOrFace({
   ring: string;
   placeholder: string;
   held?: boolean;
-  /** Seated, but the owner has no games on this hero. */
-  blind?: boolean;
   slLoadState?: "ready" | "pulling" | "queued" | "failed";
 }) {
   const [open, setOpen] = useState(false);
   const [pos, setPos] = useState({ left: 12, top: 12 });
-  const closeTimer = useRef<number | null>(null);
   const tip = useDelayedTooltip();
   const breakdown = action?.breakdown;
+  const close = () => {
+    tip.close();
+    setOpen(false);
+  };
+  const dismiss = useTooltipDismiss(close);
 
-  const cancelClose = () => {
-    if (closeTimer.current != null) window.clearTimeout(closeTimer.current);
-  };
-  const scheduleClose = () => {
-    cancelClose();
-    tip.cancelPending();
-    closeTimer.current = window.setTimeout(() => {
-      tip.close();
-      setOpen(false);
-    }, 120);
-  };
   const showAt = (x: number, y: number) => {
     if (!breakdown?.factors.length) return;
-    cancelClose();
+    dismiss.onTriggerEnter();
+    dismiss.cancelClose();
     tip.hover(x, y, (px, py) => {
       setPos(placeScorecardNear(px, py));
       setOpen(true);
@@ -9391,13 +9509,20 @@ function EmptyOrFace({
   };
   const showNow = (x: number, y: number) => {
     if (!breakdown?.factors.length) return;
-    cancelClose();
+    dismiss.cancelClose();
     tip.focus(x, y, (px, py) => {
       setPos(placeScorecardNear(px, py));
       setOpen(true);
     });
   };
 
+  if (action?.hero === NO_BAN) {
+    return (
+      <div className={`rounded-sm ring-1 ${ring}`}>
+        <NoBanBanFace size="md" banned={Boolean(banned)} />
+      </div>
+    );
+  }
   if (!action || action.hero === UNSEEN_BAN) {
     return (
       <div
@@ -9433,22 +9558,28 @@ function EmptyOrFace({
             ? "animate-pulse ring-2 ring-amber-300/80"
             : `ring-2 ${ring}`;
   return (
-    <div
-      className={`relative flex flex-col items-center rounded-sm ${slRing}`}
-      onMouseEnter={(event) => showAt(event.clientX, event.clientY)}
-      onMouseLeave={scheduleClose}
-      onFocus={(event) => {
-        const rect = event.currentTarget.getBoundingClientRect();
-        showNow(rect.left + rect.width / 2, rect.bottom);
-      }}
-      onBlur={scheduleClose}
-      tabIndex={breakdown ? 0 : undefined}
-      aria-label={
-        breakdown
-          ? `${action.hero} score breakdown, total ${breakdown.total}`
-          : undefined
-      }
-    >
+    <div className={`relative flex flex-col items-center rounded-sm ${slRing}`}>
+      <div
+        className="flex flex-col items-center"
+        onMouseEnter={(event) => showAt(event.clientX, event.clientY)}
+        onMouseMove={(event) => showAt(event.clientX, event.clientY)}
+        onMouseLeave={() => {
+          dismiss.onTriggerLeave();
+          tip.cancelPending();
+          if (!open) tip.close();
+        }}
+        onFocus={(event) => {
+          const rect = event.currentTarget.getBoundingClientRect();
+          showNow(rect.left + rect.width / 2, rect.bottom);
+        }}
+        onBlur={close}
+        tabIndex={breakdown ? 0 : undefined}
+        aria-label={
+          breakdown
+            ? `${action.hero} score breakdown, total ${breakdown.total}`
+            : undefined
+        }
+      >
       {slLoadState !== "ready" && !banned ? (
         <span
           className={`absolute -right-0.5 -top-0.5 z-10 rounded px-1 py-px text-[8px] font-bold uppercase leading-none ${
@@ -9475,19 +9606,19 @@ function EmptyOrFace({
         label={action.hero}
         title={nativeTitle}
       />
-      {open && breakdown ? (
-        <div
-          role="tooltip"
-          onMouseEnter={cancelClose}
-          onMouseLeave={scheduleClose}
+      </div>
+      {breakdown ? (
+        <ViewportTooltipPortal
+          open={open}
+          pos={pos}
+          dismiss={dismiss}
           className={`${TOOLTIP_PANEL_SCROLL_CLASS} w-[min(22rem,calc(100vw-2rem))] rounded-md border border-[#3d5163] bg-[#0f1821] px-3 py-2 shadow-xl`}
-          style={{ left: `${pos.left}px`, top: `${pos.top}px` }}
         >
           <p className="mb-1.5 text-[10px] font-bold uppercase tracking-wide text-[#8aa0b2]">
             Score breakdown · total {breakdown.total}
           </p>
           <ScoreFactorList factors={breakdown.factors} />
-        </div>
+        </ViewportTooltipPortal>
       ) : null}
       {held && (
         <span className="mt-0.5 text-center text-[10px] font-semibold uppercase leading-tight text-amber-200">
@@ -9496,20 +9627,14 @@ function EmptyOrFace({
       )}
       {who ? (
         <span
-          className={`mt-0.5 max-w-[3.75rem] truncate text-center text-[10px] font-semibold leading-tight ${
-            blind ? "text-amber-300" : "text-[#9dceb0]"
-          }`}
+          className="mt-0.5 max-w-[3.75rem] truncate text-center text-[10px] font-semibold leading-tight text-[#9dceb0]"
           title={
             moved
-              ? `Drafted for ${draftedFor}. Now ${who}${
-                  blind ? " (no games on it)" : ""
-                } — seats moved because the five's comfort total is higher.`
-              : blind
-                ? `${who} has no games on ${action.hero} — blind pick (not missing Storm League data)`
-                : undefined
+              ? `Drafted for ${draftedFor}. Now ${who} — seats moved because the five's comfort total is higher.`
+              : undefined
           }
         >
-          {blind ? `${who} · blind` : who}
+          {who}
           {moved ? (
             <span className="block truncate text-[9px] font-medium text-[#8aa0b2]">
               was {draftedFor}

@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { HeroesProfileError } from "@/lib/heroesprofile/client";
 import { loadStormLeaguePlayers } from "@/lib/scout/pipeline";
+import { syncReplayBattletags } from "@/lib/replay/syncReplays";
 
 export const dynamic = "force-dynamic";
 
@@ -11,11 +12,19 @@ export async function GET(request: Request) {
     .map((tag) => tag.trim())
     .filter(Boolean)
     .slice(0, 10);
-  if (!tags.length) return NextResponse.json({ players: [] });
+  if (!tags.length) return NextResponse.json({ players: [], lookups: [] });
 
   try {
-    const { players, apiCalls, cacheCalls } = await loadStormLeaguePlayers(tags);
-    return NextResponse.json({ players, apiCalls, cacheCalls });
+    const replaySync = await syncReplayBattletags();
+    const { players, lookups, apiCalls, cacheCalls } =
+      await loadStormLeaguePlayers(tags, replaySync);
+    return NextResponse.json({
+      players,
+      lookups,
+      replaySync,
+      apiCalls,
+      cacheCalls,
+    });
   } catch (err) {
     const message =
       err instanceof HeroesProfileError

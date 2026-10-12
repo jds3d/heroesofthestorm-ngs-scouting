@@ -178,7 +178,7 @@ export function pairDuoSynergy(
     if (missing.length) {
       return {
         points: 0,
-        detail: `${a} and ${b}: ally matchups not loaded for ${missing.join(", ")} — fetching`,
+        detail: `${a} and ${b}: ally matchups not loaded for ${missing.join(", ")} — queued`,
       };
     }
     const games = allyPairGames(table, a, b);

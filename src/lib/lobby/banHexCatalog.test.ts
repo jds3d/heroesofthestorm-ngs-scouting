@@ -6,6 +6,8 @@ import {
   banFaceScore,
   catalogRowFromBanHex,
   matchBanPixels,
+  matchSavedBanHex,
+  readThreeBanHexSlots,
 } from "@/lib/lobby/banFace";
 import { banHexManifest, rowsFromBanHexExamples } from "@/lib/lobby/banHexCatalog";
 import { DRAFT_BAN_HEXES } from "@/lib/lobby/screenLobby";
@@ -43,21 +45,22 @@ function cropHex(
 describe("ban hex catalog", () => {
   it("regenerates PNGs and banHexCatalog.json from the manifest sources", () => {
     if (process.env.REGEN_BAN_HEX !== "1") return;
-    const image = decodePng(readFileSync(ALTERAC));
-    const manifest = [
-      { hero: "Hogger", file: "hogger-alterac-2.png", source: "draft lobby alterac 2.png" },
-      { hero: "Whitemane", file: "whitemane-alterac-2.png", source: "draft lobby alterac 2.png" },
-    ];
-    const boxes = [DRAFT_BAN_HEXES.right[0], DRAFT_BAN_HEXES.right[2]];
+    const manifest = banHexManifest();
+    const drafts = path.join(process.cwd(), "examples", "drafts");
     mkdirSync(HEX_DIR, { recursive: true });
-    const rows = manifest.map((row, index) => {
-      const crop = cropHex(image, boxes[index]!);
+    const rows = manifest.map((row) => {
+      const source = path.join(drafts, row.source ?? "draft lobby alterac 2.png");
+      const image = decodePng(readFileSync(source));
+      const side = row.side ?? "right";
+      const slot = row.slot ?? 0;
+      const box = DRAFT_BAN_HEXES[side][slot];
+      if (!box) throw new Error(`no ban box for ${row.hero}`);
+      const crop = cropHex(image, box);
       writeFileSync(path.join(HEX_DIR, row.file), crop.png);
       const catalog = catalogRowFromBanHex(row.hero, crop.pixels, crop.width, crop.height);
       if (!catalog) throw new Error(`no catalog row for ${row.hero}`);
       return catalog;
     });
-    writeFileSync(path.join(HEX_DIR, "manifest.json"), JSON.stringify(manifest, null, 2) + "\n");
     writeFileSync(CATALOG_JSON, JSON.stringify(rows, null, 2) + "\n");
   });
 
@@ -83,11 +86,47 @@ describe("ban hex catalog", () => {
     }
   });
 
+  it("names Xal'atath on Battlefield (not Sylvanas hex false positive)", () => {
+    const image = decodePng(
+      readFileSync(path.join(process.cwd(), "examples", "drafts", "battlefield.png")),
+    );
+    const xal = cropHex(image, DRAFT_BAN_HEXES.left[1]);
+    expect(matchBanPixels(xal.pixels, xal.width, xal.height)).toBe("Xal'atath");
+  });
+
   it("names Hogger and Whitemane on Alterac with hex examples in the catalog", () => {
     const image = decodePng(readFileSync(ALTERAC));
     const hogger = cropHex(image, DRAFT_BAN_HEXES.right[0]);
     const whitemane = cropHex(image, DRAFT_BAN_HEXES.right[2]);
     expect(matchBanPixels(hogger.pixels, hogger.width, hogger.height)).toBe("Hogger");
     expect(matchBanPixels(whitemane.pixels, whitemane.width, whitemane.height)).toBe("Whitemane");
-  });
+  }, 20_000);
+
+  it("names Braxis ban hexes from saved crops (not Maiev for Anub'arak)", () => {
+    const drafts = path.join(process.cwd(), "examples", "drafts");
+    const braxis1 = decodePng(readFileSync(path.join(drafts, "braxis 1.png")));
+    const braxis2 = decodePng(readFileSync(path.join(drafts, "braxis 2.png")));
+    const qhira = cropHex(braxis1, DRAFT_BAN_HEXES.left[0]);
+    const anub = cropHex(braxis1, DRAFT_BAN_HEXES.right[0]);
+    expect(matchBanPixels(qhira.pixels, qhira.width, qhira.height)).toBe("Qhira");
+    expect(matchBanPixels(anub.pixels, anub.width, anub.height)).toBe("Anub'arak");
+    expect(matchBanPixels(anub.pixels, anub.width, anub.height)).not.toBe("Maiev");
+    const chromie = cropHex(braxis1, DRAFT_BAN_HEXES.right[1]);
+    expect(matchBanPixels(chromie.pixels, chromie.width, chromie.height)).toBe("Chromie");
+    const cassia = cropHex(braxis2, DRAFT_BAN_HEXES.left[0]);
+    const chen = cropHex(braxis2, DRAFT_BAN_HEXES.left[1]);
+    const sylvanas = cropHex(braxis2, DRAFT_BAN_HEXES.left[2]);
+    const tyrande = cropHex(braxis2, DRAFT_BAN_HEXES.right[2]);
+    expect(matchBanPixels(chen.pixels, chen.width, chen.height)).toBe("Chen");
+    const row = readThreeBanHexSlots([cassia, chen, sylvanas]);
+    expect(row.identified).toEqual(["Cassia", "Chen", "Sylvanas"]);
+    expect(matchBanPixels(sylvanas.pixels, sylvanas.width, sylvanas.height)).toBe("Sylvanas");
+    const rows = rowsFromBanHexExamples();
+    const tyrandeRow = rows.find((row) => row.hero === "Tyrande");
+    expect(tyrandeRow).toBeDefined();
+    const tyrandeFace = banFace(tyrande.pixels, tyrande.width, tyrande.height);
+    expect(tyrandeFace).not.toBeNull();
+    expect(banFaceScore(tyrandeFace!, tyrandeRow!)).toBeGreaterThan(0.99);
+    expect(matchBanPixels(tyrande.pixels, tyrande.width, tyrande.height)).toBe("Tyrande");
+  }, 180_000);
 });

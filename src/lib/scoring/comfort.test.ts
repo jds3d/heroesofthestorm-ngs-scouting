@@ -10,16 +10,21 @@ import {
   comfortFromSources,
   fallbackPoolScore,
   filterBanList,
+  floorComfortFromGames,
   heroMeetsSuggestBar,
+  heroUnplayedBy,
+  playerFromStormLeague,
+  playerHeroGames,
+  rosterAnyoneHasGamesOn,
   mergeSourceMaps,
   anySuggestablePair,
   overlayStormLeague,
   playerComfortOn,
   resolvePlayerScout,
-  playerFromStormLeague,
   playerWithoutHistory,
   playersMeetingSuggestBar,
   comfortPairOwners,
+  comfortSourceDetail,
   heroesForOpenPlayers,
   slHeroSuggestions,
   sourceMapGames,
@@ -145,6 +150,71 @@ describe("suggest bar", () => {
 
   it("uses UI score 15 as the minimum raw comfort", () => {
     expect(COMFORT_SUGGEST_MIN).toBe(0.15);
+  });
+
+  it("names comfort sources on the scorecard detail line", () => {
+    const roster: PlayerScout[] = [
+      {
+        battletag: "EkeeB#1696",
+        preferredRole: null,
+        topHeroes: [
+          {
+            hero: "Yrel",
+            comfort: 0.08,
+            playPct: 0.05,
+            winRate: 0.375,
+            games: 8,
+            sources: {
+              stormLeague: {
+                games: 8,
+                wins: 3,
+                losses: 5,
+                winRate: 0.375,
+                playPct: 0.05,
+              },
+            },
+          },
+        ],
+        ngsWins: 0,
+        ngsLosses: 0,
+        confidence: "medium",
+        heroesProfileUrl: "",
+        ngsProfileUrl: "",
+        returningFromPrior: false,
+      },
+    ];
+    const line = comfortSourceDetail(roster, "Yrel", "EkeeB", 0.08);
+    expect(line).toContain("8g Storm League");
+    expect(line).toContain("of that pool");
+    expect(line).toContain("5.0% of that pool");
+    expect(line).toContain("under suggest bar");
+    expect(line).not.toContain("NGS S");
+  });
+
+  it("keeps thin Storm League samples on the card with low positive comfort", () => {
+    const player = playerFromStormLeague(
+      "EkeeB#1696",
+      new Map([
+        [
+          "Yrel",
+          {
+            games: 8,
+            wins: 3,
+            losses: 5,
+            winRate: 3 / 8,
+            playPct: 0.05,
+          },
+        ],
+      ]),
+    );
+    const yrel = player.topHeroes.find((h) => h.hero === "Yrel");
+    expect(yrel).toBeDefined();
+    expect(yrel!.comfort).toBeGreaterThan(0);
+    expect(yrel!.comfort).toBeLessThan(COMFORT_SUGGEST_MIN);
+    expect(heroUnplayedBy([player], "Yrel")).toBe(false);
+    expect(playerHeroGames([player], "Yrel", "EkeeB")).toBe(8);
+    expect(rosterAnyoneHasGamesOn([player], "Yrel")).toBe(true);
+    expect(floorComfortFromGames(8)).toBeGreaterThan(0);
   });
 
   it("scales comfort into pick points with a hard cap", () => {

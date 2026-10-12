@@ -7,7 +7,6 @@ import {
   plateFill,
   portraitFilled,
   portraitIsLocked,
-  portraitTeamRim,
 } from "@/lib/lobby/screenLobby";
 import { decodePng } from "@/lib/lobby/pngImage";
 
@@ -38,12 +37,6 @@ function boxRgb(
 describe("alterac pass plate reads", () => {
   it("locks qhira and both enemy picks but not greymane or alarak hovers", () => {
     const image = decodePng(readFileSync(ALTERAC));
-    const pixelAt = (px: number, py: number) => {
-      const x = Math.max(0, Math.min(image.width - 1, px));
-      const y = Math.max(0, Math.min(image.height - 1, py));
-      const i = (y * image.width + x) * 4;
-      return { r: image.data[i] ?? 0, g: image.data[i + 1] ?? 0, b: image.data[i + 2] ?? 0 };
-    };
     const readSide = (
       side: "left" | "right",
       portraits: typeof DRAFT_PLATE_SLOTS.left,
@@ -51,16 +44,16 @@ describe("alterac pass plate reads", () => {
     ) =>
       portraits.map((box, index) => {
         const face = boxRgb(image, box);
-        const plate = plateFill(boxRgb(image, names[index]));
-        const teamRim = portraitTeamRim(image.width, image.height, box, pixelAt);
+        const ally = side === "left";
+        const plate = plateFill(boxRgb(image, names[index]), ally);
         const locked = portraitIsLocked({
           phase: "pick",
           faceFilled: portraitFilled(face),
-          teamRim,
           plate,
-          ally: side === "left",
+          ally,
+          heroOnPlate: ally ? index === 3 : index === 0 || index === 2,
         });
-        return { index, plate, teamRim, locked, face: portraitFilled(face) };
+        return { index, plate, locked, face: portraitFilled(face) };
       });
     const left = readSide("left", DRAFT_PLATE_SLOTS.left, DRAFT_SLOT_NAMES.left);
     const right = readSide("right", DRAFT_PLATE_SLOTS.right, DRAFT_SLOT_NAMES.right);

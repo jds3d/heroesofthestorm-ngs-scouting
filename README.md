@@ -32,11 +32,15 @@ npm run dev
 
 Or run as a Docker container (recommended for always-on local use):
 
+Set **`HOTS_REPLAY_HOST_DIR`** in `.env.local` to your HotS **Multiplayer** replays folder (see `.env.example`). Docker bind-mounts it read-only at `/replays` so live draft can resolve `Name#1234` from games you have played.
+
 ```bash
 # --env-file so NEXT_PUBLIC_SCOUT_API_SECRET is available at *build* time
 # (.env.local is dockerignored and otherwise never reaches `next build`).
 docker compose --env-file .env.local up -d --build
 ```
+
+After deploy, `docker compose logs ngs-scouting` should show `[replay-sync] Indexed …` when new `.StormReplay` files appear.
 
 Open [http://localhost:3000](http://localhost:3000) in Chrome/Edge (not the Cursor Simple Browser — it cannot load localhost).
 

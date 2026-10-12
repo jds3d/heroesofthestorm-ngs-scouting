@@ -5,6 +5,60 @@ import { heroPortraitUrlCandidates } from "@/lib/scoring/heroPortrait";
 
 type FaceKind = "draft" | "select";
 
+/** Cropped from `examples/drafts/battlefield.png` (REGEN_NO_BAN=1 in banPassHex.test). */
+export const NO_BAN_PLATE_SRC = "/draft/no-ban-plate.png";
+
+export function NoBanBanFace({
+  size = "md",
+  banned = true,
+  title = "No ban",
+}: {
+  size?: "sm" | "md" | "lg";
+  banned?: boolean;
+  title?: string;
+}) {
+  const dims =
+    size === "lg"
+      ? "h-24 w-16"
+      : size === "sm"
+        ? "h-14 w-9"
+        : "h-20 w-14";
+  return (
+    <div className="flex flex-col items-center gap-1" title={title}>
+      <div className={`relative overflow-hidden rounded-sm bg-[#1a2430] ${dims}`}>
+        {/* eslint-disable-next-line @next/next/no-img-element */}
+        <img
+          src={NO_BAN_PLATE_SRC}
+          alt=""
+          className="h-full w-full object-cover object-center"
+          decoding="async"
+        />
+        {banned ? (
+          <svg
+            aria-hidden
+            className="pointer-events-none absolute inset-0 h-full w-full"
+            viewBox="0 0 100 100"
+            preserveAspectRatio="none"
+          >
+            <line
+              x1="8"
+              y1="92"
+              x2="92"
+              y2="8"
+              stroke="#e11d48"
+              strokeWidth="4"
+              strokeLinecap="round"
+            />
+          </svg>
+        ) : null}
+      </div>
+      <span className="max-w-[4.5rem] truncate text-center text-[10px] font-semibold text-[var(--muted)]">
+        No ban
+      </span>
+    </div>
+  );
+}
+
 export function HeroFace({
   hero,
   kind = "select",

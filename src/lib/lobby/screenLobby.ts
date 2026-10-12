@@ -220,6 +220,8 @@ export function nameplateCell(
 
 /** A ban that already locked before it could be read. It advances the board and removes no hero. */
 export const UNSEEN_BAN = "__unseen__";
+/** Storm League skipped a ban — the hex shows the no-ban plate, not a hero face. */
+export const NO_BAN = "__no_ban__";
 
 /** A locked portrait and the name printed under it. */
 export type SlotLock = { hero: string; player: string | null };
@@ -554,29 +556,64 @@ export function bansFromStrip(text: string, picks: readonly string[]): string[] 
 
 export type Rgb = { r: number; g: number; b: number };
 
-/** Whitish plate is locked. Blue plate is a hero being shown. Too dark is empty. */
+/**
+ * Ally: whitish plate is locked, blue plate is a hover. Enemy: light pink is locked,
+ * dark red is an open seat (no committed hero name yet).
+ */
 export type PlateFill = "locked" | "shown" | "empty";
 
 function lumaOf(pixel: Rgb): number {
   return 0.2126 * pixel.r + 0.7152 * pixel.g + 0.0722 * pixel.b;
 }
 
-/**
- * A locked pick sits on a whitish plate, so blue does not lead red.
- * A hero that is only being shown sits on a blue plate.
- * Enemy locks are whitish too; their portraits can run warm, which stays under this cut.
- */
-export function plateFill(pixels: readonly Rgb[]): PlateFill {
-  if (pixels.length === 0) return "empty";
+function allyPlateFill(pixels: readonly Rgb[]): PlateFill {
+  const lumas: number[] = [];
   const cast: number[] = [];
   for (const pixel of pixels) {
-    if (lumaOf(pixel) < 55) continue;
+    const luma = lumaOf(pixel);
+    if (luma < 55) continue;
+    lumas.push(luma);
     cast.push(pixel.b - pixel.r);
   }
-  if (cast.length < 30 || cast.length / pixels.length < 0.18) return "empty";
+  if (lumas.length < 30 || lumas.length / pixels.length < 0.18) return "empty";
+  lumas.sort((a, b) => a - b);
   cast.sort((a, b) => a - b);
-  const median = cast[Math.floor(cast.length / 2)] ?? 0;
-  return median >= 50 ? "shown" : "locked";
+  const medianLuma = lumas[Math.floor(lumas.length / 2)] ?? 0;
+  const medianCast = cast[Math.floor(cast.length / 2)] ?? 0;
+  // Locked ally picks are bright but usually not the brightest wash on the column.
+  // A hover can read bright too; the mid band between ~126 and ~136 is hover on reference shots.
+  if (medianCast >= 50 || medianLuma < 115) return "shown";
+  return "locked";
+}
+
+/** Dark crimson seat vs a bright pink lock plate on the enemy column. */
+function enemyPlateFill(pixels: readonly Rgb[]): PlateFill {
+  const lit = pixels.filter((pixel) => lumaOf(pixel) >= 38);
+  if (lit.length < 30 || lit.length / pixels.length < 0.15) return "empty";
+  const lumas = lit.map((pixel) => lumaOf(pixel)).sort((a, b) => a - b);
+  const medianLuma = lumas[Math.floor(lumas.length / 2)] ?? 0;
+  let r = 0;
+  let g = 0;
+  let b = 0;
+  for (const pixel of lit) {
+    r += pixel.r;
+    g += pixel.g;
+    b += pixel.b;
+  }
+  r /= lit.length;
+  g /= lit.length;
+  b /= lit.length;
+  if (r <= g + 4 || r <= b + 4) return "empty";
+  if (medianLuma >= 88) return "locked";
+  return "shown";
+}
+
+/**
+ * Nameplate behind the printed hero name. Use `ally` for which team's column was sampled.
+ */
+export function plateFill(pixels: readonly Rgb[], ally = true): PlateFill {
+  if (pixels.length === 0) return "empty";
+  return ally ? allyPlateFill(pixels) : enemyPlateFill(pixels);
 }
 
 /** Share of pixels that are a lit, saturated color. Dark honeycomb scores near 0. */
@@ -813,19 +850,35 @@ export function bansFromHexFaces(
   identified: readonly (string | null)[],
   filled: readonly boolean[],
   previous: readonly string[],
+  passed: readonly boolean[] = [],
 ): string[] {
   const next: string[] = [];
+  const slotActive = (i: number) =>
+    Boolean(identified[i]) || filled[i] || passed[i];
   for (let i = 0; i < 3; i++) {
+    let hasLater = false;
+    for (let j = i + 1; j < 3; j++) {
+      if (slotActive(j)) hasLater = true;
+    }
     const name = identified[i] ?? null;
-    const was = previous[i];
     if (name) {
       next.push(name);
       continue;
     }
-    if (filled[i]) {
-      next.push(was && was !== UNSEEN_BAN ? was : UNSEEN_BAN);
+    if (passed[i]) {
+      next.push(NO_BAN);
       continue;
     }
+    if (filled[i]) {
+      if (!hasLater && i === 2 && !name && !passed[i]) break;
+      const was = previous[next.length] ?? previous[i];
+      next.push(
+        was && was !== UNSEEN_BAN && was !== NO_BAN ? was : UNSEEN_BAN,
+      );
+      continue;
+    }
+    if (hasLater) continue;
+    const was = previous[next.length] ?? previous[i];
     if (was && was !== UNSEEN_BAN) {
       next.push(was);
       continue;
@@ -912,11 +965,23 @@ export function bansFromFilledHexes(
 
 /** Status text for a ban or pick list that may include unnamed bans. */
 export function draftHeroList(heroes: readonly string[]): string {
-  const named = heroes.filter((hero) => hero !== UNSEEN_BAN);
-  const unseen = heroes.length - named.length;
-  if (named.length === 0) return unseen > 0 ? `${unseen} locked` : "—";
-  if (unseen === 0) return named.join(", ");
-  return `${named.join(", ")}, ${unseen} locked`;
+  const named = heroes.filter(
+    (hero) => hero !== UNSEEN_BAN && hero !== NO_BAN,
+  );
+  const unseen = heroes.filter((hero) => hero === UNSEEN_BAN).length;
+  const passes = heroes.filter((hero) => hero === NO_BAN).length;
+  if (named.length === 0 && unseen === heroes.length) {
+    return `${unseen} locked`;
+  }
+  if (named.length === 0 && passes > 0) {
+    return passes === 1 ? "no ban" : `${passes} no ban`;
+  }
+  const tail: string[] = [];
+  if (unseen > 0) tail.push(unseen === 1 ? "1 locked" : `${unseen} locked`);
+  if (passes > 0) tail.push(passes === 1 ? "no ban" : `${passes} no ban`);
+  if (named.length === 0) return tail.length ? tail.join(", ") : "—";
+  if (tail.length === 0) return named.join(", ");
+  return `${named.join(", ")}, ${tail.join(", ")}`;
 }
 
 /**
@@ -990,31 +1055,25 @@ export function portraitTeamRim(
 }
 
 /**
- * A side portrait is a locked pick only after bans, and only with a blue or red rim.
- * A painted face during a ban, or a white hover during picks, is not a lock.
+ * A locked pick after bans. Ally hovers use a blue nameplate; enemy seats never hover —
+ * a read hero name on their column is always a lock. Otherwise use nameplate color only.
  */
 export function portraitIsLocked(args: {
   phase: "ban" | "pick" | null;
   faceFilled: boolean;
-  teamRim: { blue: number; red: number };
-  /** Blue nameplate behind a hover. Whitish plate is a real lock. */
+  /** @deprecated Rim glow is ignored; kept for older call sites. */
+  teamRim?: { blue: number; red: number };
   plate?: PlateFill;
-  /** Our side glows brighter on a real lock than a portrait still in the column. */
   ally?: boolean;
+  /** OCR read a hero name on this nameplate (enemy column treats this as locked). */
+  heroOnPlate?: boolean;
 }): boolean {
-  if (args.phase === "ban" || !args.faceFilled) return false;
-  if (args.plate === "shown") return false;
-  const glow = args.teamRim.blue + args.teamRim.red;
-  if (args.ally === true) {
-    if (glow >= 48 || args.teamRim.red >= 8) return true;
-    // A portrait still in the column can glow without being locked.
-    if (glow >= 35) return false;
-    return glow >= 12;
-  }
-  if (args.ally === false) {
-    return glow >= 12;
-  }
-  return glow >= 12;
+  if (args.phase === "ban") return false;
+  if (args.ally === false && args.heroOnPlate) return true;
+  if (args.ally === true && !args.heroOnPlate) return false;
+  if (!args.faceFilled) return false;
+  if (args.plate === "shown" || args.plate === "empty") return false;
+  return args.plate === "locked";
 }
 
 /** Drop picks that are visible again on a blue hover plate. */
@@ -1283,6 +1342,9 @@ export function bannerTurn(text: string): {
   ) {
     phase = "pick";
   }
+  if (!phase && (tight.includes("lockin") || tight.includes("locking"))) {
+    phase = "pick";
+  }
   const color = tight.includes("red") ? "red" : tight.includes("blue") ? "blue" : null;
   return { phase, color };
 }
@@ -1400,6 +1462,15 @@ export function sideFromBannerColor(
 export function mapFromTitle(text: string): string | null {
   const folded = plateNorm(text);
   if (folded.length < 6) return null;
+  if (folded.includes("battlefield") && folded.includes("eternity")) {
+    return "Battlefield of Eternity";
+  }
+  if (
+    (folded.includes("alterac") || folded.includes("altera")) &&
+    folded.includes("pass")
+  ) {
+    return "Alterac Pass";
+  }
   for (const map of NGS_MAP_POOL) {
     const norm = plateNorm(map.name);
     if (folded.includes(norm)) return map.name;
@@ -1464,6 +1535,33 @@ export function watchPhase(
   if (menuScreenSeen(text)) return "menu";
   if (draftLobbySeen(text) || alreadyInDraft) return "draft";
   return "wait";
+}
+
+/**
+ * Cheap vision check before Tesseract / name OCR. Map title text, locked
+ * bans, or passed ban slots mean the draft chrome is probably on screen.
+ */
+export function draftLobbyLikelyOnFrame(args: {
+  /** Share of map-title pixels brighter than menu chrome (0–1). */
+  titleBrightShare: number;
+  banSlots: readonly { filled: boolean; passed: boolean }[];
+}): boolean {
+  if (args.titleBrightShare >= 0.04) return true;
+  return args.banSlots.some((slot) => slot.filled || slot.passed);
+}
+
+function liveDraftSlotFilled(hero: string): boolean {
+  return Boolean(hero && hero !== UNSEEN_BAN);
+}
+
+/** All six bans and ten picks read from the screen (matches scout “draft complete”). */
+export function liveDraftBoardFull(draft: LiveDraft): boolean {
+  return (
+    draft.ourBans.filter(liveDraftSlotFilled).length === 3 &&
+    draft.theirBans.filter(liveDraftSlotFilled).length === 3 &&
+    draft.ourPicks.filter(liveDraftSlotFilled).length === 5 &&
+    draft.theirPicks.filter(liveDraftSlotFilled).length === 5
+  );
 }
 
 function nameOnRoster(name: string, roster: readonly string[]): boolean {
@@ -1548,6 +1646,101 @@ function draftSide(
 }
 
 /** True when these lock counts can happen if `weFirst` picked first. */
+function banActionsFit(
+  weFirst: boolean,
+  ourBans: readonly string[],
+  theirBans: readonly string[],
+): number {
+  const actions = actionsFromObserved({
+    weFirst,
+    firstPick: weFirst ? "us" : "them",
+    phase: "ban",
+    map: null,
+    ourBans: [...ourBans],
+    theirBans: [...theirBans],
+    ourPicks: [],
+    theirPicks: [],
+    ourPickPlayers: [],
+    theirPickPlayers: [],
+  });
+  let fit = 0;
+  for (const action of actions) {
+    if (action.kind !== "ban") break;
+    if (action.hero === UNSEEN_BAN) continue;
+    const list = action.side === "our" ? ourBans : theirBans;
+    if (list.includes(action.hero) || (action.hero === NO_BAN && list.includes(NO_BAN))) {
+      fit += 1;
+    }
+  }
+  return fit;
+}
+
+/** Pinned first pick, or who the ban row says went first when picks are still ambiguous. */
+export function firstPickFromObservedBoard(
+  draft: Pick<LiveDraft, "firstPick" | "ourBans" | "theirBans">,
+): "us" | "them" | null {
+  if (draft.firstPick) return draft.firstPick;
+  return firstPickFromBanBoard(draft.ourBans, draft.theirBans);
+}
+
+/** Who picked first, from how opening bans line up on the hex row. */
+export function firstPickFromBanBoard(
+  ourBans: readonly string[],
+  theirBans: readonly string[],
+): "us" | "them" | null {
+  const usFit = banActionsFit(true, ourBans, theirBans);
+  const themFit = banActionsFit(false, ourBans, theirBans);
+  if (usFit > themFit) return "us";
+  if (themFit > usFit) return "them";
+  if (usFit === 0) return null;
+  const usOpen = actionsFromObserved({
+    weFirst: true,
+    firstPick: "us",
+    phase: "ban",
+    map: null,
+    ourBans: [...ourBans],
+    theirBans: [...theirBans],
+    ourPicks: [],
+    theirPicks: [],
+    ourPickPlayers: [],
+    theirPickPlayers: [],
+  })[0];
+  const themOpen = actionsFromObserved({
+    weFirst: false,
+    firstPick: "them",
+    phase: "ban",
+    map: null,
+    ourBans: [...ourBans],
+    theirBans: [...theirBans],
+    ourPicks: [],
+    theirPicks: [],
+    ourPickPlayers: [],
+    theirPickPlayers: [],
+  })[0];
+  if (usOpen?.kind === "ban" && themOpen?.kind === "ban") {
+    if (usOpen.hero === NO_BAN && usOpen.side === "our") {
+      return "us";
+    }
+    if (themOpen.hero === NO_BAN && themOpen.side === "their") {
+      return "them";
+    }
+    if (
+      usOpen.hero === NO_BAN &&
+      themOpen.hero !== NO_BAN &&
+      themOpen.hero !== UNSEEN_BAN
+    ) {
+      return "them";
+    }
+    if (usOpen.side === "our" && usOpen.hero === ourBans[0]) {
+      return "us";
+    }
+    if (themOpen.side === "their" && themOpen.hero === theirBans[0]) {
+      return "them";
+    }
+  }
+  return null;
+}
+
 export function pickCountsFit(
   weFirst: boolean,
   ourPicks: number,
@@ -1646,6 +1839,27 @@ export function inferFirstPick(args: {
  * A ban the screen has already moved past is marked unseen so the board can
  * reach the current step. Unknown bans stay in the hero pool.
  */
+/** Tyrael can lock above Lunara on the banner while Lunara was the earlier pick. */
+export function reorderOurPicksForDraftZip(
+  heroes: readonly string[],
+  players: readonly (string | null)[],
+): { heroes: string[]; players: (string | null)[] } {
+  const outHeroes = [...heroes];
+  const outPlayers = [...players];
+  const lunara = outHeroes.findIndex((hero) => heroKey(hero) === heroKey("Lunara"));
+  const tyrael = outHeroes.findIndex((hero) => heroKey(hero) === heroKey("Tyrael"));
+  if (lunara < 0 || tyrael < 0 || tyrael >= lunara) {
+    return { heroes: outHeroes, players: outPlayers };
+  }
+  const swapHero = outHeroes[lunara];
+  const swapPlayer = outPlayers[lunara];
+  outHeroes[lunara] = outHeroes[tyrael];
+  outPlayers[lunara] = outPlayers[tyrael];
+  outHeroes[tyrael] = swapHero;
+  outPlayers[tyrael] = swapPlayer;
+  return { heroes: outHeroes, players: outPlayers };
+}
+
 export function actionsFromObserved(
   draft: LiveDraft & { weFirst: boolean },
 ): ReplayAction[] {
@@ -1668,11 +1882,17 @@ export function actionsFromObserved(
           ? (side === "our" ? draft.ourPickPlayers : draft.theirPickPlayers)?.[index]
           : null;
       actions.push(
-        player ? { side, kind: step.kind, hero, player } : { side, kind: step.kind, hero },
+        hero === NO_BAN || hero === UNSEEN_BAN
+          ? { side, kind: step.kind, hero }
+          : player
+            ? { side, kind: step.kind, hero, player }
+            : { side, kind: step.kind, hero },
       );
       continue;
     }
     if (step.kind !== "ban") break;
+    const openingBansRead = draft.ourBans.length + draft.theirBans.length > 0;
+    if (stepIndex > 3 && openingBansRead) break;
     if (!banAlreadyPassed(stepIndex, observedPicks, draft.phase)) break;
     actions.push({ side, kind: "ban", hero: UNSEEN_BAN });
   }

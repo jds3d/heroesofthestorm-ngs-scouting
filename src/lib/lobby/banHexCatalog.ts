@@ -9,6 +9,8 @@ export type BanHexManifestRow = {
   file: string;
   /** Lobby still the crop came from, for humans. */
   source?: string;
+  side?: "left" | "right";
+  slot?: number;
 };
 
 const HEX_DIR = path.join(process.cwd(), "examples", "ban-hexes");

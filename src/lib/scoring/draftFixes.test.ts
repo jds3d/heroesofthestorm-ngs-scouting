@@ -257,8 +257,8 @@ describe("draftGrade", () => {
       ourLocked: [...ourLocked.slice(0, 4), { hero: "Azmodan", player: "C" }],
       steps: [],
     });
-    expect(withAzmodan.ours.notes[0]).toContain("Unplayed: Azmodan (C, blind)");
-    expect(withAzmodan.ours.notes[0]).toContain("blind game");
+    expect(withAzmodan.ours.notes[0]).toContain("Unplayed: Azmodan (C, unplayed)");
+    expect(withAzmodan.ours.notes[0]).toContain("forced fill");
     expect(withAzmodan.ours.quality).toBeLessThan(full.ours.quality - 15);
     expect(withAzmodan.reasons.join(" ")).toContain("locked Azmodan");
   });
@@ -462,7 +462,7 @@ describe("duo scoring", () => {
         ["Garrosh", "Anduin", "Junkrat", "Deathwing", "Gul'dan", "Samuro"],
         ["Samuro", "Anduin"],
       ),
-    ).toEqual(["Samuro", "Anduin", "Garrosh", "Junkrat", "Deathwing", "Gul'dan"]);
+    ).toEqual(["Samuro", "Garrosh", "Junkrat", "Deathwing", "Gul'dan"]);
   });
 
   it("skips open Flex plan seats in vs-likely matchup lines", () => {

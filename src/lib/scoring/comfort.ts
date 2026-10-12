@@ -99,6 +99,35 @@ export function resolvePlayerScout(
   return undefined;
 }
 
+function heroRowGames(hit: ComfortHero): number {
+  const logged = Math.max(hit.games, hit.sources.stormLeague?.games ?? 0);
+  if (logged > 0) return logged;
+  // NGS-only rows sometimes omit games; comfort still means they have a sample.
+  return hit.comfort > 0 ? 1 : 0;
+}
+
+/** Storm League (or merged) game count for one player on a hero. */
+export function playerHeroGames(
+  roster: PlayerScout[],
+  hero: string,
+  player: string | null | undefined,
+): number {
+  if (!roster.length) return 0;
+  const key = heroKey(hero);
+  if (player) {
+    const scout = resolvePlayerScout(roster, player);
+    if (!scout) return 0;
+    const hit = scout.topHeroes.find((h) => heroKey(h.hero) === key);
+    return hit ? heroRowGames(hit) : 0;
+  }
+  let best = 0;
+  for (const p of roster) {
+    const hit = p.topHeroes.find((h) => heroKey(h.hero) === key);
+    if (hit) best = Math.max(best, heroRowGames(hit));
+  }
+  return best;
+}
+
 /** Comfort on a hero for one player, or the roster high when player is omitted. */
 export function playerComfortOn(
   roster: PlayerScout[],
@@ -118,6 +147,106 @@ export function playerComfortOn(
     if (hit) best = Math.max(best, hit.comfort);
   }
   return best;
+}
+
+/** True when anyone on the roster has at least one logged game on this hero. */
+export function rosterAnyoneHasGamesOn(
+  roster: PlayerScout[],
+  hero: string,
+): boolean {
+  return playerHeroGames(roster, hero, null) > 0;
+}
+
+/** Positive comfort below the suggest bar for thin Storm League samples. */
+export function floorComfortFromGames(games: number): number {
+  if (games <= 0) return 0;
+  return Math.min(COMFORT_SUGGEST_MIN - 0.02, 0.02 + games * 0.01);
+}
+
+function formatPlayShare(ratio: number): string {
+  if (!Number.isFinite(ratio) || ratio <= 0) return "0%";
+  const pct = ratio * 100;
+  return pct >= 10 ? `${pct.toFixed(0)}%` : `${pct.toFixed(1)}%`;
+}
+
+function sourceSampleLine(
+  stat: SourceHeroStat,
+  label: string,
+  poolGames?: number,
+): string {
+  const share =
+    stat.playPct > 0
+      ? stat.playPct
+      : poolGames && poolGames > 0
+        ? stat.games / poolGames
+        : 0;
+  return `${stat.games}g ${label} (${formatPlayShare(share)} of that pool)`;
+}
+
+function poolGamesForSource(
+  scout: PlayerScout,
+  key: keyof ComfortHero["sources"],
+): number {
+  let total = 0;
+  for (const row of scout.topHeroes) {
+    total += row.sources[key]?.games ?? 0;
+  }
+  return total;
+}
+
+/** Scorecard / tooltip line: who, blended comfort, and which samples fed it. */
+export function comfortSourceDetail(
+  roster: PlayerScout[],
+  hero: string,
+  player: string | null | undefined,
+  comfort: number,
+): string {
+  const who = playerDisplayName(player ?? "") || "Seat";
+  const scout = player ? resolvePlayerScout(roster, player) : undefined;
+  const hit = scout?.topHeroes.find((h) => heroKey(h.hero) === heroKey(hero));
+  const comfortPct = (comfort * 100).toFixed(0);
+  if (!hit || !scout) {
+    return `${who} · comfort ${comfortPct} · no scout row for ${hero}`;
+  }
+
+  const sl = hit.sources.stormLeague;
+  const ngs = hit.sources.ngsCurrent;
+  const prior = hit.sources.ngsPrior;
+  const qm = hit.sources.quickMatch;
+  const sources: string[] = [];
+  if (sl && sl.games > 0) {
+    sources.push(
+      sourceSampleLine(sl, "Storm League", poolGamesForSource(scout, "stormLeague")),
+    );
+  }
+  if (ngs && ngs.games > 0) {
+    sources.push(
+      sourceSampleLine(
+        ngs,
+        `NGS S${leagueConfig.season}`,
+        poolGamesForSource(scout, "ngsCurrent"),
+      ),
+    );
+  }
+  if (prior && prior.games > 0) {
+    sources.push(
+      sourceSampleLine(prior, "NGS prior", poolGamesForSource(scout, "ngsPrior")),
+    );
+  }
+  if (qm && qm.games > 0) {
+    sources.push(
+      sourceSampleLine(qm, "Quick Match", poolGamesForSource(scout, "quickMatch")),
+    );
+  }
+  const from =
+    sources.length > 0 ? sources.join(" · ") : "no games in loaded samples";
+  const blended =
+    hit.playPct > 0
+      ? ` · ${formatPlayShare(hit.playPct)} of blended pool`
+      : "";
+  const bar =
+    comfort > 0 && comfort < COMFORT_SUGGEST_MIN ? " · under suggest bar" : "";
+  return `${who} · comfort ${comfortPct} · ${from}${blended}${bar}`;
 }
 
 /**
@@ -281,10 +410,7 @@ export function pairHasDistinctOwners(
  */
 export function heroUnplayedBy(roster: PlayerScout[], hero: string): boolean {
   if (!roster.length) return false;
-  const key = heroKey(hero);
-  return !roster.some((p) =>
-    p.topHeroes.some((h) => heroKey(h.hero) === key && h.comfort > 0),
-  );
+  return !rosterAnyoneHasGamesOn(roster, hero);
 }
 
 /** Scorecard penalty for a pick nobody on the five plays. */
@@ -624,12 +750,14 @@ export function playerFromStormLeague(
 ): PlayerScout {
   const topHeroes: ComfortHero[] = [];
   for (const [hero, source] of stormLeague) {
+    if (source.games <= 0) continue;
     const score = stormLeagueScore(source);
-    if (score <= 0) continue;
+    const comfort =
+      score > 0 ? score : floorComfortFromGames(source.games);
     const row = comfortFromSources(hero, undefined, source, undefined, false);
     topHeroes.push({
       ...row,
-      comfort: score,
+      comfort,
       games: source.games,
       winRate: source.winRate,
       playPct: source.playPct,

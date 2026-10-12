@@ -1,7 +1,61 @@
-import type { Rgb } from "@/lib/lobby/screenLobby";
+import { banHexFilled, colorfulFraction, type Rgb } from "@/lib/lobby/screenLobby";
 import catalogJson from "@/lib/lobby/banPortraits.json";
 import banHexCatalogJson from "@/lib/lobby/banHexCatalog.json";
+import noBanPlateJson from "@/lib/lobby/noBanPlate.json";
 
+const SAVED_HEX_ROWS: BanCatalogRow[] = banHexCatalogJson as BanCatalogRow[];
+const PORTRAIT_CATALOG: BanCatalogRow[] = catalogJson as BanCatalogRow[];
+/** Saved hexes that false-match each other's real bans on other maps. */
+const LOOSE_SAVED_HEX = new Set(["Cassia", "Qhira", "Sylvanas", "Xal'atath"]);
+const LOOSE_HEX_CONFUSER: Record<string, string> = {
+  Cassia: "Qhira",
+  Sylvanas: "Xal'atath",
+};
+const LOOSE_HEX_PAIR_MIN = 0.995;
+
+/** Disambiguate saved crops that false-match each other (Cassia vs Qhira, etc.). */
+function resolveLooseHexPair(face: BanFace): string | null {
+  const portrait = matchBanFace(face, PORTRAIT_CATALOG);
+  const cassRow = SAVED_HEX_ROWS.find((entry) => entry.hero === "Cassia");
+  const qhiraRow = SAVED_HEX_ROWS.find((entry) => entry.hero === "Qhira");
+  const sylRow = SAVED_HEX_ROWS.find((entry) => entry.hero === "Sylvanas");
+  const xalRow = SAVED_HEX_ROWS.find((entry) => entry.hero === "Xal'atath");
+  const cassHex = cassRow ? banFaceScore(face, cassRow) : -Infinity;
+  const qhiraHex = qhiraRow ? banFaceScore(face, qhiraRow) : -Infinity;
+  const sylHex = sylRow ? banFaceScore(face, sylRow) : -Infinity;
+  const xalHex = xalRow ? banFaceScore(face, xalRow) : -Infinity;
+  if (portrait === "Qhira" && cassHex >= 0.9999 && cassHex > qhiraHex) {
+    return "Cassia";
+  }
+  if (portrait === "Xal'atath" && sylHex >= 0.99995 && sylHex > xalHex) {
+    return "Sylvanas";
+  }
+  for (const [a, b] of [
+    ["Cassia", "Qhira"],
+    ["Sylvanas", "Xal'atath"],
+  ] as const) {
+    const rowA = SAVED_HEX_ROWS.find((entry) => entry.hero === a);
+    const rowB = SAVED_HEX_ROWS.find((entry) => entry.hero === b);
+    const sa = rowA ? banFaceScore(face, rowA) : -Infinity;
+    const sb = rowB ? banFaceScore(face, rowB) : -Infinity;
+    if (!rowA && !rowB) continue;
+    if (!rowA || !rowB) {
+      const only = rowA ? a : b;
+      const score = rowA ? sa : sb;
+      const confuser = LOOSE_HEX_CONFUSER[only];
+      if (confuser && score >= LOOSE_HEX_PAIR_MIN) {
+        const portrait = matchBanFace(face, PORTRAIT_CATALOG);
+        const confuseRow = PORTRAIT_CATALOG.find((entry) => entry.hero === confuser);
+        const confusePort = confuseRow ? banFaceScore(face, confuseRow) : -Infinity;
+        if (portrait === confuser && score > confusePort + 0.15) return only;
+      }
+      continue;
+    }
+    if (sa >= LOOSE_HEX_PAIR_MIN && sa > sb + 0.01) return a;
+    if (sb >= LOOSE_HEX_PAIR_MIN && sb > sa + 0.01) return b;
+  }
+  return null;
+}
 export type BanFace = { color: number[]; hog: number[] };
 
 export type BanCatalogRow = {
@@ -12,12 +66,6 @@ export type BanCatalogRow = {
   gh?: number;
   gray?: string;
 };
-
-/** Official target portraits plus saved ban-hex crops that fuzzy-match at ~100%. */
-const CATALOG: BanCatalogRow[] = [
-  ...(catalogJson as BanCatalogRow[]),
-  ...(banHexCatalogJson as BanCatalogRow[]),
-];
 
 /** A ban is named only when one portrait leads the rest of the roster. */
 const MIN_SCORE = 0.66;
@@ -53,7 +101,10 @@ export function banFaceScore(query: BanFace, example: BanFace): number {
 }
 
 /** The hero whose saved portrait is this ban face. Unclear faces stay unnamed. */
-export function matchBanFace(query: BanFace, rows: readonly BanCatalogRow[] = CATALOG): string | null {
+export function matchBanFace(
+  query: BanFace,
+  rows: readonly BanCatalogRow[] = PORTRAIT_CATALOG,
+): string | null {
   let best: { hero: string; score: number } | null = null;
   let second = -Infinity;
   for (const row of rows) {
@@ -91,16 +142,283 @@ export function catalogRowFromBanHex(
   return { hero, color: face.color, hog: face.hog, gw: width, gh: height, gray };
 }
 
+const NO_BAN_PLATE_ROWS: BanCatalogRow[] = noBanPlateJson as BanCatalogRow[];
+const NO_BAN_MIN_SCORE = 0.62;
+
+/** Storm League "NO BAN" plate inside a ban hex (muted art, not a hero face). */
+export function banHexPassed(
+  pixels: readonly Rgb[],
+  width: number,
+  height: number,
+): boolean {
+  return matchesNoBanPlate(pixels, width, height);
+}
+
+/** NO BAN plates sit between empty hexes and hero faces on colorfulFraction. */
+const NO_BAN_MAX_COLORFUL = 0.245;
+
+export function matchesNoBanPlate(
+  pixels: readonly Rgb[],
+  width: number,
+  height: number,
+): boolean {
+  if (banHexFilled(pixels)) return false;
+  if (colorfulFraction(pixels) > NO_BAN_MAX_COLORFUL) return false;
+  const face = banFace(pixels, width, height);
+  if (!face) return false;
+  let best = -Infinity;
+  for (const row of NO_BAN_PLATE_ROWS) {
+    best = Math.max(best, banFaceScore(face, row));
+  }
+  return best >= NO_BAN_MIN_SCORE;
+}
+
+/** Empty hex frames can align weakly with several portraits; do not name them. */
+function banHexAlignAmbiguous(pixels: readonly Rgb[], width: number, height: number): boolean {
+  const face = lumaOf(pixels, width, height);
+  let best = -Infinity;
+  let second = -Infinity;
+  for (const row of PORTRAIT_CATALOG) {
+    const portrait = rowLuma(row);
+    if (!portrait) continue;
+    const score = bestAlign(portrait.data, portrait.w, portrait.h, face, width, height);
+    if (score > best) {
+      second = best;
+      best = score;
+    } else if (score > second) second = score;
+  }
+  return best >= 0.62 && best - second < MIN_ALIGN_MARGIN;
+}
+
+function savedHexCandidates(face: BanFace): { hero: string; score: number }[] {
+  const portrait = matchBanFace(face, PORTRAIT_CATALOG);
+  return SAVED_HEX_ROWS.map((row) => ({
+    hero: row.hero,
+    score: banFaceScore(face, row),
+  })).filter((entry) => {
+    const confuser = LOOSE_HEX_CONFUSER[entry.hero];
+    if (!confuser || entry.score < 0.99) return true;
+    const row = PORTRAIT_CATALOG.find((item) => item.hero === entry.hero);
+    const other = PORTRAIT_CATALOG.find((item) => item.hero === confuser);
+    if (!row || !other) return true;
+    const selfPort = banFaceScore(face, row);
+    const confusePort = banFaceScore(face, other);
+    if (portrait === confuser && entry.score >= 0.99) {
+      return entry.score > confusePort + 0.05;
+    }
+    if (entry.score > confusePort + 0.08) return true;
+    return selfPort >= confusePort - MIN_MARGIN;
+  });
+}
+
+export function matchSavedBanHex(face: BanFace): string | null {
+  const scored = savedHexCandidates(face).sort((a, b) => b.score - a.score);
+  const best = scored[0];
+  const second = scored[1]?.score ?? -Infinity;
+  if (!best || best.score < 0.92) return null;
+  const portrait = matchBanFace(face, PORTRAIT_CATALOG);
+  if (portrait && best.hero !== portrait) {
+    const hexRow = SAVED_HEX_ROWS.find((entry) => entry.hero === best.hero);
+    const hexSelf = hexRow ? banFaceScore(face, hexRow) : -Infinity;
+    const looseConfuser = LOOSE_HEX_CONFUSER[best.hero];
+    if (hexSelf >= 0.999) {
+      if (looseConfuser) {
+        const confuseHex = SAVED_HEX_ROWS.find((entry) => entry.hero === looseConfuser);
+        if (confuseHex && hexSelf > banFaceScore(face, confuseHex) + 0.01) {
+          return best.hero;
+        }
+      } else {
+        return best.hero;
+      }
+    } else if (
+      hexSelf >= 0.99 &&
+      looseConfuser &&
+      hexSelf > second + 0.02
+    ) {
+      const confuseHex = SAVED_HEX_ROWS.find((entry) => entry.hero === looseConfuser);
+      if (confuseHex && hexSelf > banFaceScore(face, confuseHex) + 0.01) {
+        return best.hero;
+      }
+    }
+    if (
+      LOOSE_SAVED_HEX.has(best.hero) ||
+      LOOSE_SAVED_HEX.has(portrait)
+    ) {
+      const portRow = PORTRAIT_CATALOG.find((entry) => entry.hero === portrait);
+      const hexPortRow = PORTRAIT_CATALOG.find((entry) => entry.hero === best.hero);
+      const portScore = portRow ? banFaceScore(face, portRow) : -Infinity;
+      const hexPortScore = hexPortRow ? banFaceScore(face, hexPortRow) : -Infinity;
+      if (portScore >= MIN_SCORE && portScore >= hexPortScore + MIN_MARGIN) return null;
+    }
+  }
+  if (best.score >= 0.98) return best.hero;
+  if (best.score - second < 0.02) return null;
+  return best.hero;
+}
+
+function banCandidateScore(face: BanFace, hero: string, savedHex: string | null): number {
+  const row = PORTRAIT_CATALOG.find((entry) => entry.hero === hero);
+  const portraitScore = row ? banFaceScore(face, row) : -Infinity;
+  if (hero !== savedHex) return portraitScore;
+  const hexRow = SAVED_HEX_ROWS.find((entry) => entry.hero === hero);
+  const hexScore = hexRow ? banFaceScore(face, hexRow) : -Infinity;
+  if (hexScore >= 0.99) return Math.max(portraitScore, hexScore);
+  return portraitScore;
+}
+
+/** Among candidates, pick whoever scores best (portrait roster plus near-perfect saved hex). */
+function pickBanHero(
+  face: BanFace,
+  portrait: string | null,
+  hex: string | null,
+  aligned: string | null,
+): string | null {
+  const pool: string[] = [];
+  for (const hero of [portrait, hex, aligned]) {
+    if (hero && !pool.includes(hero)) pool.push(hero);
+  }
+  if (pool.length === 0) return null;
+  if (pool.length === 1) return pool[0] ?? null;
+
+  if (
+    hex &&
+    portrait &&
+    hex !== portrait &&
+    LOOSE_HEX_CONFUSER[hex] &&
+    savedHexCandidates(face).some((entry) => entry.hero === hex && entry.score >= 0.99)
+  ) {
+    return hex;
+  }
+
+  let best: { hero: string; score: number } | null = null;
+  let second = -Infinity;
+  for (const hero of pool) {
+    const score = banCandidateScore(face, hero, hex);
+    if (!best || score > best.score) {
+      second = best?.score ?? -Infinity;
+      best = { hero, score };
+    } else if (score > second) second = score;
+  }
+  if (!best || best.score < MIN_SCORE) return hex ?? portrait ?? aligned;
+  if (best.score - second < MIN_MARGIN) {
+    if (hex) {
+      const hexRow = SAVED_HEX_ROWS.find((row) => row.hero === hex);
+      if (hexRow && banFaceScore(face, hexRow) >= 0.99) return hex;
+    }
+    return null;
+  }
+  return best.hero;
+}
+
+const SANDWICH_MIN_COLOR = 0.12;
+
+/**
+ * Desaturated mid-draft bans (e.g. Chen) can sit below `banHexFilled` while
+ * outer hexes are already named. Only run when both neighbors are filled bans.
+ */
+export function inferSandwichedMutedBan(
+  slots: readonly {
+    filled: boolean;
+    passed: boolean;
+    hero: string | null;
+    pixels: readonly Rgb[];
+    width: number;
+    height: number;
+  }[],
+): void {
+  if (slots.length !== 3) return;
+  const left = slots[0];
+  const mid = slots[1];
+  const right = slots[2];
+  if (!left || !mid || !right) return;
+  if (mid.passed || mid.hero) return;
+  if (!left.filled || !right.filled || !left.hero || !right.hero) return;
+  if (colorfulFraction(mid.pixels) < SANDWICH_MIN_COLOR) return;
+  const face = banFace(mid.pixels, mid.width, mid.height);
+  if (!face) return;
+  const hex = matchSavedBanHex(face);
+  if (!hex) return;
+  mid.hero = hex;
+  mid.filled = true;
+}
+
+export function readThreeBanHexSlots(
+  crops: readonly { pixels: readonly Rgb[]; width: number; height: number }[],
+): {
+  identified: (string | null)[];
+  filled: boolean[];
+  passed: boolean[];
+} {
+  const identified: (string | null)[] = [];
+  const filled: boolean[] = [];
+  const passed: boolean[] = [];
+  for (const crop of crops) {
+    const pass = banHexPassed(crop.pixels, crop.width, crop.height);
+    passed.push(pass);
+    if (pass) {
+      filled.push(false);
+      identified.push(null);
+      continue;
+    }
+    const isFilled = banHexFilled(crop.pixels);
+    filled.push(isFilled);
+    identified.push(isFilled ? matchBanPixels(crop.pixels, crop.width, crop.height) : null);
+  }
+  if (crops.length === 3) {
+    const slots = crops.map((crop, i) => ({
+      filled: filled[i] ?? false,
+      passed: passed[i] ?? false,
+      hero: identified[i] ?? null,
+      pixels: crop.pixels,
+      width: crop.width,
+      height: crop.height,
+    }));
+    inferSandwichedMutedBan(slots);
+    for (let i = 0; i < 3; i++) {
+      filled[i] = slots[i]?.filled ?? false;
+      identified[i] = slots[i]?.hero ?? null;
+    }
+  }
+  return { identified, filled, passed };
+}
+
 export function matchBanPixels(
   pixels: readonly Rgb[],
   width: number,
   height: number,
 ): string | null {
-  const aligned = alignBan(pixels, width, height);
-  if (aligned) return aligned;
   const face = banFace(pixels, width, height);
   if (!face) return null;
-  return matchBanFace(face);
+  const loosePair = resolveLooseHexPair(face);
+  if (loosePair) return finishBanFace(loosePair, face, pixels, width, height);
+  const portrait = matchBanFace(face, PORTRAIT_CATALOG);
+  const hex = matchSavedBanHex(face);
+  const aligned = alignBan(pixels, width, height);
+  const hero = pickBanHero(face, portrait, hex, aligned);
+  if (!hero) return null;
+  return finishBanFace(hero, face, pixels, width, height);
+}
+
+function finishBanFace(
+  hero: string,
+  face: BanFace,
+  pixels: readonly Rgb[],
+  width: number,
+  height: number,
+): string | null {
+  const row = PORTRAIT_CATALOG.find((entry) => entry.hero === hero);
+  const portraitScore = row ? banFaceScore(face, row) : -Infinity;
+  const hexRow = SAVED_HEX_ROWS.find((entry) => entry.hero === hero);
+  const hexSelf = hexRow ? banFaceScore(face, hexRow) : -Infinity;
+  const confident = portraitScore >= 0.95 || hexSelf >= 0.99;
+  if (
+    !confident &&
+    banHexAlignAmbiguous(pixels, width, height) &&
+    colorfulFraction(pixels) >= 0.518
+  ) {
+    return null;
+  }
+  return hero;
 }
 
 /**
@@ -111,7 +429,7 @@ function alignBan(pixels: readonly Rgb[], width: number, height: number): string
   const face = lumaOf(pixels, width, height);
   let best: { hero: string; score: number } | null = null;
   let second = -Infinity;
-  for (const row of CATALOG) {
+  for (const row of PORTRAIT_CATALOG) {
     const portrait = rowLuma(row);
     if (!portrait) continue;
     const score = bestAlign(portrait.data, portrait.w, portrait.h, face, width, height);

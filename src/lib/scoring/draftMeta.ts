@@ -392,8 +392,9 @@ export function heroMatchupsLoaded(
   hero: string,
 ): boolean {
   const row = table?.byHero[heroKey(hero)];
-  if (!row || !heroHasPlayedMatchups(row)) return false;
+  if (!row) return false;
   if (row.matchupsLoaded) return true;
+  if (!heroHasPlayedMatchups(row)) return false;
   return (row.matchupSamples?.length ?? 0) > 0 || row.allySamples.length > 0;
 }
 
@@ -404,7 +405,7 @@ export function heroAlliesLoaded(
 ): boolean {
   const row = table?.byHero[heroKey(hero)];
   if (!row) return false;
-  if (row.allyGameCounts) return true;
+  if (row.allyGameCounts !== undefined) return true;
   return row.allySamples.length > 0 || row.synergiesWith.length > 0;
 }
 
@@ -605,11 +606,13 @@ export function duoMissingLine(
   if (games === undefined) {
     return `${label}: fetching Storm League… → 0`;
   }
-  if (games === 0) return `${label}: fetching Storm League… → 0`;
-  if (games > 0 && games < MIN_MATCHUP_GAMES) {
+  if (games === 0) {
+    return `${label}: no Storm League pairing on record → 0`;
+  }
+  if (games < MIN_MATCHUP_GAMES) {
     return `${label}: only ${games.toLocaleString("en-US")} SL games (need ${MIN_MATCHUP_GAMES}) → 0`;
   }
-  return `${label}: no Storm League pairing on record → 0`;
+  return null;
 }
 
 /** Short label for a duo line that has nothing to score, or null when the line has a sample. */

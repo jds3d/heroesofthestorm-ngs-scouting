@@ -132,7 +132,6 @@ async function runSync(): Promise<ReplaySyncResult> {
     const parsed = await parseLocalReplay(full);
     if (!parsed) {
       failed += 1;
-      state.files[file.name] = { mtimeMs: file.mtimeMs, size: file.size };
       continue;
     }
     applyReplayPlayers(

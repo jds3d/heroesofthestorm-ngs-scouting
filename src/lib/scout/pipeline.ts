@@ -26,7 +26,12 @@ import {
   playerWithoutHistory,
   sourceMapGames,
 } from "@/lib/scoring/comfort";
-import { replayBattletag } from "@/lib/replay/battletags";
+import {
+  missDetailNoReplayTag,
+  replayBattletag,
+  resolveReplayBattletag,
+} from "@/lib/replay/battletags";
+import type { ReplaySyncResult } from "@/lib/replay/syncReplays";
 import type { PlayerScout, ScoutReport, SourceHeroStat } from "@/lib/scoring/types";
 
 function heroAllMap(
@@ -84,7 +89,7 @@ function heroRowsToSourceMap(rows: NgsHeroRow[]): Map<string, SourceHeroStat> {
   return out;
 }
 
-async function countStormLeagueHeroAllCalls(
+export async function countStormLeagueHeroAllCalls(
   battletag: string,
 ): Promise<{ apiCalls: number; cacheCalls: number }> {
   const windows = stormLeagueWindows();
@@ -443,19 +448,69 @@ export async function generateScoutReport(
   };
 }
 
+export type StormLeagueMissReason =
+  | "no_replay_tag"
+  | "no_storm_league_games"
+  | "lookup_error";
+
+export type StormLeagueLookupRow = {
+  shown: string;
+  battletag: string | null;
+  games: number;
+  status: "found" | "miss" | "error";
+  missReason?: StormLeagueMissReason;
+  detail: string;
+  player: PlayerScout;
+};
+
+function missDetailNoStormLeague(battletag: string): string {
+  return `Resolved ${battletag}, but HeroesProfile shows no Storm League games in the last 24 months.`;
+}
+
 /**
  * Storm League hero pools for battletags or display names.
  * A bare name uses the most recent shared replay. No history comes back with comfort 0.
  */
-async function loadOneStormLeaguePlayer(shown: string): Promise<PlayerScout> {
-  const tag = shown.includes("#") ? shown : replayBattletag(shown);
-  if (!tag) return playerWithoutHistory(shown);
+async function loadOneStormLeagueLookup(
+  shown: string,
+  sync?: ReplaySyncResult | null,
+): Promise<StormLeagueLookupRow> {
+  const tag = shown.includes("#") ? shown : resolveReplayBattletag(shown).tag;
+  if (!tag) {
+    return {
+      shown,
+      battletag: null,
+      games: 0,
+      status: "miss",
+      missReason: "no_replay_tag",
+      detail: missDetailNoReplayTag(shown, sync),
+      player: playerWithoutHistory(shown),
+    };
+  }
   try {
     const storm = await loadWindowedMode(tag, "Storm League");
-    if (sourceMapGames(storm) <= 0) return playerWithoutHistory(shown);
+    const games = sourceMapGames(storm);
+    if (games <= 0) {
+      return {
+        shown,
+        battletag: tag,
+        games: 0,
+        status: "miss",
+        missReason: "no_storm_league_games",
+        detail: missDetailNoStormLeague(tag),
+        player: playerWithoutHistory(shown),
+      };
+    }
     const player = playerFromStormLeague(tag, storm);
     player.heroesProfileUrl = heroesProfilePlayerUrl(tag);
-    return player;
+    return {
+      shown,
+      battletag: tag,
+      games,
+      status: "found",
+      detail: games === 1 ? "1 game" : `${games} games`,
+      player,
+    };
   } catch (err) {
     if (
       err instanceof HeroesProfileError &&
@@ -463,19 +518,30 @@ async function loadOneStormLeaguePlayer(shown: string): Promise<PlayerScout> {
     ) {
       throw err;
     }
-    return playerWithoutHistory(shown);
+    return {
+      shown,
+      battletag: tag,
+      games: 0,
+      status: "error",
+      missReason: "lookup_error",
+      detail:
+        err instanceof Error ? err.message : "Storm League lookup failed.",
+      player: playerWithoutHistory(shown),
+    };
   }
 }
 
 export async function loadStormLeaguePlayers(
   tags: string[],
+  sync?: ReplaySyncResult | null,
 ): Promise<{
   players: PlayerScout[];
+  lookups: StormLeagueLookupRow[];
   apiCalls: number;
   cacheCalls: number;
 }> {
   const seen = new Set<string>();
-  const jobs: Promise<PlayerScout>[] = [];
+  const jobs: Promise<StormLeagueLookupRow>[] = [];
   let apiCalls = 0;
   let cacheCalls = 0;
   for (const raw of tags) {
@@ -489,8 +555,13 @@ export async function loadStormLeaguePlayers(
       apiCalls += counts.apiCalls;
       cacheCalls += counts.cacheCalls;
     }
-    jobs.push(loadOneStormLeaguePlayer(shown));
+    jobs.push(loadOneStormLeagueLookup(shown, sync));
   }
-  const players = await Promise.all(jobs);
-  return { players, apiCalls, cacheCalls };
+  const lookups = await Promise.all(jobs);
+  return {
+    players: lookups.map((row) => row.player),
+    lookups,
+    apiCalls,
+    cacheCalls,
+  };
 }
