@@ -28,15 +28,15 @@
     "slot": 0
   },
   {
-    "hero": "Anub'arak",
-    "file": "anubarak-braxis-1.png",
+    "hero": "Maiev",
+    "file": "maiev-braxis-1.png",
     "source": "braxis 1.png",
     "side": "right",
     "slot": 0
   },
   {
-    "hero": "Cassia",
-    "file": "cassia-braxis-2.png",
+    "hero": "Qhira",
+    "file": "qhira-braxis-2.png",
     "source": "braxis 2.png",
     "side": "left",
     "slot": 0
@@ -49,17 +49,217 @@
     "slot": 1
   },
   {
-    "hero": "Sylvanas",
-    "file": "sylvanas-braxis-2.png",
+    "hero": "Xal'atath",
+    "file": "xalatath-braxis-2.png",
     "source": "braxis 2.png",
     "side": "left",
     "slot": 2
   },
   {
-    "hero": "Tyrande",
-    "file": "tyrande-braxis-2.png",
+    "hero": "Yrel",
+    "file": "yrel-braxis-2.png",
     "source": "braxis 2.png",
     "side": "right",
+    "slot": 2
+  },
+  {
+    "hero": "Qhira",
+    "file": "qhira-haunted-mines-1.png",
+    "source": "haunted mines 1.png",
+    "map": "Haunted Mines",
+    "side": "left",
+    "slot": 0
+  },
+  {
+    "hero": "Falstad",
+    "file": "falstad-haunted-mines-1.png",
+    "source": "haunted mines 1.png",
+    "map": "Haunted Mines",
+    "side": "left",
+    "slot": 1
+  },
+  {
+    "hero": "Xal'atath",
+    "file": "xalatath-haunted-mines-1.png",
+    "source": "haunted mines 1.png",
+    "map": "Haunted Mines",
+    "side": "right",
+    "slot": 0
+  },
+  {
+    "hero": "Kel'Thuzad",
+    "file": "kelthuzad-haunted-mines-1.png",
+    "source": "haunted mines 1.png",
+    "map": "Haunted Mines",
+    "side": "right",
+    "slot": 1
+  },
+  {
+    "hero": "Garrosh",
+    "file": "garrosh-haunted-mines-2.png",
+    "source": "haunted mines 2.png",
+    "map": "Haunted Mines",
+    "side": "left",
+    "slot": 0
+  },
+  {
+    "hero": "Xal'atath",
+    "file": "xalatath-haunted-mines-2.png",
+    "source": "haunted mines 2.png",
+    "map": "Haunted Mines",
+    "side": "right",
+    "slot": 0
+  },
+  {
+    "hero": "Ragnaros",
+    "file": "ragnaros-haunted-mines-2.png",
+    "source": "haunted mines 2.png",
+    "map": "Haunted Mines",
+    "side": "right",
+    "slot": 2
+  },
+  {
+    "hero": "Qhira",
+    "file": "qhira-battlefield-3.png",
+    "source": "battlefield 3.png",
+    "map": "Battlefield of Eternity",
+    "side": "left",
+    "slot": 0
+  },
+  {
+    "hero": "Johanna",
+    "file": "johanna-battlefield-3.png",
+    "source": "battlefield 3.png",
+    "map": "Battlefield of Eternity",
+    "side": "left",
+    "slot": 1
+  },
+  {
+    "hero": "Falstad",
+    "file": "falstad-battlefield-3.png",
+    "source": "battlefield 3.png",
+    "map": "Battlefield of Eternity",
+    "side": "left",
+    "slot": 2
+  },
+  {
+    "hero": "Xal'atath",
+    "file": "xalatath-battlefield-3.png",
+    "source": "battlefield 3.png",
+    "map": "Battlefield of Eternity",
+    "side": "right",
+    "slot": 0
+  },
+  {
+    "hero": "Abathur",
+    "file": "abathur-battlefield-3.png",
+    "source": "battlefield 3.png",
+    "map": "Battlefield of Eternity",
+    "side": "right",
+    "slot": 1
+  },
+  {
+    "hero": "Artanis",
+    "file": "artanis-battlefield-3.png",
+    "source": "battlefield 3.png",
+    "map": "Battlefield of Eternity",
+    "side": "right",
+    "slot": 2
+  },
+  {
+    "hero": "Johanna",
+    "file": "johanna-cursed-hollow.png",
+    "source": "cursed hollow.png",
+    "map": "Cursed Hollow",
+    "side": "left",
+    "slot": 0
+  },
+  {
+    "hero": "Anduin",
+    "file": "anduin-cursed-hollow.png",
+    "source": "cursed hollow.png",
+    "map": "Cursed Hollow",
+    "side": "left",
+    "slot": 1
+  },
+  {
+    "hero": "Dehaka",
+    "file": "dehaka-cursed-hollow.png",
+    "source": "cursed hollow.png",
+    "map": "Cursed Hollow",
+    "side": "left",
+    "slot": 2
+  },
+  {
+    "hero": "Qhira",
+    "file": "qhira-cursed-hollow.png",
+    "source": "cursed hollow.png",
+    "map": "Cursed Hollow",
+    "side": "right",
+    "slot": 0
+  },
+  {
+    "hero": "Xal'atath",
+    "file": "xalatath-cursed-hollow.png",
+    "source": "cursed hollow.png",
+    "map": "Cursed Hollow",
+    "side": "right",
+    "slot": 1
+  },
+  {
+    "hero": "Stitches",
+    "file": "stitches-cursed-hollow.png",
+    "source": "cursed hollow.png",
+    "map": "Cursed Hollow",
+    "side": "right",
+    "slot": 2
+  },
+  {
+    "hero": "Anduin",
+    "file": "anduin-tomb-1.png",
+    "source": "tomb 1.png",
+    "map": "Tomb of the Spider Queen",
+    "side": "left",
+    "slot": 1
+  },
+  {
+    "hero": "Xal'atath",
+    "file": "xalatath-tomb-1.png",
+    "source": "tomb 1.png",
+    "map": "Tomb of the Spider Queen",
+    "side": "right",
+    "slot": 1
+  },
+  {
+    "hero": "Brightwing",
+    "file": "brightwing-battlefield-4.png",
+    "source": "battlefield 4.png",
+    "map": "Battlefield of Eternity",
+    "side": "right",
+    "slot": 0
+  },
+  {
+    "hero": "Stukov",
+    "file": "stukov-garden-2.png",
+    "source": "garden 2.png",
+    "map": "Garden of Terror",
+    "side": "left",
+    "slot": 2
+  },
+  {
+    "hero": "E.T.C.",
+    "file": "etc-haunted-3.png",
+    "source": "haunted 3.png",
+    "map": "Haunted Mines",
+    "side": "left",
+    "slot": 1
+  },
+  {
+    "hero": "Tychus",
+    "file": "tychus-haunted-3.png",
+    "source": "haunted 3.png",
+    "map": "Haunted Mines",
+    "side": "left",
     "slot": 2
   }
 ]

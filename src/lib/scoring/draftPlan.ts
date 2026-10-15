@@ -1620,6 +1620,14 @@ function ourLikelyComp(
   };
 }
 
+/**
+ * Not bruisers, but this is their job: they soak a lane alone.
+ * Zagara is the usual one. Mages who can be parked there are not on this list.
+ */
+const SOLO_LANE_HEROES = new Set(
+  ["Zagara", "Azmodan", "Probius", "Murky", "Nazeebo", "The Lost Vikings"].map(heroKey),
+);
+
 /** Bruisers that want the solo lane (clear / sustain / soak). */
 const OFFLANE_BRUISERS = new Set(
   [
@@ -1714,6 +1722,7 @@ export function planSeatJob(p: DraftCompPick): string {
 
 /** True offlane / soak heroes — not mages parked on the offlane seat. */
 export function heroIsOfflaner(hero: string): boolean {
+  if (SOLO_LANE_HEROES.has(heroKey(hero))) return true;
   const role = heroRole(hero);
   if (role.includes("Ranged")) return false;
   if (role === "Healer" || role === "Support") return false;

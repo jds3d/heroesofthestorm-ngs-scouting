@@ -52,7 +52,7 @@ describe("stormLeagueBlocksSuggestion", () => {
         step: { side: "sp", kind: "pick" },
         weFirst: false,
       }),
-    ).toBe(true);
+    ).toBe(false);
   });
 });
 
@@ -107,11 +107,20 @@ describe("shouldPredictTheirLikelyBan", () => {
       shouldPredictTheirLikelyBan({
         watchOnly: true,
         sideKnown: true,
-        planLoadingLabel: "Reading names",
+        planLoadingLabel: "Loading Storm League hero stats and matchups.",
         historyLength: 0,
         observed: { theirBans: ["Hogger"] },
       }),
     ).toBe(false);
+    expect(
+      shouldPredictTheirLikelyBan({
+        watchOnly: true,
+        sideKnown: true,
+        planLoadingLabel: "Reading player names from the screen.",
+        historyLength: 0,
+        observed: { theirBans: ["Hogger"] },
+      }),
+    ).toBe(true);
     expect(
       shouldPredictTheirLikelyBan({
         watchOnly: true,

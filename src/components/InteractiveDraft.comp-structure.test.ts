@@ -14,6 +14,29 @@ describe("Roles factor", () => {
     expect(result.total).toBe(10);
   });
 
+  it("counts Zagara as the offlaner on an otherwise normal five", () => {
+    const roles = checkRequiredRoles([
+      "Arthas",
+      "Brightwing",
+      "Zagara",
+      "Raynor",
+      "Nova",
+    ]);
+    expect(roles.missing).not.toContain("offlane");
+    expect(roles.missing).toEqual([]);
+  });
+
+  it("still treats a Qhira dive five as missing a solo laner", () => {
+    const roles = checkRequiredRoles([
+      "Lucio",
+      "Stitches",
+      "Abathur",
+      "Qhira",
+      "Kael'thas",
+    ]);
+    expect(roles.missing).toContain("offlane");
+  });
+
   it("penalizes a lock that makes the team impossible to complete", () => {
     const result = withRolesFactor(card("Thrall"), ["Malthael", "Tyrael", "Qhira"]);
     const roles = result.factors.find((factor) => factor.id === "roles")!;

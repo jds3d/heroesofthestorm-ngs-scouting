@@ -244,8 +244,12 @@ export type LiveDraft = {
   firstPick: "us" | "them" | null;
   /** Last phase read from the center banner. */
   phase: "ban" | "pick" | null;
+  /** Whose ban or pick the plates / banner say is open right now. */
+  turn?: LiveTurn | null;
   map: string | null;
 };
+
+export type LiveTurn = { side: "our" | "their"; kind: "ban" | "pick" };
 
 export const EMPTY_LIVE_DRAFT: LiveDraft = {
   ourPicks: [],
@@ -358,11 +362,16 @@ export function openSeatPlayers(
 ): string[] {
   const out: string[] = [];
   const seen = new Set<string>();
+  const lockedNames = new Set<string>();
+  seats.forEach((seat, index) => {
+    const name = seat.player?.trim();
+    if (name && locked[index]) lockedNames.add(name.toLowerCase());
+  });
   seats.forEach((seat, index) => {
     const name = seat.player?.trim();
     if (!name || locked[index]) return;
     const key = name.toLowerCase();
-    if (seen.has(key)) return;
+    if (seen.has(key) || lockedNames.has(key)) return;
     seen.add(key);
     out.push(name);
   });
@@ -382,6 +391,30 @@ export function nameFromPlate(text: string, allowShort = false): string | null {
  */
 export function columnShowsPicking(lines: readonly { text: string }[]): boolean {
   return lines.some((line) => /\bpicking\b/i.test(line.text));
+}
+
+/** Any nameplate line in a stacked column says PICKING. */
+export function columnPickingFromOcrLines(
+  lines: readonly { text: string; top?: number }[],
+): boolean {
+  return columnShowsPicking(lines);
+}
+
+/** Per-slot PICKING labels from stacked nameplate OCR. */
+export function pickingFlagsBySlot(
+  lines: readonly { text: string; top: number }[],
+  count = 5,
+  stride = SLOT_LINE_STRIDE,
+): boolean[] {
+  const buckets: string[][] = Array.from({ length: count }, () => []);
+  for (const line of lines) {
+    const index = Math.floor(line.top / stride);
+    if (index < 0 || index >= count) continue;
+    buckets[index].push(line.text);
+  }
+  return buckets.map((bucket) =>
+    bucket.some((text) => /\bpicking\b/i.test(text)),
+  );
 }
 
 /**
@@ -1067,8 +1100,24 @@ export function portraitIsLocked(args: {
   ally?: boolean;
   /** OCR read a hero name on this nameplate (enemy column treats this as locked). */
   heroOnPlate?: boolean;
+  /** The slot banner still says PICKING — hover, not a lock. */
+  slotPicking?: boolean;
+  /**
+   * Second ban round. A committed white or pink plate is a pick that was
+   * locked before this ban. Opening "BLUE BAN" / "RED BAN" cards do not set this.
+   */
+  keepCommitted?: boolean;
 }): boolean {
-  if (args.phase === "ban") return false;
+  if (args.phase === "ban" && args.keepCommitted) {
+    if (args.slotPicking || args.plate !== "locked" || !args.faceFilled) return false;
+    if (args.ally === true && !args.heroOnPlate) return false;
+    if (args.ally === false && !args.heroOnPlate) return false;
+    return true;
+  }
+  if (args.phase === "ban") {
+    return false;
+  }
+  if (args.slotPicking) return false;
   if (args.ally === false && args.heroOnPlate) return true;
   if (args.ally === true && !args.heroOnPlate) return false;
   if (!args.faceFilled) return false;
@@ -1204,9 +1253,11 @@ export function heroFromPlateText(text: string): string | null {
   const exact = list.find((hero) => hero.norm === joined);
   if (exact) return exact.hero;
   if (joined.length >= 6) {
-    const prefix = list.filter(
-      (hero) => hero.norm.startsWith(joined) || joined.startsWith(hero.norm),
-    );
+    const prefix = list.filter((hero) => {
+      const gap = Math.abs(hero.norm.length - joined.length);
+      if (gap === 0 || gap > 2) return false;
+      return hero.norm.startsWith(joined) || joined.startsWith(hero.norm);
+    });
     if (prefix.length === 1) return prefix[0].hero;
     const near = list.filter(
       (hero) =>
@@ -1342,7 +1393,23 @@ export function bannerTurn(text: string): {
   ) {
     phase = "pick";
   }
-  if (!phase && (tight.includes("lockin") || tight.includes("locking"))) {
+  if (
+    !phase &&
+    /\bwaiting for enemy\b/.test(lower) &&
+    !/\bwaiting for enemy ban\b/.test(lower) &&
+    (/\bred\s+pick\b/i.test(lower) ||
+      /\bblue\s+pick\b/i.test(lower) ||
+      tight.includes("redpick") ||
+      tight.includes("bluepick"))
+  ) {
+    phase = "pick";
+  }
+  if (
+    !phase &&
+    (tight.includes("lockin") ||
+      tight.includes("lockiny") ||
+      tight.includes("locking"))
+  ) {
     phase = "pick";
   }
   const color = tight.includes("red") ? "red" : tight.includes("blue") ? "blue" : null;
@@ -1383,6 +1450,23 @@ export function shownBanSide(args: {
   if (waitingOnEnemy && locked && !choosing) return "our";
   if (waitingOnEnemy && choosing && !locked) return "their";
   return null;
+}
+
+/**
+ * The big "BLUE BAN" / "RED BAN" card. Heroes painted on the side plates
+ * during that card are showcases, not locks.
+ */
+export function openingTeamBanCard(text: string): boolean {
+  const tight = text.toLowerCase().replace(/[^a-z]/g, "");
+  return tight.includes("blueban") || tight.includes("redban");
+}
+
+/**
+ * A ban frame after picks can already be on the board. The opening team-color
+ * card is excluded so those showcases stay off the pick list.
+ */
+export function banFrameKeepsLockedPicks(text: string): boolean {
+  return bannerTurn(text).phase === "ban" && !openingTeamBanCard(text);
 }
 
 /**
@@ -1431,6 +1515,27 @@ export function acceptPlatePicks(args: { banPhase: boolean; picksStarted: boolea
   return args.picksStarted && !args.banPhase;
 }
 
+/**
+ * Plate lock rules follow the pick phase once real picks are on the board,
+ * even when the center banner has moved into the second ban round.
+ */
+export function plateLockPhase(args: {
+  bannerPhase: "ban" | "pick" | null;
+  picksStarted: boolean;
+  priorLockedPicks: number;
+}): "ban" | "pick" | null {
+  if (args.bannerPhase === "pick") return "pick";
+  if (
+    args.bannerPhase === "ban" &&
+    args.picksStarted &&
+    args.priorLockedPicks > 0
+  ) {
+    return "pick";
+  }
+  if (args.bannerPhase === "ban") return "ban";
+  return args.bannerPhase;
+}
+
 /** Whose ban is still open, once we know who went first. */
 export function nextBanSide(
   weFirst: boolean,
@@ -1470,6 +1575,9 @@ export function mapFromTitle(text: string): string | null {
     folded.includes("pass")
   ) {
     return "Alterac Pass";
+  }
+  if (folded.includes("haunted") && folded.includes("mines")) {
+    return "Haunted Mines";
   }
   for (const map of NGS_MAP_POOL) {
     const norm = plateNorm(map.name);
@@ -1638,11 +1746,92 @@ export function ourSideIsLeft(
   return hits(left) >= hits(right);
 }
 
-function draftSide(
+export function draftStepSide(
   step: { side: "fp" | "sp" },
   weFirst: boolean,
 ): "our" | "their" {
   return (step.side === "fp") === weFirst ? "our" : "their";
+}
+
+function draftSide(
+  step: { side: "fp" | "sp" },
+  weFirst: boolean,
+): "our" | "their" {
+  return draftStepSide(step, weFirst);
+}
+
+/**
+ * Whose turn the side plates and open seats describe. PICKING on one column
+ * beats a draft-order guess from lock counts alone.
+ */
+export function resolveLiveTurn(args: {
+  phase: "ban" | "pick" | null;
+  leftPicking: boolean;
+  rightPicking: boolean;
+  usOnLeft: boolean;
+  bannerSide: "our" | "their" | null;
+  openTurn: OpenTurn | null;
+  ourOpenPlayers: readonly string[];
+  theirOpenPlayers: readonly string[];
+}): LiveTurn | null {
+  if (!args.phase) return null;
+  const fromColumns = firstPickFromPickingSlots({
+    leftPicking: args.leftPicking,
+    rightPicking: args.rightPicking,
+    usOnLeft: args.usOnLeft,
+  });
+  if (fromColumns) {
+    return {
+      side: fromColumns === "us" ? "our" : "their",
+      kind: args.phase,
+    };
+  }
+  if (args.openTurn && args.openTurn.phase === args.phase) {
+    return { side: args.openTurn.side, kind: args.openTurn.phase };
+  }
+  if (args.phase === "pick") {
+    if (args.theirOpenPlayers.length > 0 && args.ourOpenPlayers.length === 0) {
+      return { side: "their", kind: "pick" };
+    }
+    if (args.ourOpenPlayers.length > 0 && args.theirOpenPlayers.length === 0) {
+      return { side: "our", kind: "pick" };
+    }
+  }
+  if (args.bannerSide) {
+    return { side: args.bannerSide, kind: args.phase };
+  }
+  return null;
+}
+
+/** Next step in draft order that belongs to us, at or after `completedSteps`. */
+export function nextOurStepIndex(
+  completedSteps: number,
+  weFirst: boolean,
+): number | null {
+  for (let i = completedSteps; i < DRAFT_ORDER.length; i++) {
+    const step = DRAFT_ORDER[i];
+    if (draftStepSide(step, weFirst) === "our") return i;
+  }
+  return null;
+}
+
+/** Draft step index that matches what the screen says is open. */
+export function watchStepIndexForTurn(
+  completedSteps: number,
+  weFirst: boolean,
+  turn: LiveTurn,
+): number {
+  for (let i = completedSteps; i < DRAFT_ORDER.length; i++) {
+    const step = DRAFT_ORDER[i];
+    if (step.kind !== turn.kind) continue;
+    if (draftStepSide(step, weFirst) === turn.side) return i;
+  }
+  for (let i = Math.max(0, completedSteps - 1); i < completedSteps; i++) {
+    const step = DRAFT_ORDER[i];
+    if (step.kind !== turn.kind) continue;
+    if (draftStepSide(step, weFirst) === turn.side) return i;
+  }
+  return completedSteps;
 }
 
 /** True when these lock counts can happen if `weFirst` picked first. */
@@ -1675,23 +1864,308 @@ function banActionsFit(
   return fit;
 }
 
+function draftFitScore(draft: LiveDraft, weFirst: boolean): number {
+  const actions = actionsFromObserved({
+    ...draft,
+    weFirst,
+    firstPick: weFirst ? "us" : "them",
+  });
+  return actions.filter(
+    (action) =>
+      action.hero &&
+      action.hero !== UNSEEN_BAN &&
+      action.hero !== NO_BAN,
+  ).length;
+}
+
+function observedActionsLength(draft: LiveDraft, weFirst: boolean): number {
+  return actionsFromObserved({
+    ...draft,
+    weFirst,
+    firstPick: weFirst ? "us" : "them",
+  }).length;
+}
+
+function draftSequenceFit(draft: LiveDraft, weFirst: boolean): number {
+  const actions = actionsFromObserved({
+    ...draft,
+    weFirst,
+    firstPick: weFirst ? "us" : "them",
+  });
+  const cursor = {
+    our: { ban: 0, pick: 0 },
+    their: { ban: 0, pick: 0 },
+  };
+  const lists = {
+    our: { ban: draft.ourBans, pick: draft.ourPicks },
+    their: { ban: draft.theirBans, pick: draft.theirPicks },
+  };
+  let fit = 0;
+  for (const action of actions) {
+    if (
+      !action.hero ||
+      action.hero === UNSEEN_BAN ||
+      action.hero === NO_BAN
+    ) {
+      continue;
+    }
+    const idx = cursor[action.side][action.kind];
+    const expected = lists[action.side][action.kind][idx];
+    if (expected && heroKey(expected) === heroKey(action.hero)) {
+      fit += 1;
+      cursor[action.side][action.kind] += 1;
+    }
+  }
+  return fit;
+}
+
+function pickOrderSlotBonus(
+  draft: LiveDraft & {
+    ourPickSlots?: readonly number[];
+    theirPickSlots?: readonly number[];
+  },
+  weFirst: boolean,
+): number {
+  const actions = actionsFromObserved({
+    ...draft,
+    weFirst,
+    firstPick: weFirst ? "us" : "them",
+  });
+  const ourOrder = actions
+    .filter((action) => action.kind === "pick" && action.side === "our")
+    .map((action) => action.hero)
+    .filter(Boolean) as string[];
+  const theirOrder = actions
+    .filter((action) => action.kind === "pick" && action.side === "their")
+    .map((action) => action.hero)
+    .filter(Boolean) as string[];
+  const ourSlots = new Map(
+    draft.ourPicks.map((hero, index) => [
+      heroKey(hero),
+      draft.ourPickSlots?.[index] ?? index,
+    ]),
+  );
+  const theirSlots = new Map(
+    draft.theirPicks.map((hero, index) => [
+      heroKey(hero),
+      draft.theirPickSlots?.[index] ?? index,
+    ]),
+  );
+  return (
+    slotChronologyBonus(ourOrder, ourSlots, "our") +
+    slotChronologyBonus(theirOrder, theirSlots, "their")
+  );
+}
+
+function resolveFirstPickAmbiguous(
+  draft: LiveDraft & {
+    ourPickSlots?: readonly number[];
+    theirPickSlots?: readonly number[];
+  },
+): "us" | "them" | null {
+  const usObs = scoreObservedDraftActions({
+    ...draft,
+    weFirst: true,
+    firstPick: "us",
+  });
+  const themObs = scoreObservedDraftActions({
+    ...draft,
+    weFirst: false,
+    firstPick: "them",
+  });
+  if (usObs !== themObs) return usObs > themObs ? "us" : "them";
+  const usBan = banActionsFit(true, draft.ourBans, draft.theirBans);
+  const themBan = banActionsFit(false, draft.ourBans, draft.theirBans);
+  if (usBan !== themBan) return usBan > themBan ? "us" : "them";
+  const usLen = observedActionsLength(draft, true);
+  const themLen = observedActionsLength(draft, false);
+  if (usLen !== themLen) return usLen > themLen ? "us" : "them";
+  const usSeq = draftSequenceFit(draft, true);
+  const themSeq = draftSequenceFit(draft, false);
+  if (usSeq !== themSeq) return usSeq > themSeq ? "us" : "them";
+  const usSlot = pickOrderSlotBonus(draft, true);
+  const themSlot = pickOrderSlotBonus(draft, false);
+  if (usSlot !== themSlot) return usSlot > themSlot ? "us" : "them";
+  const usScore = draftFitScore(draft, true);
+  const themScore = draftFitScore(draft, false);
+  if (usScore !== themScore) return usScore > themScore ? "us" : "them";
+  return null;
+}
+
+/**
+ * Who had first pick — bans, pick counts, live turn, and draft-order fit.
+ * No waiting for a fresh opening frame when the board already shows progress.
+ */
+export function resolveFirstPick(
+  draft: Pick<
+    LiveDraft,
+    | "firstPick"
+    | "ourBans"
+    | "theirBans"
+    | "ourPicks"
+    | "theirPicks"
+    | "phase"
+    | "turn"
+  > & {
+    ourPickSlots?: readonly number[];
+    theirPickSlots?: readonly number[];
+  },
+): "us" | "them" | null {
+  const turnSide = draft.turn?.side ?? null;
+  const phase = draft.phase;
+  const ourPicks = draft.ourPicks?.length ?? 0;
+  const theirPicks = draft.theirPicks?.length ?? 0;
+
+  if (ourPicks + theirPicks > 0) {
+    const usFits = pickCountsFit(true, ourPicks, theirPicks);
+    const themFits = pickCountsFit(false, ourPicks, theirPicks);
+    if (usFits && !themFits) return "us";
+    if (themFits && !usFits) return "them";
+    const inferred = inferFirstPick({
+      ourPicks,
+      theirPicks,
+      phase,
+      turnSide,
+    });
+    if (inferred) return inferred;
+    if (usFits && themFits) {
+      const resolved = resolveFirstPickAmbiguous(draft as LiveDraft);
+      if (resolved) return resolved;
+      if (ourPicks === 5 && theirPicks === 5) return "us";
+    }
+  }
+
+  if (
+    phase === "ban" &&
+    turnSide &&
+    draft.ourBans.length === 2 &&
+    draft.theirBans.length === 2
+  ) {
+    // Tied opening bans: whoever is banning now is second pick.
+    return turnSide === "our" ? "them" : "us";
+  }
+
+  if (phase === "pick" && turnSide && ourPicks + theirPicks === 0) {
+    // After opening bans, the team on the banner has first pick.
+    return turnSide === "our" ? "us" : "them";
+  }
+
+  if (phase && turnSide) {
+    for (const fp of ["us", "them"] as const) {
+      const weFirst = fp === "us";
+      const progress = progressFromObserved({
+        ...(draft as LiveDraft),
+        weFirst,
+        firstPick: fp,
+      });
+      if (
+        progress.next?.side === turnSide &&
+        progress.next?.kind === phase
+      ) {
+        return fp;
+      }
+    }
+  }
+
+  if (draft.firstPick) return draft.firstPick;
+
+  const fromBoard = firstPickFromBanBoard(draft.ourBans, draft.theirBans, {
+    phase,
+  });
+  if (fromBoard) return fromBoard;
+
+  const resolved = resolveFirstPickAmbiguous(draft as LiveDraft);
+  if (resolved) return resolved;
+
+  const usScore = draftFitScore(draft as LiveDraft, true);
+  const themScore = draftFitScore(draft as LiveDraft, false);
+  if (usScore > themScore) return "us";
+  if (themScore > usScore) return "them";
+
+  return null;
+}
+
+/** True when bans or picks are on screen — enough to line up draft order. */
+export function observedDraftHasProgress(
+  draft: Pick<
+    LiveDraft,
+    "ourBans" | "theirBans" | "ourPicks" | "theirPicks"
+  > | null,
+): boolean {
+  if (!draft) return false;
+  return (
+    draft.ourBans.length +
+      draft.theirBans.length +
+      draft.ourPicks.length +
+      draft.theirPicks.length >
+    0
+  );
+}
+
+/** Whether the UI can show draft order and steps (not "waiting for first ban"). */
+export function isDraftSideKnown(
+  draft: LiveDraft | null,
+): boolean {
+  if (!draft) return false;
+  if (resolveFirstPick(draft)) return true;
+  if (!observedDraftHasProgress(draft)) return false;
+  const usScore = draftFitScore(draft, true);
+  const themScore = draftFitScore(draft, false);
+  return usScore !== themScore || usScore + themScore >= 4;
+}
+
+export function guessWeFirst(draft: LiveDraft | null): boolean {
+  if (!draft) return true;
+  const fp = resolveFirstPick(draft);
+  if (fp) return fp === "us";
+  const usScore = draftFitScore(draft, true);
+  const themScore = draftFitScore(draft, false);
+  if (usScore !== themScore) return usScore > themScore;
+  return true;
+}
+
 /** Pinned first pick, or who the ban row says went first when picks are still ambiguous. */
 export function firstPickFromObservedBoard(
-  draft: Pick<LiveDraft, "firstPick" | "ourBans" | "theirBans">,
+  draft: Pick<
+    LiveDraft,
+    | "firstPick"
+    | "ourBans"
+    | "theirBans"
+    | "ourPicks"
+    | "theirPicks"
+    | "phase"
+    | "turn"
+  >,
 ): "us" | "them" | null {
-  if (draft.firstPick) return draft.firstPick;
-  return firstPickFromBanBoard(draft.ourBans, draft.theirBans);
+  return resolveFirstPick(draft);
 }
 
 /** Who picked first, from how opening bans line up on the hex row. */
 export function firstPickFromBanBoard(
   ourBans: readonly string[],
   theirBans: readonly string[],
+  opts?: { phase?: "ban" | "pick" | null },
 ): "us" | "them" | null {
   const usFit = banActionsFit(true, ourBans, theirBans);
   const themFit = banActionsFit(false, ourBans, theirBans);
-  if (usFit > themFit) return "us";
-  if (themFit > usFit) return "them";
+  if (usFit > themFit) {
+    if (
+      opts?.phase === "pick" &&
+      theirBans.length < ourBans.length
+    ) {
+      return "them";
+    }
+    return "us";
+  }
+  if (themFit > usFit) {
+    if (
+      opts?.phase === "pick" &&
+      ourBans.length < theirBans.length
+    ) {
+      return "us";
+    }
+    return "them";
+  }
   if (usFit === 0) return null;
   const usOpen = actionsFromObserved({
     weFirst: true,
@@ -1731,6 +2205,14 @@ export function firstPickFromBanBoard(
     ) {
       return "them";
     }
+    if (
+      themOpen.hero === NO_BAN &&
+      usOpen.hero !== NO_BAN &&
+      usOpen.hero !== UNSEEN_BAN
+    ) {
+      return "us";
+    }
+    if (usFit === themFit) return null;
     if (usOpen.side === "our" && usOpen.hero === ourBans[0]) {
       return "us";
     }
@@ -1839,6 +2321,131 @@ export function inferFirstPick(args: {
  * A ban the screen has already moved past is marked unseen so the board can
  * reach the current step. Unknown bans stay in the hero pool.
  */
+function permutePickRows(
+  heroes: readonly string[],
+  players: readonly (string | null)[],
+): { heroes: string[]; players: (string | null)[] }[] {
+  if (heroes.length <= 1) {
+    return [{ heroes: [...heroes], players: [...players] }];
+  }
+  const out: { heroes: string[]; players: (string | null)[] }[] = [];
+  for (let i = 0; i < heroes.length; i++) {
+    const hero = heroes[i];
+    const player = players[i] ?? null;
+    const restHeroes = heroes.filter((_, index) => index !== i);
+    const restPlayers = players.filter((_, index) => index !== i);
+    for (const sub of permutePickRows(restHeroes, restPlayers)) {
+      out.push({ heroes: [hero, ...sub.heroes], players: [player, ...sub.players] });
+    }
+  }
+  return out;
+}
+
+function scoreObservedDraftActions(draft: LiveDraft & { weFirst: boolean }): number {
+  const actions = actionsFromObserved(draft);
+  let score = 0;
+  for (const action of actions) {
+    const named =
+      action.hero &&
+      action.hero !== UNSEEN_BAN &&
+      action.hero !== NO_BAN;
+    if (named) score += 3;
+    else if (action.hero === UNSEEN_BAN) score -= 2;
+  }
+  return score;
+}
+
+export function pickSlotsFromPlateLocks(
+  heroes: readonly string[],
+  locks: readonly { hero: string; slot: number | null }[],
+): number[] {
+  return heroes.map((hero) => {
+    const lock = locks.find((row) => heroKey(row.hero) === heroKey(hero));
+    return lock?.slot ?? 0;
+  });
+}
+
+function slotChronologyBonus(
+  permutedHeroes: readonly string[],
+  heroToSlot: ReadonlyMap<string, number>,
+  side: "our" | "their",
+): number {
+  const slots = permutedHeroes.map((hero) => heroToSlot.get(heroKey(hero)) ?? 0);
+  const sorted = [...slots].sort((a, b) => (side === "their" ? b - a : a - b));
+  let bonus = 0;
+  for (let i = 0; i < slots.length; i++) {
+    if (slots[i] === sorted[i]) bonus += 2;
+  }
+  return bonus;
+}
+
+/**
+ * Portrait slots are not chronological — try pick permutations so
+ * `actionsFromObserved` does not place second-round bans after picks.
+ */
+export function fitObservedPickOrder(
+  draft: LiveDraft & { weFirst: boolean },
+  slots?: {
+    our?: readonly number[];
+    their?: readonly number[];
+  },
+): Pick<LiveDraft, "ourPicks" | "theirPicks" | "ourPickPlayers" | "theirPickPlayers"> {
+  if (draft.ourPicks.length + draft.theirPicks.length === 0) {
+    return {
+      ourPicks: [...draft.ourPicks],
+      theirPicks: [...draft.theirPicks],
+      ourPickPlayers: [...draft.ourPickPlayers],
+      theirPickPlayers: [...draft.theirPickPlayers],
+    };
+  }
+  const ourSlotByHero = new Map(
+    draft.ourPicks.map((hero, index) => [heroKey(hero), slots?.our?.[index] ?? index]),
+  );
+  const theirSlotByHero = new Map(
+    draft.theirPicks.map((hero, index) => [heroKey(hero), slots?.their?.[index] ?? index]),
+  );
+  const identity = {
+    ourPicks: [...draft.ourPicks],
+    theirPicks: [...draft.theirPicks],
+    ourPickPlayers: [...draft.ourPickPlayers],
+    theirPickPlayers: [...draft.theirPickPlayers],
+  };
+  let best = identity;
+  let bestAction = scoreObservedDraftActions(draft);
+  let bestSlot =
+    slotChronologyBonus(draft.theirPicks, theirSlotByHero, "their");
+  if (draft.theirPicks.length !== 3) {
+    return identity;
+  }
+  const ourRow = { heroes: identity.ourPicks, players: identity.ourPickPlayers };
+  const theirPerms = permutePickRows(draft.theirPicks, draft.theirPickPlayers);
+  for (const their of theirPerms) {
+    const trial: LiveDraft & { weFirst: boolean } = {
+      ...draft,
+      ourPicks: ourRow.heroes,
+      theirPicks: their.heroes,
+      ourPickPlayers: ourRow.players,
+      theirPickPlayers: their.players,
+    };
+    const actionScore = scoreObservedDraftActions(trial);
+    const slotBonus = slotChronologyBonus(their.heroes, theirSlotByHero, "their");
+    if (
+      actionScore > bestAction ||
+      (actionScore === bestAction && slotBonus > bestSlot)
+    ) {
+      bestAction = actionScore;
+      bestSlot = slotBonus;
+      best = {
+        ourPicks: ourRow.heroes,
+        theirPicks: their.heroes,
+        ourPickPlayers: ourRow.players,
+        theirPickPlayers: their.players,
+      };
+    }
+  }
+  return best;
+}
+
 /** Tyrael can lock above Lunara on the banner while Lunara was the earlier pick. */
 export function reorderOurPicksForDraftZip(
   heroes: readonly string[],
@@ -1900,6 +2507,42 @@ export function actionsFromObserved(
 }
 
 /**
+ * The watch board must follow the current screen. A first-pick flip used to
+ * leave the old bans in place and append the new sequence after them, which
+ * puts a ban in the middle of the first pick wave.
+ * Returns true when history should be replaced by `screen`.
+ */
+export function watchHistoryNeedsReplace(
+  history: readonly { side: "our" | "their"; kind: "ban" | "pick"; hero: string }[],
+  screen: readonly { side: "our" | "their"; kind: "ban" | "pick"; hero: string }[],
+  weFirst: boolean,
+): boolean {
+  const followsOrder = history.every((action, index) => {
+    const step = DRAFT_ORDER[index];
+    return (
+      Boolean(step) &&
+      action.kind === step.kind &&
+      action.side === draftStepSide(step, weFirst)
+    );
+  });
+  if (!followsOrder) return true;
+  if (screen.length < history.length) return false;
+  for (let index = 0; index < history.length; index++) {
+    const next = screen[index];
+    const prev = history[index];
+    if (
+      !next ||
+      next.side !== prev.side ||
+      next.kind !== prev.kind ||
+      heroKey(next.hero) !== heroKey(prev.hero)
+    ) {
+      return true;
+    }
+  }
+  return screen.length > history.length;
+}
+
+/**
  * Completed bans and picks in draft order, plus the step the lobby is on.
  * An unfinished draft has one sequence that can produce the locks already
  * on screen, so the order stops at the first hero the lobby has not locked.
@@ -1909,6 +2552,34 @@ export function progressFromObserved(draft: LiveDraft & { weFirst: boolean }): {
   next: { side: "our" | "their"; kind: "ban" | "pick" } | null;
 } {
   const actions = actionsFromObserved(draft);
+  const stepFromActions = DRAFT_ORDER[actions.length];
+  if (
+    stepFromActions &&
+    draft.ourPicks.length + draft.theirPicks.length === 0 &&
+    actions.length >= 4 &&
+    actions.every((action) => action.kind === "ban") &&
+    stepFromActions.kind === "pick"
+  ) {
+    return {
+      actions,
+      next: {
+        side: draftSide(stepFromActions, draft.weFirst),
+        kind: stepFromActions.kind,
+      },
+    };
+  }
+  const phaseForNext =
+    draft.phase ??
+    (draft.ourPicks.length + draft.theirPicks.length > 0 ? "pick" : null);
+  if (phaseForNext === "ban" || phaseForNext === "pick") {
+    const open = nextOpenStep(
+      draft.weFirst,
+      draft.ourPicks.length,
+      draft.theirPicks.length,
+      phaseForNext,
+    );
+    if (open) return { actions, next: open };
+  }
   const step = DRAFT_ORDER[actions.length];
   if (!step) return { actions, next: null };
   return { actions, next: { side: draftSide(step, draft.weFirst), kind: step.kind } };

@@ -269,10 +269,10 @@ describe("resolvePairPickSelection", () => {
     );
     expect(
       stepHeading({ ours: true, kind: "pick", ordinal: 4, pair: true, watch: true }),
-    ).toBe("Our 4th + 5th picks — waiting for them on screen");
+    ).toBe("Our 4th + 5th picks — waiting for it on screen");
     expect(
       stepHeading({ ours: true, kind: "pick", ordinal: 5, pair: true, watch: true }),
-    ).toBe("Our 5th pick — waiting for them on screen");
+    ).toBe("Our 5th pick — waiting for it on screen");
   });
 
   it("marks a selected pair hero as locked in the current plan once", () => {

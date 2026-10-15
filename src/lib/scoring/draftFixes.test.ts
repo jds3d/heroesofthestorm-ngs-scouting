@@ -29,7 +29,7 @@ import {
   type DraftStepScore,
 } from "@/lib/scoring/draftGrade";
 import { heroKey } from "@/lib/scoring/heroMeta";
-import { solveSeatAssignments } from "@/lib/scoring/draftPlan";
+import { DRAFT_ORDER, solveSeatAssignments } from "@/lib/scoring/draftPlan";
 import { assignUniqueOwners, displacedComfort, nextSeatLabels, playersSeatedOnLocks } from "@/lib/scoring/draftSwap";
 import { slHeroSuggestions } from "@/lib/scoring/comfort";
 import type { PlayerScout } from "@/lib/scoring/types";
@@ -214,6 +214,33 @@ describe("draftGrade", () => {
     expect(card.ours.grade).toBe("B");
     expect(card.theirs.grade).toBe("A+");
     expect(card.ours.notes[0]).toBe("Every step ranked C or better against the options open.");
+  });
+
+  it("counts a perfect ban as a quarter of a perfect pick", () => {
+    const picks = gradeFinishedDraft({
+      ...base,
+      steps: [step("our", 10, 10, 40), step("our", 10, 10, 40)],
+    });
+    const withBan = gradeFinishedDraft({
+      ...base,
+      steps: [
+        step("our", 10, 10, 40),
+        step("our", 10, 10, 40),
+        {
+          side: "our",
+          kind: "ban",
+          label: "Ban 1",
+          locked: "Genji",
+          bestLabel: "Genji",
+          best: 10,
+          achieved: 10,
+          percentile: 100,
+        },
+      ],
+    });
+    expect(picks.ours.percentile).toBe(40);
+    // (40 + 40 + 100 × 0.25) / 2.25 = 46.6 → 47
+    expect(withBan.ours.percentile).toBe(47);
   });
 
   it("names the lowest-ranked step as the biggest miss", () => {
@@ -1225,13 +1252,17 @@ describe("seat suggestion text stays aligned with the live plan", () => {
             },
       };
     });
-    const steps = collectReportSteps(history, () => ({
-      best: 40,
-      achieved: 8,
-      bestLabel: "Rehgar + Sylvanas",
-      percentile: 12,
-      fieldSize: 20,
-    }));
+    const steps = collectReportSteps(
+      history,
+      () => ({
+        best: 40,
+        achieved: 8,
+        bestLabel: "Rehgar + Sylvanas",
+        percentile: 12,
+        fieldSize: 20,
+      }),
+      "their",
+    );
     const theirs = steps.filter((step) => step.side === "their");
     expect(theirs.map((step) => step.label)).toEqual([
       "Ban 1",
@@ -1246,6 +1277,74 @@ describe("seat suggestion text stays aligned with the live plan", () => {
       bestLabel: "Rehgar + Sylvanas",
       percentile: 12,
     });
+  });
+
+  it("gives first pick Pick 1 and Picks 4+5, and second pick Pick 5, with every ban scored", () => {
+    const heroes = {
+      our: {
+        ban: ["Diablo", "Xal'atath", "Garrosh"],
+        pick: ["Lucio", "Stitches", "Abathur", "Qhira", "Kael'thas"],
+      },
+      their: {
+        ban: ["Falstad", "Yrel", "Johanna"],
+        pick: ["Zagara", "Raynor", "Brightwing", "Nova", "Arthas"],
+      },
+    };
+    const counts = { our: { ban: 0, pick: 0 }, their: { ban: 0, pick: 0 } };
+    const history = DRAFT_ORDER.map((step) => {
+      const side = step.side === "fp" ? "our" as const : "their" as const;
+      const ordinal = (counts[side][step.kind] += 1);
+      return {
+        side,
+        kind: step.kind,
+        ordinal,
+        hero: heroes[side][step.kind][ordinal - 1],
+      };
+    });
+    const steps = collectReportSteps(
+      history,
+      () => ({
+        best: 10,
+        achieved: 8,
+        bestLabel: "Alt",
+        percentile: 40,
+        fieldSize: 4,
+      }),
+      "our",
+    );
+    expect(steps.filter((step) => step.side === "our").map((step) => step.label)).toEqual([
+      "Ban 1",
+      "Ban 2",
+      "Pick 1",
+      "Picks 2 + 3",
+      "Ban 3",
+      "Picks 4 + 5",
+    ]);
+    expect(steps.filter((step) => step.side === "their").map((step) => step.label)).toEqual([
+      "Ban 1",
+      "Ban 2",
+      "Picks 1 + 2",
+      "Ban 3",
+      "Picks 3 + 4",
+      "Pick 5",
+    ]);
+    expect(steps.find((step) => step.side === "our" && step.label === "Pick 1")?.locked).toBe(
+      "Lucio",
+    );
+    expect(
+      steps.find((step) => step.side === "our" && step.label === "Picks 4 + 5")?.locked,
+    ).toBe("Qhira + Kael'thas");
+    expect(
+      steps.find((step) => step.side === "their" && step.label === "Picks 3 + 4")?.locked,
+    ).toBe("Brightwing + Nova");
+    expect(steps.find((step) => step.side === "their" && step.label === "Pick 5")?.locked).toBe(
+      "Arthas",
+    );
+    expect(steps.filter((step) => step.kind === "ban")).toHaveLength(6);
+    const numbers = steps
+      .filter((step) => step.kind === "pick")
+      .map((step) => step.label);
+    expect(new Set(numbers).size).toBe(numbers.length);
   });
 
   it("suggests the open plan hero instead of that player's highest-volume Storm League pick", () => {

@@ -3,7 +3,10 @@
 import { useEffect, useRef, useState, type MutableRefObject } from "react";
 import { TimeLeftBar } from "@/components/TimeLeftBar";
 import { heroKey } from "@/lib/scoring/heroMeta";
-import { banHexPassed, inferSandwichedMutedBan, matchBanPixels } from "@/lib/lobby/banFace";
+import {
+  readThreeBanHexSlots,
+  setBanHexMapContext,
+} from "@/lib/lobby/banFace";
 import type { Worker } from "tesseract.js";
 import {
   DRAFT_BAN_HEXES,
@@ -17,17 +20,23 @@ import {
   nameplateCell,
   EMPTY_LIVE_DRAFT,
   bannerTurn,
-  banHexFilled,
   bansFromHexFaces,
   acceptPortraitExample,
   matchPortrait,
   portraitVector,
   inferFirstPick,
+  resolveFirstPick,
+  guessWeFirst,
   firstPickFromBanBoard,
+  columnPickingFromOcrLines,
+  pickingFlagsBySlot,
   pickCountsFit,
+  resolveLiveTurn,
   PARTY_NAME_ROW,
   openSeatPlayers,
   reorderOurPicksForDraftZip,
+  fitObservedPickOrder,
+  pickSlotsFromPlateLocks,
   portraitFilled,
   plateFill,
   portraitIsLocked,
@@ -44,6 +53,8 @@ import {
   sideFromStatus,
   sideFromTeamSplash,
   acceptPlatePicks,
+  banFrameKeepsLockedPicks,
+  plateLockPhase,
   banSideFromSplash,
   firstBanSideFromStatus,
   slotsHoldPicks,
@@ -73,11 +84,7 @@ type Box = { x: number; y: number; w: number; h: number; rotate: number };
 const WATCH_TICK_DRAFT_MS = 2000;
 const WATCH_TICK_IDLE_MS = 6000;
 
-function readHex(
-  ctx: CanvasRenderingContext2D,
-  frame: HTMLCanvasElement,
-  box: DraftBox,
-): {
+type BanHexSlot = {
   filled: boolean;
   passed: boolean;
   vector: number[] | null;
@@ -85,7 +92,13 @@ function readHex(
   pixels: Rgb[];
   width: number;
   height: number;
-} {
+};
+
+function cropBanHex(
+  ctx: CanvasRenderingContext2D,
+  frame: HTMLCanvasElement,
+  box: DraftBox,
+): { pixels: Rgb[]; width: number; height: number } {
   const x = Math.max(0, Math.round(box.x * frame.width));
   const y = Math.max(0, Math.round(box.y * frame.height));
   const w = Math.max(1, Math.min(frame.width - x, Math.round(box.w * frame.width)));
@@ -94,22 +107,31 @@ function readHex(
   try {
     data = ctx.getImageData(x, y, w, h).data;
   } catch {
-    return { filled: false, passed: false, vector: null, hero: null, pixels: [], width: 0, height: 0 };
+    return { pixels: [], width: 0, height: 0 };
   }
   const pixels: Rgb[] = [];
   for (let i = 0; i < data.length; i += 4) {
     pixels.push({ r: data[i] ?? 0, g: data[i + 1] ?? 0, b: data[i + 2] ?? 0 });
   }
-  const filled = banHexFilled(pixels);
-  return {
-    filled,
-    passed: !filled && banHexPassed(pixels, w, h),
-    vector: portraitVector(pixels, w, h),
-    hero: filled ? matchBanPixels(pixels, w, h) : null,
-    pixels,
-    width: w,
-    height: h,
-  };
+  return { pixels, width: w, height: h };
+}
+
+function readSideBanHexes(
+  ctx: CanvasRenderingContext2D,
+  frame: HTMLCanvasElement,
+  boxes: readonly DraftBox[],
+): BanHexSlot[] {
+  const crops = boxes.map((box) => cropBanHex(ctx, frame, box));
+  const { identified, filled, passed } = readThreeBanHexSlots(crops);
+  return crops.map((crop, i) => ({
+    filled: filled[i] ?? false,
+    passed: passed[i] ?? false,
+    hero: identified[i] ?? null,
+    vector: portraitVector(crop.pixels, crop.width, crop.height),
+    pixels: crop.pixels,
+    width: crop.width,
+    height: crop.height,
+  }));
 }
 
 type FaceRow = { hero: string; vector: number[] };
@@ -296,6 +318,7 @@ export function LobbyScreenWatch({
   resetEpoch = 0,
   onIdlePausedChange,
   resumeRef,
+  autoStart = false,
 }: {
   ourNames: string[];
   /** Battletags the OCR names can snap onto (both lineups). */
@@ -313,11 +336,18 @@ export function LobbyScreenWatch({
   onIdlePausedChange?: (paused: boolean) => void;
   /** Parent calls `.current()` to resume after idle pause. */
   resumeRef?: MutableRefObject<(() => void) | null>;
+  /** When true, opens the share dialog on mount (off by default — wait for the button). */
+  autoStart?: boolean;
 }) {
-  const [phase, setPhase] = useState<Phase>("idle");
+  const [phase, setPhase] = useState<Phase>(autoStart ? "watching" : "idle");
+  const [requestingShare, setRequestingShare] = useState(false);
   const [status, setStatus] = useState(
-    "Share the main screen once. While a draft lobby is visible, the five opponent names fill in here.",
+    autoStart
+      ? "Opening screen share…"
+      : "Click Share main screen when Heroes is on your monitor. Names and draft state read from there.",
   );
+  const startWatchRef = useRef<(() => Promise<void>) | null>(null);
+  const autoStartOnceRef = useRef(false);
   const [names, setNames] = useState<string[]>([]);
   const streamRef = useRef<MediaStream | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
@@ -345,6 +375,8 @@ export function LobbyScreenWatch({
   const watchFingerprintRef = useRef("");
   const stableSinceRef = useRef(0);
   const idlePausedRef = useRef(false);
+  /** Draft finished on screen — keep state and sharing until Reset draft. */
+  const draftCompleteRef = useRef(false);
   const onReplaySyncRef = useRef(onReplaySync);
   const leftNamesRef = useRef<string[]>([]);
   const rightNamesRef = useRef<string[]>([]);
@@ -391,6 +423,15 @@ export function LobbyScreenWatch({
     };
   }, []);
 
+  useEffect(() => {
+    if (!autoStart || autoStartOnceRef.current) return;
+    autoStartOnceRef.current = true;
+    const id = window.requestAnimationFrame(() => {
+      void startWatchRef.current?.();
+    });
+    return () => window.cancelAnimationFrame(id);
+  }, [autoStart]);
+
   function clearWatchTimer() {
     if (timerRef.current != null) {
       window.clearInterval(timerRef.current);
@@ -414,6 +455,7 @@ export function LobbyScreenWatch({
   }
 
   function resumeIdleWatch() {
+    if (draftCompleteRef.current) return;
     if (!streamRef.current || !videoRef.current || !workerRef.current) return;
     setIdlePaused(false);
     stableSinceRef.current = Date.now();
@@ -608,6 +650,8 @@ async function readLobby(
   picksRight: OcrLine[];
   leftPicking: boolean;
   rightPicking: boolean;
+  leftPickingFlags: boolean[];
+  rightPickingFlags: boolean[];
   center: OcrLine[];
 } | null> {
   const leftPlate = stackNameplates(frame, DRAFT_SLOT_NAMES.left);
@@ -633,6 +677,10 @@ async function readLobby(
   };
   const leftReads = readsBySlot(data.left ?? []);
   const rightReads = readsBySlot(data.right ?? []);
+  const leftPickingFlags = pickingFlagsBySlot(data.left ?? []);
+  const rightPickingFlags = pickingFlagsBySlot(data.right ?? []);
+  const leftPicking = columnPickingFromOcrLines(data.left ?? []);
+  const rightPicking = columnPickingFromOcrLines(data.right ?? []);
   const ctx = frame.getContext("2d");
   const pixelAt = ctx ? framePixelAt(ctx, frame) : null;
   const slots = (
@@ -640,6 +688,7 @@ async function readLobby(
     reads: { hero: string | null; player: string | null }[],
     portraitBoxes: readonly DraftBox[],
     nameBoxes: readonly DraftBox[],
+    pickingFlags: boolean[],
   ) =>
     reads.flatMap((read, index) => {
       const box = portraitBoxes[index];
@@ -655,6 +704,7 @@ async function readLobby(
           faceFilled: portraitFilled(sampleBox(ctx, frame, box)),
           teamRim: portraitTeamRim(frame.width, frame.height, box, pixelAt),
           ally,
+          slotPicking: pickingFlags[index] ?? false,
         },
       ];
     });
@@ -677,16 +727,30 @@ async function readLobby(
   return {
     left: leftNames,
     right: rightNames,
-    leftSlots: slots(true, leftReads, DRAFT_PLATE_SLOTS.left, DRAFT_SLOT_NAMES.left),
-    rightSlots: slots(false, rightReads, DRAFT_PLATE_SLOTS.right, DRAFT_SLOT_NAMES.right),
+    leftSlots: slots(
+      true,
+      leftReads,
+      DRAFT_PLATE_SLOTS.left,
+      DRAFT_SLOT_NAMES.left,
+      leftPickingFlags,
+    ),
+    rightSlots: slots(
+      false,
+      rightReads,
+      DRAFT_PLATE_SLOTS.right,
+      DRAFT_SLOT_NAMES.right,
+      rightPickingFlags,
+    ),
     leftShown: shownHeroes(leftReads, DRAFT_SLOT_NAMES.left),
     rightShown: [],
     leftReads,
     rightReads,
     picksLeft: [],
     picksRight: [],
-    leftPicking: false,
-    rightPicking: false,
+    leftPicking,
+    rightPicking,
+    leftPickingFlags,
+    rightPickingFlags,
     center: data.center ?? [],
   };
 }
@@ -700,6 +764,7 @@ async function readLobby(
   }
 
   function clearObserved() {
+    draftCompleteRef.current = false;
     inDraftRef.current = false;
     watchFingerprintRef.current = "";
     stableSinceRef.current = 0;
@@ -745,6 +810,7 @@ async function readLobby(
     if (busyRef.current || video.readyState < 2) return;
     if (hiddenRef.current) return;
     if (idlePausedRef.current) return;
+    if (draftCompleteRef.current) return;
     const epoch = epochRef.current;
     busyRef.current = true;
     try {
@@ -794,6 +860,12 @@ async function readLobby(
           screenPhase === "menu" &&
           (inDraftRef.current || lastOursKeyRef.current || lastKeyRef.current)
         ) {
+          if (draftCompleteRef.current || liveDraftBoardFull(draftRef.current)) {
+            setStatus(
+              "Draft complete — still on the board until you click Reset draft.",
+            );
+            return;
+          }
           await onReplaySyncRef.current?.();
           if (epoch !== epochRef.current) return;
           clearObserved();
@@ -814,10 +886,11 @@ async function readLobby(
       inDraftRef.current = true;
       const lobbyPromise = readLobby(frame);
       const partyText = await readColumn(frame, worker, PARTY_NAME_ROW);
-      const leftHexes = DRAFT_BAN_HEXES.left.map((hex) => readHex(ctx, frame, hex));
-      const rightHexes = DRAFT_BAN_HEXES.right.map((hex) => readHex(ctx, frame, hex));
-      inferSandwichedMutedBan(leftHexes);
-      inferSandwichedMutedBan(rightHexes);
+      const mapHint = mapFromTitle(titleText) ?? draftRef.current.map ?? null;
+      setBanHexMapContext(mapHint);
+      const leftHexes = readSideBanHexes(ctx, frame, DRAFT_BAN_HEXES.left);
+      const rightHexes = readSideBanHexes(ctx, frame, DRAFT_BAN_HEXES.right);
+      setBanHexMapContext(null);
       const lobby = await lobbyPromise;
       const rapidCenter = (lobby?.center ?? []).map((line) => line.text).join("\n");
       const centerSource = rapidCenter.trim() ? rapidCenter : centerText;
@@ -839,7 +912,20 @@ async function readLobby(
           slot: lock.slot,
         }));
       const banPhase = banner.phase === "ban" || centerRead.phase === "ban";
-      const platePhase = banPhase ? "ban" : (banner.phase ?? centerRead.phase);
+      const bannerPhase = banPhase
+        ? "ban"
+        : (banner.phase ?? centerRead.phase ?? null);
+      const keepCommitted =
+        banPhase &&
+        banFrameKeepsLockedPicks(`${centerSource}\n${statusText}`);
+      const priorLockedPicks =
+        draft.ourPicks.length + draft.theirPicks.length;
+      const lockPhase = plateLockPhase({
+        bannerPhase,
+        picksStarted: picksStartedRef.current,
+        priorLockedPicks,
+      });
+      const platePhase = lockPhase ?? bannerPhase;
       const lockedSlots = (
         rows: {
           hero: string;
@@ -849,24 +935,29 @@ async function readLobby(
           faceFilled: boolean;
           teamRim: { blue: number; red: number };
           ally: boolean;
+          slotPicking?: boolean;
         }[],
       ) =>
         snapPlate(
           rows.filter((row) =>
             portraitIsLocked({
               phase: platePhase,
+              keepCommitted: keepCommitted && platePhase === "ban",
               faceFilled: row.faceFilled,
               plate: row.plate,
               ally: row.ally,
               heroOnPlate: true,
+              slotPicking: row.slotPicking,
             }),
           ),
         );
       const leftLocked = lockedSlots(lobby?.leftSlots ?? []);
       const rightLocked = lockedSlots(lobby?.rightSlots ?? []);
-      const slotted = slotsHoldPicks(leftLocked.length + rightLocked.length);
+      const slotted =
+        slotsHoldPicks(leftLocked.length + rightLocked.length) &&
+        (lockPhase === "pick" || (keepCommitted && platePhase === "ban"));
       const fromSlots = null;
-      if (!banPhase && slotted) picksStartedRef.current = true;
+      if (slotted) picksStartedRef.current = true;
       if (!banPhase && (banner.phase === "pick" || fromSlots === "pick")) {
         picksStartedRef.current = true;
       }
@@ -875,7 +966,8 @@ async function readLobby(
         acceptPlatePicks({
           banPhase,
           picksStarted: picksStartedRef.current,
-        });
+        }) ||
+        (lockPhase === "pick" && picksStartedRef.current);
       const ourShown = usOnLeft ? lobby?.leftShown ?? [] : lobby?.rightShown ?? [];
       const theirShown = usOnLeft ? lobby?.rightShown ?? [] : lobby?.leftShown ?? [];
       const ourPruned = pruneHoverPicks(
@@ -1006,15 +1098,12 @@ async function readLobby(
         theirHexes.map((hex) => hex.passed),
       );
       const phase = banner.phase ?? centerRead.phase ?? fromSlots ?? (slotted ? "pick" : draft.phase);
-      if (banPhase && !picksStartedRef.current) {
+      if (banPhase && !picksStartedRef.current && !slotted) {
         ourPicks = [];
         theirPicks = [];
       }
-      let firstPick = draft.firstPick;
-      if (!firstPick) {
-        const fromBanBoard = firstPickFromBanBoard(ourBans, theirBans);
-        if (fromBanBoard) firstPick = fromBanBoard;
-      }
+      const fromBanBoard = firstPickFromBanBoard(ourBans, theirBans);
+      let firstPick = fromBanBoard ?? draft.firstPick;
       if (
         !firstPick &&
         ourPicks.length + theirPicks.length === 0 &&
@@ -1056,13 +1145,7 @@ async function readLobby(
         if (ourBans.length > 0 && theirBans.length === 0) firstPick = "us";
         else if (theirBans.length > 0 && ourBans.length === 0) firstPick = "them";
       }
-      if (
-        firstPick === "them" &&
-        theirPicks.length === 0 &&
-        (ourPicks.length > 0 ||
-          (lobby &&
-            (usOnLeft ? lobby.leftReads : lobby.rightReads).some((read) => read.hero)))
-      ) {
+      if (firstPick === "them" && theirPicks.length === 0 && ourPicks.length > 0) {
         firstPick = "us";
       }
       if (ourPicks.length + theirPicks.length > 0) {
@@ -1107,14 +1190,19 @@ async function readLobby(
           if (!seatCtx || !seatPixels) return false;
           const nameBox = nameBoxes[index];
           const read = reads[index];
+          const pickingFlags = ally
+            ? lobby?.leftPickingFlags ?? []
+            : lobby?.rightPickingFlags ?? [];
           return portraitIsLocked({
             phase: platePhase,
+            keepCommitted: keepCommitted && platePhase === "ban",
             faceFilled: portraitFilled(sampleBox(seatCtx, frame, box)),
             plate: nameBox
               ? plateFill(sampleBox(seatCtx, frame, nameBox), ally)
               : undefined,
             ally,
             heroOnPlate: Boolean(read?.hero),
+            slotPicking: pickingFlags[index] ?? false,
           });
         });
       const ourBoxes = usOnLeft ? DRAFT_PLATE_SLOTS.left : DRAFT_PLATE_SLOTS.right;
@@ -1142,6 +1230,73 @@ async function readLobby(
         ourPicks = ourZip.heroes;
         ourPickPlayers = ourZip.players;
       }
+      const turnPhase =
+        phase === "ban" || phase === "pick"
+          ? phase
+          : platePhase === "ban" || platePhase === "pick"
+            ? platePhase
+            : null;
+      const liveTurn = resolveLiveTurn({
+        phase: turnPhase,
+        leftPicking: lobby?.leftPicking ?? false,
+        rightPicking: lobby?.rightPicking ?? false,
+        usOnLeft,
+        bannerSide: turnSide,
+        openTurn: turn.open,
+        ourOpenPlayers,
+        theirOpenPlayers,
+      });
+      const weFirstGuess =
+        firstPick === "us" || firstPick === "them"
+          ? firstPick === "us"
+          : guessWeFirst({
+              firstPick,
+              ourBans,
+              theirBans,
+              ourPicks,
+              theirPicks,
+              ourPickPlayers,
+              theirPickPlayers,
+              phase,
+              turn: liveTurn,
+              map,
+            });
+      const ourLockRows = usOnLeft ? leftLocked : rightLocked;
+      const theirLockRows = usOnLeft ? rightLocked : leftLocked;
+      const fittedPicks = fitObservedPickOrder(
+        {
+          weFirst: weFirstGuess,
+          firstPick,
+          phase,
+          map,
+          ourBans,
+          theirBans,
+          ourPicks,
+          theirPicks,
+          ourPickPlayers,
+          theirPickPlayers,
+        },
+        {
+          our: pickSlotsFromPlateLocks(ourPicks, ourLockRows),
+          their: pickSlotsFromPlateLocks(theirPicks, theirLockRows),
+        },
+      );
+      ourPicks = fittedPicks.ourPicks;
+      theirPicks = fittedPicks.theirPicks;
+      ourPickPlayers = fittedPicks.ourPickPlayers;
+      theirPickPlayers = fittedPicks.theirPickPlayers;
+      const resolvedFirst =
+        resolveFirstPick({
+          firstPick,
+          ourBans,
+          theirBans,
+          ourPicks,
+          theirPicks,
+          phase,
+          turn: liveTurn,
+          ourPickSlots: pickSlotsFromPlateLocks(ourPicks, ourLockRows),
+          theirPickSlots: pickSlotsFromPlateLocks(theirPicks, theirLockRows),
+        }) ?? firstPick;
       const nextDraft: LiveDraft = {
         ourPicks,
         theirPicks,
@@ -1151,16 +1306,20 @@ async function readLobby(
         theirOpenPlayers,
         ourBans,
         theirBans,
-        firstPick,
+        firstPick: resolvedFirst,
         phase,
+        turn: liveTurn,
         map,
       };
       if (epoch !== epochRef.current) return;
       draftRef.current = nextDraft;
       onDraftRef.current(nextDraft);
-      if (liveDraftBoardFull(nextDraft)) {
-        stopWatch();
-        setStatus("Draft complete. Screen watch stopped.");
+      if (liveDraftBoardFull(nextDraft) && !draftCompleteRef.current) {
+        draftCompleteRef.current = true;
+        clearWatchTimer();
+        setStatus(
+          "Draft complete. Board stays here until you click Reset draft.",
+        );
         return;
       }
 
@@ -1236,29 +1395,29 @@ async function readLobby(
     stableSinceRef.current = 0;
     onDraftRef.current(draftRef.current);
     setNames([]);
-    setPhase("watching");
-    setStatus("Choose the main screen in the share dialog.");
+    setRequestingShare(true);
+    setStatus(
+      "In the browser dialog, choose your main monitor (not a window or this tab).",
+    );
     try {
       const stream = await navigator.mediaDevices.getDisplayMedia({
         video: {
+          displaySurface: "monitor",
           width: { ideal: 2560 },
           height: { ideal: 1440 },
           frameRate: { ideal: 2 },
         },
         audio: false,
-        // Chrome-only hints: ask for a monitor, not this browser tab.
+        // Chrome: monitors only; no tab/window list when supported.
         preferCurrentTab: false,
         selfBrowserSurface: "exclude",
         monitorTypeSurfaces: "include",
+        windowTypeSurfaces: "exclude",
+        browserTypeSurfaces: "exclude",
+        surfaceSwitching: "exclude",
       } as DisplayMediaStreamOptions);
       const [track] = stream.getVideoTracks();
       if (!track) throw new Error("No video track");
-      const surface = track.getSettings().displaySurface;
-      if (surface && surface !== "monitor") {
-        track.stop();
-        setStatus("That share is a window. Share the whole main screen so the lobby can be read.");
-        return;
-      }
       track.addEventListener("ended", () => {
         stopWatch();
         setStatus("Screen share ended.");
@@ -1290,11 +1449,15 @@ async function readLobby(
       const denied = err instanceof DOMException && err.name === "NotAllowedError";
       setStatus(
         denied
-          ? "Screen share was dismissed. Share the main screen to fill the lobby."
+          ? "Screen share was dismissed. Click Share main screen when you are ready."
           : "Could not start the screen watch.",
       );
+    } finally {
+      setRequestingShare(false);
     }
   }
+
+  startWatchRef.current = startWatch;
 
   if (phase !== "idle") {
     const load = screenLoad(status);
@@ -1326,33 +1489,16 @@ async function readLobby(
   }
 
   return (
-    <div className="space-y-3 rounded-lg border border-[var(--line)] bg-[var(--background)] p-4">
-      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-        <div className="space-y-1">
-          <h3 className="text-sm font-semibold text-[var(--ink)]">Live lobby</h3>
-          <p className="text-sm text-[var(--muted)]">{status}</p>
-        </div>
-        <button
-          type="button"
-          onClick={() => {
-            if (phase === "idle") {
-              void startWatch();
-              return;
-            }
-            stopWatch();
-            setStatus("Screen watch stopped.");
-          }}
-          className="h-10 shrink-0 rounded-md border border-[var(--accent)] px-4 text-sm font-semibold uppercase tracking-wide text-[var(--accent)] transition hover:bg-[var(--accent)]/10"
-        >
-          {phase === "idle" ? "Watch main screen" : "Stop watching"}
-        </button>
-      </div>
-      {names.length > 0 && (
-        <p className="text-sm text-[var(--ink)]">
-          Their side from the draft:{" "}
-          <span className="font-semibold">{names.join(", ")}</span>
-        </p>
-      )}
+    <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-[var(--line)] bg-[var(--background)] p-4">
+      <p className="min-w-0 flex-1 text-sm text-[var(--muted)]">{status}</p>
+      <button
+        type="button"
+        disabled={requestingShare}
+        onClick={() => void startWatch()}
+        className="h-10 shrink-0 rounded-md border border-[var(--accent)] px-4 text-sm font-semibold uppercase tracking-wide text-[var(--accent)] transition hover:bg-[var(--accent)]/10 disabled:opacity-50"
+      >
+        {requestingShare ? "Choose monitor…" : "Share main screen"}
+      </button>
     </div>
   );
 }

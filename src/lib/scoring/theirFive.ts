@@ -1,7 +1,7 @@
 import type { DraftMetaTable } from "@/lib/scoring/draftMeta";
 import { heroDraftMeta } from "@/lib/scoring/draftMeta";
 import { stormLeagueScore } from "@/lib/scoring/comfort";
-import { heroKey } from "@/lib/scoring/heroMeta";
+import { heroKey, heroRole } from "@/lib/scoring/heroMeta";
 import {
   assignRequiredRoles,
   heroFillsRole,
@@ -22,6 +22,10 @@ export type TheirRemainingSeat = {
   sl: number;
   comfort: number;
   games: number;
+  /** Visible rank number. Storm League score × 100, or a ban total. */
+  points?: number;
+  /** Mouseover: why this hero is in the column. */
+  why?: string;
 };
 
 type HeroOption = {
@@ -110,12 +114,124 @@ export function collectTheirUnpickedPlayers(args: {
   return out;
 }
 
-/** Map open pick slots (left to right) to projected seats. */
-export function likelyPicksUnderOpenSlots(
+/** Roles already taken by heroes locked on the board. */
+function coveredByLocks(lockedHeroes: readonly string[]): Set<RequiredRole> {
+  const heroes = lockedHeroes.filter(Boolean);
+  return new Set(assignRequiredRoles(heroes).values());
+}
+
+function faceRole(hero: string): TheirSeatRole {
+  const required = REQUIRED_ROLES.find((role) => heroFillsRole(hero, role));
+  return roleWord(required);
+}
+
+/**
+ * One open player's own heroes, highest first.
+ * A hero that fills a role the locked comp still needs ranks above a hero
+ * whose only roles are already locked. Nothing is hidden because another
+ * open player also plays that role.
+ */
+export function seatSuggestionStack(
+  seat: TheirRemainingSeat,
+  roster: readonly PlayerScout[],
+  gone: ReadonlySet<string>,
+  limit = 3,
+  extras: readonly string[] = [],
+  lockedHeroes: readonly string[] = [],
+): TheirRemainingSeat[] {
+  const unavailable = new Set([...gone].map((hero) => heroKey(hero)));
+  const covered = coveredByLocks(lockedHeroes);
+  const who = seat.player ?? "This seat";
+  const stack: TheirRemainingSeat[] = [];
+  const name = (seat.player ?? "").split("#")[0]?.trim().toLowerCase() ?? "";
+  const scout = roster.find((player) => {
+    const base = player.battletag.split("#")[0]?.trim().toLowerCase() ?? "";
+    return Boolean(name) && base === name;
+  });
+  const push = (hero: string, sl = 0, comfort = 0, games = 0) => {
+    if (unavailable.has(heroKey(hero))) return;
+    if (stack.some((row) => heroKey(row.hero) === heroKey(hero))) return;
+    const slPoints = sl > 0 ? Math.round(sl * 100) : 0;
+    const fills = REQUIRED_ROLES.filter((role) => heroFillsRole(hero, role));
+    const fillsMissing = fills.some((role) => !covered.has(role));
+    const coveredOnly =
+      fills.length > 0 && fills.every((role) => covered.has(role));
+    const need = fillsMissing ? 25 : coveredOnly ? -25 : 0;
+    const points = slPoints + need;
+    const played = heroRole(hero);
+    const scoreLine =
+      games > 0
+        ? `${hero} is ${played} on ${who}. Storm League ${slPoints} from ${games} games.`
+        : `${hero} is ${played}.`;
+    const compLine = fillsMissing
+      ? " The locked comp still needs a role this hero fills, so it ranks up."
+      : coveredOnly
+        ? " That role is already locked, so it ranks behind heroes that fill something still open."
+        : "";
+    stack.push({
+      player: seat.player,
+      hero,
+      role: faceRole(hero),
+      locked: false,
+      sl,
+      comfort,
+      games,
+      points,
+      why: `Pick one for ${who}. ${scoreLine}${compLine} Rank ${points}. Other columns are other players. A lock rebuilds the remaining columns.`,
+    });
+  };
+  if (scout) {
+    for (const option of optionsFor(scout, unavailable)) {
+      push(option.hero, option.sl, option.comfort, option.games);
+    }
+  }
+  push(seat.hero, seat.sl, seat.comfort, seat.games);
+  if (stack.length < limit) {
+    for (const hero of extras) {
+      if (stack.length >= limit) break;
+      push(hero);
+    }
+  }
+  stack.sort(
+    (a, b) =>
+      (b.points ?? -1) - (a.points ?? -1) ||
+      b.sl - a.sl ||
+      a.hero.localeCompare(b.hero),
+  );
+  return stack.slice(0, limit);
+}
+
+/** Three suggestions under each empty pick, left to right. */
+export function likelyPickStacksUnderOpenSlots(
   picks: readonly ({ hero: string } | null)[],
   seats: readonly TheirRemainingSeat[],
+  roster: readonly PlayerScout[],
+  gone: ReadonlySet<string>,
+  limit = 3,
+  extras: readonly string[] = [],
+): (TheirRemainingSeat[] | null)[] {
+  const locked = picks.flatMap((pick) => (pick?.hero ? [pick.hero] : []));
+  return likelyPicksUnderOpenSlots(picks, seats).map((seat) =>
+    seat
+      ? seatSuggestionStack(seat, roster, gone, limit, extras, locked)
+      : null,
+  );
+}
+
+/** Map open pick slots (left to right) to projected seats. */
+export function likelyPicksUnderOpenSlots(
+  picks: readonly ({ hero: string; player?: string | null } | null)[],
+  seats: readonly TheirRemainingSeat[],
 ): (TheirRemainingSeat | null)[] {
-  const open = seats.filter((seat) => !seat.locked);
+  const taken = new Set(
+    picks.flatMap((pick) => {
+      const key = nameKey(pick?.player);
+      return key ? [key] : [];
+    }),
+  );
+  const open = seats.filter(
+    (seat) => !seat.locked && !taken.has(nameKey(seat.player)),
+  );
   const emptyIndices: number[] = [];
   picks.forEach((pick, index) => {
     if (!pick) emptyIndices.push(index);

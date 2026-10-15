@@ -11,6 +11,8 @@ export type BanHexManifestRow = {
   source?: string;
   side?: "left" | "right";
   slot?: number;
+  /** When set, the saved crop is only matched on this map name. */
+  map?: string;
 };
 
 const HEX_DIR = path.join(process.cwd(), "examples", "ban-hexes");
@@ -47,7 +49,7 @@ export function rowsFromBanHexExamples(): BanCatalogRow[] {
         b: image.data[i * 4 + 2] ?? 0,
       });
     }
-    const catalog = catalogRowFromBanHex(row.hero, pixels, image.width, image.height);
+    const catalog = catalogRowFromBanHex(row.hero, pixels, image.width, image.height, row.map);
     if (catalog) out.push(catalog);
   }
   return out;

@@ -5,6 +5,8 @@ import {
   LikelyPickProjection,
   MatchupTracker,
   MissingDataBadge,
+  SuggestionStack,
+  observedDraftSlots,
 } from "./InteractiveDraft";
 
 describe("Likely pick projection", () => {
@@ -27,6 +29,68 @@ describe("Likely pick projection", () => {
     expect(html).toContain("Valla");
     expect(html).toContain("Cinema");
     expect(html).toContain("ring-dashed");
+  });
+
+  it("stacks three faces under an open slot", () => {
+    const seat = {
+      player: "EKevin",
+      hero: "Nazeebo",
+      role: "Ranged" as const,
+      locked: false,
+      sl: 1,
+      comfort: 1,
+      games: 10,
+    };
+    const html = renderToStaticMarkup(
+      createElement(SuggestionStack, {
+        accent: "enemy",
+        seats: [
+          seat,
+          { ...seat, hero: "Jaina" },
+          { ...seat, hero: "Valla" },
+        ],
+      }),
+    );
+    expect(html).toContain("Nazeebo");
+    expect(html).toContain("Jaina");
+    expect(html).toContain("Valla");
+    expect(html).toContain("EKevin");
+    expect(html).toContain("Pick one for EKevin");
+    expect(html).toContain("Nazeebo");
+    expect(html).toContain("Jaina");
+    expect(html).toContain("Valla");
+  });
+});
+
+describe("observed draft slots", () => {
+  it("shows every screen lock, including a hero the turn order has not reached", () => {
+    const picks = observedDraftSlots(
+      ["Johanna", "Nazeebo", "Falstad", "Leoric"],
+      ["Crogunt", "EKevin", null, "Hecarimj"],
+      "their",
+      "pick",
+      5,
+    );
+    expect(picks.map((slot) => slot?.hero ?? null)).toEqual([
+      "Johanna",
+      "Nazeebo",
+      "Falstad",
+      "Leoric",
+      null,
+    ]);
+    const bans = observedDraftSlots(
+      ["Xal'atath", "The Lost Vikings", "Chromie"],
+      [],
+      "their",
+      "ban",
+      3,
+    );
+    expect(bans.map((slot) => slot?.hero)).toEqual([
+      "Xal'atath",
+      "The Lost Vikings",
+      "Chromie",
+    ]);
+    expect(bans.every((slot) => slot?.kind === "ban")).toBe(true);
   });
 });
 

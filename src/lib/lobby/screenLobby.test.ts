@@ -6,8 +6,16 @@ import {
   NO_BAN,
   UNSEEN_BAN,
   actionsFromObserved,
+  watchHistoryNeedsReplace,
   inferFirstPick,
   firstPickFromObservedBoard,
+  fitObservedPickOrder,
+  isDraftSideKnown,
+  resolveFirstPick,
+  pickingFlagsBySlot,
+  resolveLiveTurn,
+  watchStepIndexForTurn,
+  nextOurStepIndex,
   bannerTurn,
   colorfulFraction,
   firstBanSideFromStatus,
@@ -20,6 +28,9 @@ import {
   nextBanSide,
   banSideFromSplash,
   acceptPlatePicks,
+  banFrameKeepsLockedPicks,
+  openingTeamBanCard,
+  plateLockPhase,
   shownBanSide,
   matchLobbyToRosters,
   sideFromBannerColor,
@@ -84,6 +95,50 @@ describe("reorderOurPicksForDraftZip", () => {
   });
 });
 
+describe("resolveLiveTurn", () => {
+  it("prefers a PICKING column over lock-count draft order", () => {
+    expect(
+      resolveLiveTurn({
+        phase: "pick",
+        leftPicking: false,
+        rightPicking: true,
+        usOnLeft: true,
+        bannerSide: null,
+        openTurn: null,
+        ourOpenPlayers: [],
+        theirOpenPlayers: ["Undead"],
+      }),
+    ).toEqual({ side: "their", kind: "pick" });
+  });
+});
+
+describe("watchStepIndexForTurn", () => {
+  it("steps forward to their last pick when the screen says it is their turn", () => {
+    expect(
+      watchStepIndexForTurn(14, true, { side: "their", kind: "pick" }),
+    ).toBe(15);
+  });
+});
+
+describe("nextOurStepIndex", () => {
+  it("keeps counseling our 5th pick while they are on their last pick", () => {
+    expect(nextOurStepIndex(14, true)).toBe(14);
+    expect(nextOurStepIndex(15, true)).toBeNull();
+  });
+});
+
+describe("pickingFlagsBySlot", () => {
+  it("marks only the seat whose plate says PICKING", () => {
+    expect(
+      pickingFlagsBySlot([
+        { text: "Chen", top: 10 },
+        { text: "PICKING", top: 410 },
+        { text: "Anduin", top: 420 },
+      ]),
+    ).toEqual([false, true, false, false, false]);
+  });
+});
+
 describe("firstPickFromObservedBoard", () => {
   it("reads Battlefield bans when firstPick was never pinned", () => {
     expect(
@@ -91,8 +146,119 @@ describe("firstPickFromObservedBoard", () => {
         firstPick: null,
         ourBans: [NO_BAN, "Xal'atath", NO_BAN],
         theirBans: ["Qhira", NO_BAN, "Johanna"],
+        ourPicks: [],
+        theirPicks: [],
+        phase: "ban",
+        turn: null,
       }),
     ).toBe("us");
+  });
+
+  it("resolves Haunted Mines mid-ban from turn when opening bans tie", () => {
+    expect(
+      resolveFirstPick({
+        firstPick: null,
+        ourBans: ["Qhira", "Falstad"],
+        theirBans: ["Xal'atath", "Kel'Thuzad"],
+        ourPicks: [],
+        theirPicks: [],
+        phase: "ban",
+        turn: { side: "our", kind: "ban" },
+      }),
+    ).toBe("them");
+    expect(
+      isDraftSideKnown({
+        ...EMPTY_LIVE_DRAFT,
+        ourBans: ["Qhira", "Falstad"],
+        theirBans: ["Xal'atath", "Kel'Thuzad"],
+        phase: "ban",
+        turn: { side: "our", kind: "ban" },
+      }),
+    ).toBe(true);
+  });
+
+  it("breaks a 5v5 pick tie with draft-order fit", () => {
+    expect(
+      resolveFirstPick({
+        firstPick: null,
+        ourBans: ["Cassia", "Chen", "Sylvanas"],
+        theirBans: ["Anub'arak", "Chromie", "Tyrande"],
+        ourPicks: ["Johanna", "Rexxar", "Tychus", "Junkrat", "Kharazim"],
+        theirPicks: [
+          "Sgt. Hammer",
+          "Lt. Morales",
+          "Artanis",
+          "Diablo",
+          "Zul'jin",
+        ],
+        phase: "pick",
+        turn: null,
+      }),
+    ).toBe("us");
+  });
+
+  it("resolves Cursed Hollow mid-draft from 4v3 pick counts", () => {
+    expect(
+      resolveFirstPick({
+        firstPick: "us",
+        ourBans: ["Johanna", "Anduin", "Dehaka"],
+        theirBans: ["Qhira", "Xal'atath", "Stitches"],
+        ourPicks: ["Rehgar", "Alarak", "Tyrael", "Sylvanas"],
+        theirPicks: ["Falstad", "Brightwing", "Greymane"],
+        phase: "pick",
+        turn: { side: "their", kind: "pick" },
+      }),
+    ).toBe("them");
+  });
+
+  it("infers first pick from uneven pick counts", () => {
+    expect(
+      resolveFirstPick({
+        firstPick: null,
+        ourBans: ["Qhira", "Falstad"],
+        theirBans: ["Xal'atath", "Kel'Thuzad"],
+        ourPicks: ["Johanna", "Hanzo"],
+        theirPicks: ["Mal'Ganis", "Auriel", "Dehaka"],
+        phase: "pick",
+        turn: { side: "our", kind: "pick" },
+      }),
+    ).toBe("them");
+  });
+
+  it("keeps every locked enemy hero when reordering three picks for draft fit", () => {
+    const fitted = fitObservedPickOrder(
+      {
+        weFirst: false,
+        firstPick: "them",
+        phase: "pick",
+        map: "Battlefield of Eternity",
+        ourBans: ["Qhira", "Johanna", "Falstad"],
+        theirBans: ["Xal'atath", "Abathur", "Artanis"],
+        ourPicks: ["Whitemane", "Raynor"],
+        theirPicks: ["Mal'Ganis", "Kael'thas", "Brightwing"],
+        ourPickPlayers: ["a", "b"],
+        theirPickPlayers: ["c", "d", "e"],
+      },
+      { our: [1, 2], their: [0, 1, 3] },
+    );
+    expect(fitted.theirPicks.sort()).toEqual(
+      ["Brightwing", "Kael'thas", "Mal'Ganis"].sort(),
+    );
+    expect(fitted.ourPicks).toEqual(["Whitemane", "Raynor"]);
+  });
+
+  it("overrides a stale ban-board first pick when pick counts only fit one side", () => {
+    expect(
+      resolveFirstPick({
+        firstPick: "us",
+        ourBans: ["Qhira", "Falstad"],
+        theirBans: ["Xal'atath", "Kel'Thuzad"],
+        ourPicks: ["Johanna", "Hanzo"],
+        theirPicks: ["Arthas", "Tassadar", "Tracer"],
+        phase: "ban",
+        turn: { side: "our", kind: "ban" },
+      }),
+    ).toBe("them");
   });
 });
 
@@ -110,6 +276,15 @@ describe("openSeatPlayers", () => {
         [true, false, true, false, true],
       ),
     ).toEqual(["Dante", "hiimrick"]);
+  });
+
+  it("drops a name that is already on a locked seat", () => {
+    expect(
+      openSeatPlayers(
+        [{ player: "HuckIt" }, { player: "MoJoE" }, { player: "HuckIt" }],
+        [true, false, false],
+      ),
+    ).toEqual(["MoJoE"]);
   });
 });
 
@@ -181,6 +356,11 @@ describe("draft locks from the screen", () => {
     expect(playerFromSlotText("Li-Ming Thomas")).toBe("Thomas");
     expect(heroFromPlateText("MALGANS")).toBe("Mal'Ganis");
     expect(heroFromPlateText("MAL'GANS")).toBe("Mal'Ganis");
+    expect(heroFromPlateText("novawolf117")).toBeNull();
+    expect(readSlotPlate(["VALLA", "novawolf117"])).toEqual({
+      hero: "Valla",
+      player: "novawolf117",
+    });
     expect(nameFromPlate("MALGANS\nPeterWiggin")).toBe("PeterWiggin");
     expect(nameFromPlate("MAL'GANS")).toBeNull();
     expect(nameFromPlate("VALLA\nTopgun707")).toBe("Topgun707");
@@ -253,6 +433,15 @@ describe("draft locks from the screen", () => {
         heroOnPlate: true,
       }),
     ).toBe(true);
+    expect(
+      portraitIsLocked({
+        phase: "ban",
+        faceFilled: true,
+        ally: false,
+        heroOnPlate: true,
+        plate: "locked",
+      }),
+    ).toBe(false);
   });
 
   it("leaves the Alterac Tyrande hover unlocked", () => {
@@ -725,6 +914,48 @@ describe("draft locks from the screen", () => {
     expect(acceptPlatePicks({ banPhase: true, picksStarted: false })).toBe(false);
     expect(acceptPlatePicks({ banPhase: false, picksStarted: false })).toBe(false);
     expect(acceptPlatePicks({ banPhase: false, picksStarted: true })).toBe(true);
+    expect(
+      plateLockPhase({
+        bannerPhase: "ban",
+        picksStarted: true,
+        priorLockedPicks: 5,
+      }),
+    ).toBe("pick");
+    expect(
+      plateLockPhase({
+        bannerPhase: "ban",
+        picksStarted: false,
+        priorLockedPicks: 0,
+      }),
+    ).toBe("ban");
+    expect(openingTeamBanCard("BLUE BAN\nWaiting for Team Ban...")).toBe(true);
+    expect(openingTeamBanCard("SleezyGypsy1\nBanning\nWaiting for Enemy Ban...")).toBe(
+      false,
+    );
+    expect(banFrameKeepsLockedPicks("BLUE BAN\nWaiting for Team Ban...")).toBe(false);
+    expect(
+      banFrameKeepsLockedPicks("SleezyGypsy1\nBanning\nWaiting for Enemy Ban..."),
+    ).toBe(true);
+    expect(
+      portraitIsLocked({
+        phase: "ban",
+        keepCommitted: true,
+        faceFilled: true,
+        plate: "locked",
+        ally: true,
+        heroOnPlate: true,
+      }),
+    ).toBe(true);
+    expect(
+      portraitIsLocked({
+        phase: "ban",
+        keepCommitted: true,
+        faceFilled: true,
+        plate: "shown",
+        ally: true,
+        heroOnPlate: true,
+      }),
+    ).toBe(false);
     expect(nextBanSide(false, 0, 0)).toBe("their");
     expect(nextBanSide(false, 0, 1)).toBe("our");
     expect(nextBanSide(true, 0, 0)).toBe("our");
@@ -777,6 +1008,7 @@ describe("draft locks from the screen", () => {
 
   it("reads the map title and the banning announcement", () => {
     expect(mapFromTitle("BATTLEFIELD OF ETERNITY")).toBe("Battlefield of Eternity");
+    expect(mapFromTitle("HAUNTED MINES")).toBe("Haunted Mines");
     expect(turnFromOcr("MsBelis27\nBanning", ["MsBells27"])).toEqual({
       player: "MsBells27",
       phase: "ban",
@@ -956,6 +1188,53 @@ describe("draft locks from the screen", () => {
     ]);
     expect(draftHeroList([UNSEEN_BAN, UNSEEN_BAN, UNSEEN_BAN])).toBe("3 locked");
     expect(draftHeroList(["Valla", UNSEEN_BAN])).toBe("Valla, 1 locked");
+  });
+
+  it("replaces a history that puts a ban in the first pick wave", () => {
+    const illegal = [
+      { side: "our" as const, kind: "ban" as const, hero: "Unseen" },
+      { side: "their" as const, kind: "ban" as const, hero: "Xal'atath" },
+      { side: "our" as const, kind: "ban" as const, hero: "Unseen" },
+      { side: "their" as const, kind: "ban" as const, hero: "The Lost Vikings" },
+      { side: "their" as const, kind: "pick" as const, hero: "Nazeebo" },
+      { side: "their" as const, kind: "pick" as const, hero: "Johanna" },
+      { side: "our" as const, kind: "pick" as const, hero: "Qhira" },
+      { side: "their" as const, kind: "ban" as const, hero: "Chromie" },
+    ];
+    const legal = actionsFromObserved({
+      ...EMPTY_LIVE_DRAFT,
+      weFirst: true,
+      firstPick: "us",
+      ourBans: ["__unseen__", "__unseen__"],
+      theirBans: ["Xal'atath", "The Lost Vikings", "Chromie"],
+      ourPicks: ["Qhira", "Muradin", "Rehgar"],
+      theirPicks: ["Nazeebo", "Johanna"],
+    });
+    expect(watchHistoryNeedsReplace(illegal, legal, true)).toBe(true);
+    expect(legal.map((action) => action.kind).slice(0, 9)).toEqual([
+      "ban",
+      "ban",
+      "ban",
+      "ban",
+      "pick",
+      "pick",
+      "pick",
+      "pick",
+      "pick",
+    ]);
+    const chromie = legal.findIndex((action) => action.hero === "Chromie");
+    expect(chromie === -1 || chromie >= 9).toBe(true);
+  });
+
+  it("keeps a longer legal history when the screen flickers shorter", () => {
+    const history = [
+      { side: "our" as const, kind: "ban" as const, hero: "Johanna" },
+      { side: "their" as const, kind: "ban" as const, hero: "Qhira" },
+    ];
+    expect(watchHistoryNeedsReplace(history, history.slice(0, 1), true)).toBe(false);
+    expect(
+      watchHistoryNeedsReplace(history, [...history, { side: "our", kind: "ban", hero: "Anub'arak" }], true),
+    ).toBe(true);
   });
 
   it("reads whose turn from the team splash without treating it as a ban", () => {

@@ -12,7 +12,9 @@ import { InteractiveDraft } from "@/components/InteractiveDraft";
 import {
   actionsFromObserved,
   EMPTY_LIVE_DRAFT,
-  firstPickFromObservedBoard,
+  guessWeFirst,
+  isDraftSideKnown,
+  liveDraftBoardFull,
   heroFromPlateText,
   rosterTagsForLobby,
   rosterTagsPresent,
@@ -185,17 +187,23 @@ export function ScoutApp() {
   const scoutingSelf = selected !== "" && selected === homeName;
   const lineupsReady =
     ourFive.length === 5 && (scoutingSelf || theirFive.length === 5);
-  const liveFirstPick = useMemo(
-    () => (liveDraft ? firstPickFromObservedBoard(liveDraft) : null),
+  const liveSideKnown = useMemo(
+    () => isDraftSideKnown(liveDraft),
     [liveDraft],
   );
+  const liveWeFirst = useMemo(
+    () => guessWeFirst(liveDraft),
+    [liveDraft],
+  );
+  const liveDraftFrozen = Boolean(liveDraft && liveDraftBoardFull(liveDraft));
   const liveScreen = useMemo(() => {
-    if (!liveDraft || !liveFirstPick) return null;
+    if (!liveDraft) return null;
     return actionsFromObserved({
       ...liveDraft,
-      weFirst: liveFirstPick === "us",
+      weFirst: liveWeFirst,
+      firstPick: liveWeFirst ? "us" : "them",
     });
-  }, [liveDraft, liveFirstPick]);
+  }, [liveDraft, liveWeFirst]);
 
   const weekGroups = useMemo(() => opponentsByWeek(teams), [teams]);
 
@@ -391,7 +399,7 @@ export function ScoutApp() {
           if (cancelled) return;
           try {
             const slRes = await scoutFetch(
-              `/api/players/storm-league?tags=${encodeURIComponent(tag)}`,
+              `/api/players/storm-league?sync=0&tags=${encodeURIComponent(tag)}`,
             );
             const slData = (await slRes.json()) as {
               players?: PlayerScout[];
@@ -708,17 +716,8 @@ export function ScoutApp() {
     if (!watchMeta?.byHero || !Object.keys(watchMeta.byHero).length) {
       return "Loading Storm League hero stats and matchups.";
     }
-    const pulling = slTrack.some(
-      (row) => row.status === "queued" || row.status === "pulling",
-    );
-    if (pulling) {
-      return "Loading Storm League history for players on screen.";
-    }
-    if (stormHome.length < 4) {
-      return "Reading player names from the screen.";
-    }
     return null;
-  }, [sharing, report, watchMeta, slTrack, stormHome.length]);
+  }, [sharing, report, watchMeta]);
 
   const draftSaveKey = [
     liveDraft?.map ?? "",
@@ -846,6 +845,7 @@ export function ScoutApp() {
         </div>
         )}
         <LobbyScreenWatch
+          autoStart={false}
           ourNames={ourRoster.map((player) => player.battletag.split("#")[0] ?? player.battletag)}
           rosterNames={[...ourRoster, ...theirRoster].map((player) => player.battletag)}
           onReplaySync={syncLocalReplays}
@@ -1021,7 +1021,7 @@ export function ScoutApp() {
         </div>
       )}
 
-      {sharing && !report ? (
+      {sharing && (!report || liveDraftFrozen) ? (
         <div className="space-y-3">
           <DraftTracker
             rows={slTrack}
@@ -1043,8 +1043,8 @@ export function ScoutApp() {
           ) : null}
           <InteractiveDraft
             tree={{ id: "live", title: "Live draft", detail: "Read from the shared screen." }}
-            weFirst={liveFirstPick === "us"}
-            sideKnown={liveFirstPick != null}
+            weFirst={liveWeFirst}
+            sideKnown={liveSideKnown}
             screen={liveScreen}
             observedPicks={liveDraft}
             ourLabel="Us"
@@ -1076,14 +1076,14 @@ export function ScoutApp() {
         </div>
       )}
 
-      {report && (
+      {report && !(sharing && liveDraftFrozen) ? (
         <ScoutReportView
           key={review?.id ?? "live"}
           report={report}
           review={review}
           liveDraft={liveDraft}
         />
-      )}
+      ) : null}
     </div>
     </div>
   );

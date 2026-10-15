@@ -84,6 +84,13 @@ type LockedSeat = {
   player: string | null;
 };
 
+/** A ban is a quarter of a pick in the decision grade. */
+export const BAN_STEP_WEIGHT = 0.25;
+
+export function stepGradeWeight(kind: "ban" | "pick"): number {
+  return kind === "ban" ? BAN_STEP_WEIGHT : 1;
+}
+
 /** Quality points lost per required role the locked five can't cover. */
 const MISSING_ROLE_QUALITY = 12;
 /** Quality points lost per locked hero nobody on the five has on record. */
@@ -157,7 +164,8 @@ function synergyScore(
   }
   return {
     points: clamp(10 + total * 0.4, 0, SYNERGY_MAX),
-    best: best && best.edge > 0 ? best.label : null,
+    // A 50.4% duo is a coin flip, not a reason to call it the best pair.
+    best: best && best.edge >= 3 ? best.label : null,
   };
 }
 
@@ -315,8 +323,9 @@ export function sumStepPoints(steps: readonly DraftStepScore[]): {
   let points = 0;
   let bestPoints = 0;
   for (const s of steps) {
-    points += s.achieved;
-    bestPoints += Math.max(0, s.best, s.achieved);
+    const weight = stepGradeWeight(s.kind);
+    points += s.achieved * weight;
+    bestPoints += Math.max(0, s.best, s.achieved) * weight;
   }
   const pct = bestPoints > 0 ? clamp(Math.round((points / bestPoints) * 100), 0, 100) : 100;
   return { points: Math.round(points), bestPoints: Math.round(bestPoints), pct };
@@ -357,7 +366,9 @@ function gradeSide(args: {
 }): SideDraftGrade {
   const { points, bestPoints, pct } = sumStepPoints(args.steps);
   const notes: string[] = [];
-  const miss = biggestMiss(args.steps);
+  const miss =
+    biggestMiss(args.steps.filter((s) => s.kind === "pick")) ??
+    biggestMiss(args.steps.filter((s) => s.kind === "ban"));
   if (miss) {
     const verb = miss.kind === "ban" ? "banned" : "picked";
     notes.push(
@@ -387,8 +398,12 @@ function gradeSide(args: {
     const percentile = stepPercentile(s);
     return { ...s, pct: stepPct(s), percentile, grade: percentileToGrade(percentile) };
   });
-  const percentile = steps.length
-    ? Math.round(steps.reduce((sum, s) => sum + s.percentile, 0) / steps.length)
+  const weight = steps.reduce((sum, s) => sum + stepGradeWeight(s.kind), 0);
+  const percentile = weight
+    ? Math.round(
+        steps.reduce((sum, s) => sum + s.percentile * stepGradeWeight(s.kind), 0) /
+          weight,
+      )
     : clamp(Math.round(args.scored.quality), 0, 100);
   return {
     label: args.label,

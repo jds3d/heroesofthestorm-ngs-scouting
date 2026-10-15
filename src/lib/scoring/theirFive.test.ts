@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
 import { playerFromStormLeague } from "@/lib/scoring/comfort";
 import {
+  likelyPickStacksUnderOpenSlots,
   likelyPicksUnderOpenSlots,
   rebuildTheirRemainingFive,
+  seatSuggestionStack,
 } from "@/lib/scoring/theirFive";
 import type { SourceHeroStat } from "@/lib/scoring/types";
 
@@ -189,5 +191,127 @@ describe("rebuildTheirRemainingFive", () => {
     expect(after.map((seat) => [seat.player, seat.hero, seat.role])).toEqual([
       ["SKilleen", "Falstad", "Flex"],
     ]);
+  });
+});
+
+describe("seat suggestion stacks", () => {
+  it("puts three of that player's heroes under one open slot", () => {
+    const roster = [
+      scout("EKevin", [
+        ["Nazeebo", 30, 10],
+        ["Jaina", 20, 8],
+        ["Valla", 12, 6],
+      ]),
+    ];
+    const seat = {
+      player: "EKevin",
+      hero: "Nazeebo",
+      role: "Ranged" as const,
+      locked: false,
+      sl: 1,
+      comfort: 1,
+      games: 10,
+    };
+    const stack = seatSuggestionStack(seat, roster, new Set(["Johanna"]), 3);
+    expect(stack.map((row) => row.hero)).toEqual(["Nazeebo", "Jaina", "Valla"]);
+    const slots = likelyPickStacksUnderOpenSlots(
+      [null, { hero: "Leoric" }, null, null, null],
+      [seat],
+      roster,
+      new Set(["Johanna"]),
+    );
+    expect(slots[0]?.map((row) => row.hero)).toEqual(["Nazeebo", "Jaina", "Valla"]);
+    expect(slots[1]).toBeNull();
+    expect(slots[2]).toBeNull();
+  });
+
+  it("never gives an open column to a player who already locked", () => {
+    const huck = {
+      player: "HuckIt",
+      hero: "Tychus",
+      role: "Ranged" as const,
+      locked: false,
+      sl: 1,
+      comfort: 1,
+      games: 4,
+    };
+    const mojoe = {
+      player: "MoJoE",
+      hero: "Malthael",
+      role: "Flex" as const,
+      locked: false,
+      sl: 1,
+      comfort: 1,
+      games: 4,
+    };
+    const slots = likelyPicksUnderOpenSlots(
+      [
+        { hero: "Brightwing", player: "HuckIt" },
+        { hero: "Artanis", player: "Topgun707" },
+        null,
+        null,
+        null,
+      ],
+      [huck, mojoe],
+    );
+    expect(slots.map((seat) => seat?.player ?? null)).toEqual([
+      null,
+      null,
+      "MoJoE",
+      null,
+      null,
+    ]);
+  });
+
+  it("shows each player's own heroes, including a second tank, until a tank locks", () => {
+    const roster = [
+      scout("Beachyman", [
+        ["Kerrigan", 40, 10],
+        ["Stitches", 20, 8],
+        ["Anub'arak", 12, 6],
+      ]),
+      scout("MoJoE", [
+        ["Malthael", 30, 8],
+        ["Muradin", 22, 8],
+        ["Samuro", 10, 6],
+      ]),
+    ];
+    const open = {
+      locked: false,
+      sl: 0.3,
+      comfort: 0.3,
+      games: 20,
+    };
+    const beach = seatSuggestionStack(
+      { ...open, player: "Beachyman", hero: "Kerrigan", role: "Flex" },
+      roster,
+      new Set(),
+    );
+    const mo = seatSuggestionStack(
+      { ...open, player: "MoJoE", hero: "Malthael", role: "Flex" },
+      roster,
+      new Set(),
+    );
+    expect(beach.map((row) => row.hero)).toEqual(
+      expect.arrayContaining(["Kerrigan", "Stitches"]),
+    );
+    expect(mo.map((row) => row.hero)).toContain("Muradin");
+    expect(beach.every((row) => row.why?.includes("Pick one for Beachyman"))).toBe(
+      true,
+    );
+    expect(beach.find((row) => row.hero === "Kerrigan")?.role).not.toBe("Tank");
+
+    const afterLock = seatSuggestionStack(
+      { ...open, player: "MoJoE", hero: "Malthael", role: "Flex" },
+      roster,
+      new Set(["Stitches"]),
+      3,
+      [],
+      ["Stitches"],
+    );
+    const malthael = afterLock.findIndex((row) => row.hero === "Malthael");
+    const muradin = afterLock.findIndex((row) => row.hero === "Muradin");
+    expect(malthael).toBeGreaterThanOrEqual(0);
+    expect(malthael).toBeLessThan(muradin === -1 ? 99 : muradin);
   });
 });

@@ -46,7 +46,7 @@ Open [http://localhost:3000](http://localhost:3000) in Chrome/Edge (not the Curs
 
 ### Auto-start on PC boot
 
-Docker Desktop starts at login. The app and Cloudflare tunnel both use `restart: unless-stopped`.
+Docker Desktop starts at login. The app and Cloudflare tunnel both use `restart: always`, so they come up when Docker starts.
 
 - Local: [http://localhost:3000](http://localhost:3000)
 - Public: [https://ngs-scouting.jstaff.trade](https://ngs-scouting.jstaff.trade) (Cloudflare Access Google sign-in)

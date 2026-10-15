@@ -8,6 +8,7 @@ import {
   DRAFT_SLOT_NAMES,
   DRAFT_STATUS_BOX,
   DRAFT_TITLE_BOX,
+  DRAFT_TURN_BOX,
   SLOT_LINE_STRIDE,
   NAMEPLATE_CELL_WIDTH,
   bansFromHexFaces,
@@ -23,15 +24,20 @@ import {
   portraitTeamRim,
   readsBySlot,
   firstPickFromBanBoard,
+  resolveFirstPick,
+  pickCountsFit,
   inferFirstPick,
   progressFromObserved,
   reorderOurPicksForDraftZip,
+  fitObservedPickOrder,
   sideFromStatus,
+  banFrameKeepsLockedPicks,
   NO_BAN,
   UNSEEN_BAN,
   type DraftBox,
 } from "@/lib/lobby/screenLobby";
-import { readThreeBanHexSlots } from "@/lib/lobby/banFace";
+import { readThreeBanHexSlots, setBanHexMapContext } from "@/lib/lobby/banFace";
+import { heroKey } from "@/lib/scoring/heroMeta";
 import { DRAFT_ORDER } from "@/lib/scoring/draftPlan";
 import { nextStepSuggestion } from "@/lib/scoring/pickPairs";
 import { decodePng, encodePng, type RgbaImage } from "@/lib/lobby/pngImage";
@@ -164,9 +170,12 @@ async function loadLobby(file: string) {
   const labels = await readNameColumns(
     pngBase64(scaledLabel(image, DRAFT_TITLE_BOX)),
     pngBase64(scaledLabel(image, DRAFT_STATUS_BOX)),
+    undefined,
+    pngBase64(scaledLabel(image, DRAFT_TURN_BOX)),
   );
   const titleText = labels.left.map((line) => line.text).join(" ");
   const statusText = labels.right.map((line) => line.text).join(" ");
+  const centerText = labels.center.map((line) => line.text).join(" ");
   const leftReads = readsBySlot(plates.left);
   const rightReads = readsBySlot(plates.right);
   const locks = (reads: SlotRead[], faces: boolean[]) =>
@@ -175,8 +184,10 @@ async function loadLobby(file: string) {
     );
   const leftFaces = DRAFT_PLATE_SLOTS.left.map((box) => portraitFilled(boxRgb(image, box)));
   const rightFaces = DRAFT_PLATE_SLOTS.right.map((box) => portraitFilled(boxRgb(image, box)));
-  const phase = bannerTurn(statusText).phase;
-  const turn = sideFromStatus(statusText);
+  const bannerText = `${titleText}\n${statusText}`;
+  let phase = bannerTurn(bannerText).phase;
+  const keepCommitted = banFrameKeepsLockedPicks(`${bannerText}\n${centerText}`);
+  const turn = sideFromStatus(bannerText);
   const pixelAt = (x: number, y: number) => {
     const [r, g, b] = sample(image, x, y);
     return { r, g, b };
@@ -191,14 +202,14 @@ async function loadLobby(file: string) {
       const read = reads[slot];
       const nameBox = nameSlots[slot];
       if (!read?.hero || !nameBox) return [];
-      if (!ally) return [{ hero: read.hero, player: read.player, slot }];
-      const plate = plateFill(boxRgb(image, nameBox), true);
+      const plate = plateFill(boxRgb(image, nameBox), ally);
       if (
         !portraitIsLocked({
           phase,
+          keepCommitted,
           faceFilled: portraitFilled(boxRgb(image, box)),
           plate,
-          ally: true,
+          ally,
           heroOnPlate: true,
         })
       ) {
@@ -218,6 +229,7 @@ async function loadLobby(file: string) {
       const plate = nameBox ? plateFill(boxRgb(image, nameBox), ally) : undefined;
       return portraitIsLocked({
         phase,
+        keepCommitted,
         faceFilled: portraitFilled(boxRgb(image, box)),
         plate,
         ally,
@@ -239,29 +251,51 @@ async function loadLobby(file: string) {
     rightReads,
     seatLocked(false, DRAFT_PLATE_SLOTS.right, DRAFT_SLOT_NAMES.right, rightReads),
   );
+  if (!phase && ourPicks.length + theirPicks.length > 0) {
+    phase = "pick";
+  }
+  const map = mapFromTitle(titleText);
+  setBanHexMapContext(map);
   const leftBanRead = readBanSide(image, "left");
   const rightBanRead = readBanSide(image, "right");
+  setBanHexMapContext(null);
   const ourBans = leftBanRead.chronological;
   const theirBans = rightBanRead.chronological;
-  const map = mapFromTitle(titleText);
   let firstPick =
-    firstPickFromBanBoard(ourBans, theirBans) ??
+    (phase === "pick" && ourPicks.length + theirPicks.length === 0
+      ? null
+      : firstPickFromBanBoard(ourBans, theirBans, { phase })) ??
     firstBanSideFromStatus(statusText) ??
     null;
-  if (
-    firstPick === "them" &&
-    theirPicks.length === 0 &&
-    (ourPicks.length > 0 || leftReads.some((read) => read.hero))
-  ) {
-    firstPick = "us";
-  }
+  const weFirstGuess =
+    firstPick === "us" || firstPick === "them"
+      ? firstPick === "us"
+      : firstPickFromBanBoard(ourBans, theirBans) === "us";
+  const fitted = fitObservedPickOrder(
+    {
+      weFirst: weFirstGuess,
+      firstPick,
+      phase,
+      map,
+      ourBans,
+      theirBans,
+      ourPicks: ourPicks.map((pick) => pick.hero),
+      theirPicks: theirPicks.map((pick) => pick.hero),
+      ourPickPlayers: ourPicks.map((pick) => pick.player),
+      theirPickPlayers: theirPicks.map((pick) => pick.player),
+    },
+    {
+      our: ourPicks.map((pick) => pick.slot),
+      their: theirPicks.map((pick) => pick.slot),
+    },
+  );
   const ourZip = reorderOurPicksForDraftZip(
-    ourPicks.map((pick) => pick.hero),
-    ourPicks.map((pick) => pick.player),
+    fitted.ourPicks,
+    fitted.ourPickPlayers,
   );
   const theirZip = {
-    heroes: theirPicks.map((pick) => pick.hero),
-    players: theirPicks.map((pick) => pick.player),
+    heroes: fitted.theirPicks,
+    players: fitted.theirPickPlayers,
   };
   const inferredFirst = inferFirstPick({
     ourPicks: ourZip.heroes.length,
@@ -272,6 +306,18 @@ async function loadLobby(file: string) {
   if (inferredFirst) {
     firstPick = inferredFirst;
   }
+  firstPick =
+    resolveFirstPick({
+      firstPick,
+      ourBans,
+      theirBans,
+      ourPicks: ourZip.heroes,
+      theirPicks: theirZip.heroes,
+      phase,
+      turn: turn && phase ? { side: turn, kind: phase } : null,
+      ourPickSlots: ourPicks.map((pick) => pick.slot),
+      theirPickSlots: theirPicks.map((pick) => pick.slot),
+    }) ?? firstPick;
   const progress =
     firstPick == null
       ? null
@@ -295,7 +341,7 @@ async function loadLobby(file: string) {
     statusText,
     turn: sideFromStatus(statusText),
     banTurn: firstBanSideFromStatus(statusText),
-    phase: bannerTurn(statusText).phase,
+    phase: bannerTurn(bannerText).phase,
     leftBans: leftBanRead.filled,
     rightBans: rightBanRead.filled,
     leftBanHeroes: leftBanRead.slotHeroes,
@@ -308,7 +354,13 @@ async function loadLobby(file: string) {
     rightLocks: locks(rightReads, rightFaces),
     firstPick,
     ourPicks,
-    theirPicks,
+    theirPicks: theirZip.heroes.map((hero, index) => ({
+      hero,
+      player: theirZip.players[index] ?? null,
+      slot:
+        theirPicks.find((pick) => heroKey(pick.hero) === heroKey(hero))?.slot ??
+        index,
+    })),
     order: progress?.actions ?? [],
     next: progress?.next ?? null,
     ourOpen,
@@ -511,6 +563,47 @@ describe("draft lobby screenshots", () => {
   );
 
   it(
+    "loads Alterac Pass second ban with our first-pick locks",
+    async () => {
+      const draft = await loadLobby(path.join(DRAFTS, "alterac 1.png"));
+      expect(draft.map).toBe("Alterac Pass");
+      expect(draft.phase).toBe("ban");
+      expect(draft.turn).toBe("their");
+      expect(draft.firstPick).toBe("us");
+      expect(draft.leftBanHeroes).toEqual(["Zeratul", "Johanna", null]);
+      expect(draft.rightBanHeroes).toEqual(["Falstad", "Xal'atath", null]);
+      expect(draft.ourPicks.map((pick) => pick.hero)).toEqual([
+        "Qhira",
+        "Rehgar",
+        "Tyrael",
+      ]);
+      expect(draft.theirPicks.map((pick) => pick.hero)).toEqual(["Genji", "Hogger"]);
+      expect(draft.ourPicks.map((pick) => folded(pick.player))).toEqual([
+        ocrFold("Huckit"),
+        ocrFold("Wiimote"),
+        ocrFold("Saffiel"),
+      ]);
+      expect(draft.theirPicks.map((pick) => folded(pick.player))).toEqual([
+        ocrFold("XalaThot"),
+        ocrFold("Diesel17"),
+      ]);
+      expect(draft.next).toEqual({ side: "their", kind: "ban" });
+      expect(listed(draft.order)).toEqual([
+        ["our", "ban", "Zeratul", ""],
+        ["their", "ban", "Falstad", ""],
+        ["our", "ban", "Johanna", ""],
+        ["their", "ban", "Xal'atath", ""],
+        ["our", "pick", "Qhira", ocrFold("Huckit")],
+        ["their", "pick", "Genji", ocrFold("XalaThot")],
+        ["their", "pick", "Hogger", ocrFold("Diesel17")],
+        ["our", "pick", "Rehgar", ocrFold("Wiimote")],
+        ["our", "pick", "Tyrael", ocrFold("Saffiel")],
+      ]);
+    },
+    180_000,
+  );
+
+  it(
     "loads Alterac Pass late draft with full ban order and hover-safe locks",
     async () => {
       const draft = await loadLobby(
@@ -592,14 +685,14 @@ describe("draft lobby screenshots", () => {
       expect(draft.phase).toBe("pick");
       expect(draft.firstPick).toBe("us");
       expect(draft.leftBanHeroes).toEqual(["Qhira", null, null]);
-      expect(draft.rightBanHeroes).toEqual(["Anub'arak", "Chromie", null]);
+      expect(draft.rightBanHeroes).toEqual(["Maiev", "Chromie", null]);
       expect(draft.ourPicks).toEqual([]);
       expect(draft.theirPicks).toEqual([]);
       expect(draft.leftReads[0]?.hero).toBe("Johanna");
       expect(folded(draft.leftReads[0]?.player ?? null)).toBe(ocrFold("Bunny"));
       expect(listed(draft.order)).toEqual([
         ["our", "ban", "Qhira", ""],
-        ["their", "ban", "Anub'arak", ""],
+        ["their", "ban", "Maiev", ""],
         ["our", "ban", UNSEEN_BAN, ""],
         ["their", "ban", "Chromie", ""],
       ]);
@@ -614,8 +707,8 @@ describe("draft lobby screenshots", () => {
       const draft = await loadLobby(path.join(DRAFTS, "braxis 2.png"));
       expect(draft.map).toBe("Braxis Holdout");
       expect(draft.firstPick).toBe("us");
-      expect(draft.leftBanHeroes).toEqual(["Cassia", "Chen", "Sylvanas"]);
-      expect(draft.rightBanHeroes).toEqual(["Anub'arak", "Chromie", "Tyrande"]);
+      expect(draft.leftBanHeroes).toEqual(["Qhira", "Chen", "Xal'atath"]);
+      expect(draft.rightBanHeroes).toEqual(["Maiev", "Chromie", "Yrel"]);
       expect(draft.ourPicks.map((pick) => pick.hero)).toEqual([
         "Johanna",
         "Rexxar",
@@ -631,8 +724,8 @@ describe("draft lobby screenshots", () => {
         "Zul'jin",
       ]);
       expect(listed(draft.order)).toEqual([
-        ["our", "ban", "Cassia", ""],
-        ["their", "ban", "Anub'arak", ""],
+        ["our", "ban", "Qhira", ""],
+        ["their", "ban", "Maiev", ""],
         ["our", "ban", "Chen", ""],
         ["their", "ban", "Chromie", ""],
         ["our", "pick", "Johanna", ocrFold("Bunny")],
@@ -640,8 +733,8 @@ describe("draft lobby screenshots", () => {
         ["their", "pick", "Lt. Morales", ocrFold("Prolith")],
         ["our", "pick", "Rexxar", ocrFold("CEOMEGALUL")],
         ["our", "pick", "Tychus", ocrFold("DeadEyeDan")],
-        ["their", "ban", "Tyrande", ""],
-        ["our", "ban", "Sylvanas", ""],
+        ["their", "ban", "Yrel", ""],
+        ["our", "ban", "Xal'atath", ""],
         ["their", "pick", "Artanis", ocrFold("Rantore")],
         ["their", "pick", "Diablo", ocrFold("eklml3laco")],
         ["our", "pick", "Junkrat", ocrFold("dlrtyymlke")],
@@ -658,6 +751,7 @@ describe("draft lobby screenshots", () => {
     async () => {
       const draft = await loadLobby(path.join(DRAFTS, "battlefield 2.png"));
       expect(draft.map).toBe("Battlefield of Eternity");
+      expect(draft.firstPick).toBe("them");
       expect(draft.leftBanHeroes).toEqual([NO_BAN, "Xal'atath", NO_BAN]);
       expect(draft.rightBanHeroes).toEqual(["Qhira", NO_BAN, "Johanna"]);
       expect(draft.ourPicks.map((pick) => pick.hero)).toEqual([
@@ -684,23 +778,145 @@ describe("draft lobby screenshots", () => {
         ocrFold("DrDoomYo"),
         ocrFold("mFreePoints"),
       ]);
-      expect(draft.firstPick).toBe("us");
-      expect(draft.next).toEqual({ side: "our", kind: "pick" });
+      expect(draft.next?.kind).toBe("pick");
+      expect(draft.order.length).toBeGreaterThanOrEqual(10);
+      expect(nextStepSuggestion(DRAFT_ORDER, draft.order.length)).toEqual({
+        side: "fp",
+        kind: "pick",
+        picks: 1,
+        last: true,
+      });
+    },
+    180_000,
+  );
+
+  it(
+    "loads Battlefield of Eternity mid-pick with six bans and five locks",
+    async () => {
+      const draft = await loadLobby(path.join(DRAFTS, "battlefield 3.png"));
+      expect(draft.map).toBe("Battlefield of Eternity");
+      expect(draft.leftBanHeroes).toEqual(["Qhira", "Johanna", "Falstad"]);
+      expect(draft.rightBanHeroes).toEqual(["Xal'atath", "Abathur", "Artanis"]);
+      expect(draft.ourPicks.map((pick) => pick.hero).sort()).toEqual([
+        "Raynor",
+        "Whitemane",
+      ]);
+      expect(draft.theirPicks.map((pick) => pick.hero).sort()).toEqual([
+        "Brightwing",
+        "Kael'thas",
+        "Mal'Ganis",
+      ]);
+      // Pick chronology needs live announcements — a still only proves who locked.
+      expect(draft.firstPick).toBe("them");
+    },
+    180_000,
+  );
+
+  it(
+    "loads Haunted Mines blue ban with ally locks ignored and ban order intact",
+    async () => {
+      const draft = await loadLobby(path.join(DRAFTS, "haunted mines 1.png"));
+      expect(draft.map).toBe("Haunted Mines");
+      expect(draft.phase).toBe("ban");
+      expect(draft.firstPick).toBe("them");
+      expect(draft.next).toEqual({ side: "their", kind: "pick" });
+      expect(draft.leftBanHeroes[0]).toBe("Qhira");
+      expect(draft.leftBanHeroes[1]).toBe("Falstad");
+      expect(draft.leftBanHeroes[2]).toBeNull();
+      expect(draft.rightBanHeroes[0]).toBe("Xal'atath");
+      expect(draft.rightBanHeroes[1]).toBe("Kel'Thuzad");
+      expect(draft.rightBanHeroes[2]).toBeNull();
+      expect(draft.ourPicks).toEqual([]);
+      expect(draft.theirPicks).toEqual([]);
+      expect(draft.leftReads.map((read) => read.hero)).toEqual([
+        "Sylvanas",
+        "Alarak",
+        "Brightwing",
+        "Varian",
+        "Thrall",
+      ]);
+      expect(draft.leftFaces.filter(Boolean).length).toBeGreaterThanOrEqual(4);
+      expect(listed(draft.order).slice(0, 4)).toEqual([
+        ["their", "ban", "Xal'atath", ""],
+        ["our", "ban", "Qhira", ""],
+        ["their", "ban", "Kel'Thuzad", ""],
+        ["our", "ban", "Falstad", ""],
+      ]);
+    },
+    180_000,
+  );
+
+  it(
+    "loads Cursed Hollow with our ban hexes and ban order",
+    async () => {
+      const draft = await loadLobby(path.join(DRAFTS, "cursed hollow.png"));
+      expect(draft.map).toBe("Cursed Hollow");
+      expect(draft.leftBanHeroes).toEqual(["Johanna", "Anduin", "Dehaka"]);
+      expect(draft.rightBanHeroes).toEqual(["Qhira", "Xal'atath", "Stitches"]);
+      expect(draft.ourPicks.length).toBe(4);
+      expect(draft.theirPicks.length).toBe(3);
+      expect(pickCountsFit(false, draft.ourPicks.length, draft.theirPicks.length)).toBe(
+        true,
+      );
+      expect(pickCountsFit(true, draft.ourPicks.length, draft.theirPicks.length)).toBe(
+        false,
+      );
+      expect(draft.firstPick).toBe("them");
+      expect(draft.ourPicks.map((pick) => pick.hero)).toEqual([
+        "Rehgar",
+        "Alarak",
+        "Tyrael",
+        "Sylvanas",
+      ]);
+      expect(draft.theirPicks.map((pick) => pick.hero)).toEqual([
+        "Greymane",
+        "Brightwing",
+        "Falstad",
+      ]);
+    },
+    180_000,
+  );
+
+  it(
+    "loads Haunted Mines enemy fifth pick with bans and locked picks",
+    async () => {
+      const draft = await loadLobby(path.join(DRAFTS, "haunted mines 2.png"));
+      expect(draft.map).toBe("Haunted Mines");
+      expect(draft.turn).toBe("their");
+      expect(draft.firstPick).toBe("them");
+      expect(draft.next).toEqual({ side: "their", kind: "pick" });
+      expect(draft.leftBanHeroes).toEqual(["Garrosh", "Qhira", "Anduin"]);
+      expect(draft.rightBanHeroes).toEqual(["Xal'atath", "Abathur", "Ragnaros"]);
+      expect(draft.ourPicks.map((pick) => pick.hero)).toEqual([
+        "Johanna",
+        "Hanzo",
+        "Tyrande",
+        "Thrall",
+      ]);
+      expect(draft.theirPicks.map((pick) => pick.hero)).toEqual([
+        "Stitches",
+        "Kharazim",
+        "Tracer",
+        "Valeera",
+      ]);
+      expect(draft.leftReads[2]?.hero).toBeNull();
+      expect(folded(draft.ourOpen[0])).toBe(ocrFold("DivineAlign"));
+      expect(folded(draft.theirOpen[0])).toBe(ocrFold("RoyalVizier"));
       expect(listed(draft.order)).toEqual([
-        ["our", "ban", NO_BAN, ""],
-        ["their", "ban", "Qhira", ""],
-        ["our", "ban", "Xal'atath", ""],
-        ["their", "ban", NO_BAN, ""],
-        ["our", "pick", "Whitemane", ocrFold("Huckit")],
-        ["their", "pick", "Chen", ocrFold("barberousse")],
-        ["their", "pick", "Greymane", ocrFold("Miclen")],
-        ["our", "pick", "Falstad", ocrFold("LiuMei")],
-        ["our", "pick", "Lunara", ocrFold("Lochen")],
-        ["their", "ban", "Johanna", ""],
-        ["our", "ban", NO_BAN, ""],
-        ["their", "pick", "Diablo", ocrFold("DrDoomYo")],
-        ["their", "pick", "Alarak", ocrFold("mFreePoints")],
-        ["our", "pick", "Tyrael", ocrFold("Kalel")],
+        ["their", "ban", "Xal'atath", ""],
+        ["our", "ban", "Garrosh", ""],
+        ["their", "ban", "Abathur", ""],
+        ["our", "ban", "Qhira", ""],
+        ["their", "pick", "Stitches", ocrFold("VickAgain")],
+        ["our", "pick", "Johanna", ocrFold("SportySpice")],
+        ["our", "pick", "Hanzo", ocrFold("Slumpinator")],
+        ["their", "pick", "Kharazim", ocrFold("BenDoverman")],
+        ["their", "pick", "Tracer", ocrFold("Viccuri")],
+        ["our", "ban", "Anduin", ""],
+        ["their", "ban", "Ragnaros", ""],
+        ["our", "pick", "Tyrande", ocrFold("CruelAlloy")],
+        ["our", "pick", "Thrall", ocrFold("Huckit")],
+        ["their", "pick", "Valeera", ocrFold("EKevin")],
       ]);
       expect(nextStepSuggestion(DRAFT_ORDER, draft.order.length)).toEqual({
         side: "fp",
