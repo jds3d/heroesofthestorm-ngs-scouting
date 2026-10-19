@@ -15,6 +15,11 @@ export const UNFILLABLE_ROLE_PENALTY = 45;
 /** Listed as bruisers but routinely played as the solo tank. */
 const FLEX_TANKS = new Set(["varian", "artanis", "dva", "d.va", "chen"]);
 
+/** A real tank, not a bruiser who can cover the role. */
+export function isMainTank(hero: string): boolean {
+  return heroFillsRole(hero, "tank") && !FLEX_TANKS.has(hero.toLowerCase());
+}
+
 export function heroFillsRole(hero: string, role: RequiredRole): boolean {
   switch (role) {
     case "tank":

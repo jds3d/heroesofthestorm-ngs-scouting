@@ -46,5 +46,8 @@ next-env.d.ts
 # watched drafts
 /drafts/
 
+# agent build hook flag
+.cursor/needs-build
+
 # Cloudflare tunnel credentials (never commit)
 cloudflared/credentials.json

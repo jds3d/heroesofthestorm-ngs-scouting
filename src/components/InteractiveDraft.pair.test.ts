@@ -12,8 +12,10 @@ import {
   buildPlayerComfort,
   heroUnplayedBy,
   pairHasDistinctOwners,
+  playerWithoutHistory,
   UNPLAYED_PICK_PENALTY,
 } from "@/lib/scoring/comfort";
+import type { PlayerScout } from "@/lib/scoring/types";
 import {
   buildPickScorecard,
   formatScoreGapSentence,
@@ -461,6 +463,107 @@ describe("unplayed picks", () => {
     expect(factor?.detail).toContain("Nobody on this five has Azmodan");
     expect(pick.total).toBe(played.total + UNPLAYED_PICK_PENALTY);
     expect(ban.factors.some((f) => f.id === "unplayed")).toBe(false);
+  });
+
+  it("does not score comfort when the seated player has no history", () => {
+    const known = {
+      battletag: "A#1",
+      topHeroes: [
+        {
+          hero: "Anub'arak",
+          comfort: 0.4,
+          playPct: 0,
+          winRate: 0,
+          games: 10,
+          sources: {},
+        },
+      ],
+    } as PlayerScout;
+    const unknown = buildPickScorecard({
+      ...args,
+      hero: "E.T.C.",
+      kind: "pick",
+      comfort: 0,
+      comfortWho: "C10vurhd1",
+      teamRoster: [playerWithoutHistory("C10vurhd1"), known],
+    });
+    expect(unknown.factors.some((f) => f.id === "comfort")).toBe(false);
+    expect(unknown.factors.some((f) => f.id === "below-bar")).toBe(false);
+
+    const doesNotPlay = buildPickScorecard({
+      ...args,
+      hero: "E.T.C.",
+      kind: "pick",
+      comfort: 0,
+      comfortWho: "A",
+      teamRoster: [known],
+    });
+    expect(doesNotPlay.factors.some((f) => f.id === "comfort")).toBe(true);
+    expect(doesNotPlay.factors.some((f) => f.id === "below-bar")).toBe(true);
+  });
+
+  it("names their comfort on a suggested ban", () => {
+    const tenshi = {
+      battletag: "Tenshi#1",
+      topHeroes: [
+        {
+          hero: "Johanna",
+          comfort: 0.42,
+          playPct: 0.2,
+          winRate: 0.55,
+          games: 80,
+          sources: {
+            stormLeague: { games: 80, wins: 44, losses: 36, winRate: 0.55, playPct: 0.2 },
+          },
+        },
+      ],
+    } as PlayerScout;
+    const ban = buildPickScorecard({
+      ...args,
+      hero: "Johanna",
+      kind: "ban",
+      comfort: 0.42,
+      comfortWho: "Tenshi",
+      comfortLabel: "Their comfort",
+      teamRoster: [tenshi],
+    });
+    const comfort = ban.factors.find((factor) => factor.id === "comfort");
+    expect(comfort?.label).toBe("Their comfort");
+    expect(comfort?.points).toBeGreaterThan(0);
+    expect(comfort?.detail).toContain("Tenshi");
+  });
+
+  it("leaves comfort and swap points out when comfort is ignored", () => {
+    const scored = buildPickScorecard({
+      ...args,
+      hero: "Johanna",
+      kind: "pick",
+      comfort: 0.8,
+      comfortWho: "Tenshi",
+      swapDelta: 0.2,
+      swapNote: "moved a seat",
+    });
+    const ignored = buildPickScorecard({
+      ...args,
+      hero: "Johanna",
+      kind: "pick",
+      comfort: 0.8,
+      comfortWho: "Tenshi",
+      swapDelta: 0.2,
+      swapNote: "moved a seat",
+      ignoreComfort: true,
+    });
+    expect(scored.factors.some((factor) => factor.id === "comfort")).toBe(true);
+    expect(scored.factors.some((factor) => factor.id === "swap")).toBe(true);
+    expect(
+      ignored.factors.some((factor) =>
+        factor.id === "comfort" || factor.id === "swap" || factor.id === "below-bar",
+      ),
+    ).toBe(false);
+    const dropped = scored.factors
+      .filter((factor) => factor.id === "comfort" || factor.id === "swap")
+      .reduce((sum, factor) => sum + factor.points, 0);
+    expect(ignored.total).toBe(scored.total - dropped);
   });
 
   it("knows when a roster has never logged a hero", () => {

@@ -18,10 +18,12 @@ import {
   pivotPlanSlots,
 } from "@/config/divePlaybook";
 import { healDenyGuideFor } from "@/config/healDenyPlaybook";
+import { laneAssignment, teamfightStrategy } from "@/lib/scoring/draftPlan";
 import { applyMapToDraftPlan } from "@/lib/scoring/applyMap";
 import {
   favouredLabel,
   gradeFinishedDraft,
+  scoreFive,
   mmrAdjustedWinPct,
   percentileToGrade,
   stepPct,
@@ -31,7 +33,7 @@ import {
 import { heroKey } from "@/lib/scoring/heroMeta";
 import { DRAFT_ORDER, solveSeatAssignments } from "@/lib/scoring/draftPlan";
 import { assignUniqueOwners, displacedComfort, nextSeatLabels, playersSeatedOnLocks } from "@/lib/scoring/draftSwap";
-import { slHeroSuggestions } from "@/lib/scoring/comfort";
+import { playerWithoutHistory, slHeroSuggestions } from "@/lib/scoring/comfort";
 import type { PlayerScout } from "@/lib/scoring/types";
 import { pairDuoSynergy, pairRoleCheck } from "@/lib/scoring/pickPairs";
 import {
@@ -104,6 +106,65 @@ describe("leave-dive / Falstad", () => {
   it("chooseDivePivot tips poke when Brightwing + Tyrael", () => {
     const { pivot } = chooseDivePivot(["Brightwing", "Tyrael"]);
     expect(["poke", "blowup", "global"]).toContain(pivot.id);
+  });
+});
+
+describe("teamfight strategy", () => {
+  it("orders the tank engage, then the dive, and does not coach the healer", () => {
+    const line = teamfightStrategy(
+      ["Anduin", "Qhira", "Johanna", "Sonya", "Valla"],
+      ["Jaina", "Muradin", "Rehgar", "Thrall", "Raynor"],
+    );
+    expect(line).toContain("Johanna starts with Condemn onto Jaina");
+    expect(line).toContain("Qhira, then Sonya, then Valla, then Anduin follow");
+    expect(line).toContain("Do not send Qhira in before Johanna lands");
+    expect(line).not.toMatch(/Bloodlust|Lightning Shield|you took/i);
+  });
+
+  it("starts a hook tank before the follow-up assassin", () => {
+    const line = teamfightStrategy(["Kerrigan", "Stitches", "Anduin"], ["Valla"]);
+    expect(line?.startsWith("Stitches starts with Hook or Gorge onto Valla")).toBe(true);
+    expect(line).toContain("Kerrigan, then Anduin follow");
+  });
+});
+
+describe("lane assignment", () => {
+  const braxisUs = ["Hogger", "Kel'Thuzad", "Johanna", "Li Li", "Valla"];
+  const braxisThem = ["Li-Ming", "Muradin", "Chen", "Alexstrasza", "Fenix"];
+
+  it("matches a 1-4 on Braxis and keeps the tank with the four", () => {
+    const line = laneAssignment({
+      map: "Braxis Holdout",
+      ourHeroes: braxisUs,
+      theirHeroes: braxisThem,
+    });
+    expect(line).toContain("1-4 with Chen in the solo lane");
+    expect(line).toContain("Hogger takes that lane");
+    expect(line).toContain("Johanna, Kel'Thuzad, Valla, and Li Li are the four");
+    expect(line).toContain("Two heroes living in Chen's lane lose the objective");
+    expect(line).not.toContain("Johanna and Kel'Thuzad");
+  });
+
+  it("double-soaks a three-lane map instead of parking two heroes on their solo", () => {
+    const line = laneAssignment({
+      map: "Cursed Hollow",
+      ourHeroes: ["Xul", "Johanna", "Jaina", "Anduin", "Valla"],
+      theirHeroes: ["Chen", "Muradin", "Li-Ming", "Rehgar", "Raynor"],
+    });
+    expect(line).toContain("Xul double-soaks");
+    expect(line).toContain("A second hero in Chen's lane");
+  });
+
+  it("splits Dragon Shire across the two shrines and keeps the tank in mid", () => {
+    const line = laneAssignment({
+      map: "Dragon Shire",
+      ourHeroes: braxisUs,
+      theirHeroes: braxisThem,
+    });
+    expect(line).toContain("1-1-3");
+    expect(line).toContain("Hogger holds one shrine");
+    expect(line).toContain("Valla holds the other");
+    expect(line).toContain("Johanna does not sit on a shrine");
   });
 });
 
@@ -199,7 +260,7 @@ describe("draftGrade", () => {
     theirLabel: "TG",
   };
 
-  it("grades each side on the average percentile of its steps", () => {
+  it("keeps step totals and grades the finished five against the best five", () => {
     const card = gradeFinishedDraft({
       ...base,
       steps: [
@@ -210,37 +271,89 @@ describe("draftGrade", () => {
     });
     expect(card.ours.points).toBe(85);
     expect(card.ours.bestPoints).toBe(135);
-    expect(card.ours.percentile).toBe(83);
-    expect(card.ours.grade).toBe("B");
+    // Their five already covers every role, so nothing left beats it when
+    // synergy and matchups are unknown. Ours is missing a healer.
+    expect(card.theirs.percentile).toBe(100);
     expect(card.theirs.grade).toBe("A+");
+    expect(card.ours.percentile).toBeLessThan(60);
+    expect(card.ours.grade).toBe("F");
     expect(card.ours.notes[0]).toBe("Every step ranked C or better against the options open.");
+    expect(card.ours.notes.join(" ")).toContain("Best available vs the enemy comp");
   });
 
-  it("counts a perfect ban as a quarter of a perfect pick", () => {
-    const picks = gradeFinishedDraft({
-      ...base,
-      steps: [step("our", 10, 10, 40), step("our", 10, 10, 40)],
-    });
-    const withBan = gradeFinishedDraft({
-      ...base,
-      steps: [
-        step("our", 10, 10, 40),
-        step("our", 10, 10, 40),
-        {
-          side: "our",
-          kind: "ban",
-          label: "Ban 1",
-          locked: "Genji",
-          bestLabel: "Genji",
-          best: 10,
-          achieved: 10,
-          percentile: 100,
+  it("counts a ban as a quarter of a pick in the step totals", () => {
+    const picks = sumStepPoints([step("our", 10, 10, 40), step("our", 10, 10, 40)]);
+    const withBan = sumStepPoints([
+      step("our", 10, 10, 40),
+      step("our", 10, 10, 40),
+      {
+        side: "our",
+        kind: "ban",
+        label: "Ban 1",
+        locked: "Genji",
+        bestLabel: "Genji",
+        best: 10,
+        achieved: 10,
+        percentile: 100,
+      },
+    ]);
+    expect(picks.points).toBe(20);
+    // 10 + 10 + 10 × 0.25, rounded
+    expect(withBan.points).toBe(23);
+  });
+
+  it("grades a low-comfort five below the roster's best five into the enemy comp", () => {
+    const player = (battletag: string, heroes: [string, number][]) => ({
+      battletag,
+      preferredRole: null,
+      topHeroes: heroes.map(([hero, comfort]) => ({
+        hero,
+        comfort,
+        playPct: 0,
+        winRate: 0,
+        games: 20,
+        sources: {
+          stormLeague: { games: 20, wins: 10, losses: 10, winRate: 0.5, playPct: 0.2 },
         },
-      ],
+      })),
+      ngsWins: 0,
+      ngsLosses: 0,
+      confidence: "high" as const,
+      heroesProfileUrl: "",
+      ngsProfileUrl: "",
+      returningFromPrior: false,
     });
-    expect(picks.ours.percentile).toBe(40);
-    // (40 + 40 + 100 × 0.25) / 2.25 = 46.6 → 47
-    expect(withBan.ours.percentile).toBe(47);
+    const card = gradeFinishedDraft({
+      ...base,
+      homeRoster: [
+        player("A#1", [["Johanna", 0.9], ["Garrosh", 0.05]]),
+        player("B#1", [["Anduin", 0.9], ["Li Li", 0.05]]),
+        player("C#1", [["Sonya", 0.8], ["Dehaka", 0.05]]),
+        player("D#1", [["Valla", 0.8], ["Raynor", 0.05]]),
+        player("E#1", [["Tychus", 0.7], ["Junkrat", 0.05]]),
+      ],
+      ourLocked: [
+        { hero: "Garrosh", player: "A" },
+        { hero: "Li Li", player: "B" },
+        { hero: "Dehaka", player: "C" },
+        { hero: "Raynor", player: "D" },
+        { hero: "Junkrat", player: "E" },
+      ],
+      theirLocked: [
+        { hero: "Anub'arak", player: null },
+        { hero: "Rehgar", player: null },
+        { hero: "Zagara", player: null },
+        { hero: "Illidan", player: null },
+        { hero: "Thrall", player: null },
+      ],
+      steps: [],
+    });
+    expect(card.ours.quality).toBeLessThan(card.ours.bestQuality);
+    expect(card.ours.percentile).toBeLessThan(80);
+    expect(card.ours.bestHeroes).toEqual(
+      expect.arrayContaining(["Johanna", "Anduin", "Sonya", "Valla", "Tychus"]),
+    );
+    expect(card.ours.notes.join(" ")).toContain("Johanna");
   });
 
   it("names the lowest-ranked step as the biggest miss", () => {
@@ -278,16 +391,92 @@ describe("draftGrade", () => {
     const full = gradeFinishedDraft({ ...base, homeRoster, steps: [] });
     expect(full.ours.notes.join(" ")).not.toContain("Unplayed");
 
+    const azmodanLock = [
+      ...ourLocked.slice(0, 4),
+      { hero: "Azmodan", player: "C" },
+    ];
     const withAzmodan = gradeFinishedDraft({
       ...base,
       homeRoster,
-      ourLocked: [...ourLocked.slice(0, 4), { hero: "Azmodan", player: "C" }],
+      ourLocked: azmodanLock,
       steps: [],
+      tournamentMode: true,
     });
     expect(withAzmodan.ours.notes[0]).toContain("Unplayed: Azmodan (C, unplayed)");
     expect(withAzmodan.ours.notes[0]).toContain("forced fill");
     expect(withAzmodan.ours.quality).toBeLessThan(full.ours.quality - 15);
     expect(withAzmodan.reasons.join(" ")).toContain("locked Azmodan");
+
+    const open = gradeFinishedDraft({
+      ...base,
+      homeRoster,
+      ourLocked: azmodanLock,
+      steps: [],
+    });
+    expect(open.ours.notes.join(" ")).not.toContain("Unplayed");
+    expect(open.reasons.join(" ")).not.toContain("strength lost");
+
+    const unknown = playerWithoutHistory("C10vurhd1");
+    const withUnknown = gradeFinishedDraft({
+      ...base,
+      homeRoster: [...homeRoster, unknown],
+      ourLocked: [
+        ...ourLocked.slice(0, 4),
+        { hero: "Azmodan", player: "C10vurhd1" },
+      ],
+      steps: [],
+      tournamentMode: true,
+    });
+    expect(withUnknown.ours.notes.join(" ")).not.toContain("Unplayed");
+    expect(withUnknown.reasons.join(" ")).not.toContain("strength lost");
+  });
+
+  it("omits comfort for a seated player with no history and does not treat that as zero", () => {
+    const known = {
+      battletag: "A#1",
+      preferredRole: null,
+      topHeroes: [
+        {
+          hero: "Anub'arak",
+          comfort: 0.4,
+          playPct: 0,
+          winRate: 0,
+          games: 20,
+          sources: {},
+        },
+      ],
+      ngsWins: 0,
+      ngsLosses: 0,
+      confidence: "high" as const,
+      heroesProfileUrl: "",
+      ngsProfileUrl: "",
+      returningFromPrior: false,
+    };
+    const roster = [known, playerWithoutHistory("C10vurhd1")];
+    const unknownSeat = scoreFive({
+      seats: [
+        { hero: "Anub'arak", player: "A" },
+        { hero: "E.T.C.", player: "C10vurhd1" },
+      ],
+      enemyHeroes: [],
+      roster,
+      table: null,
+      map: null,
+    });
+    const playedNone = scoreFive({
+      seats: [
+        { hero: "Anub'arak", player: "A" },
+        { hero: "E.T.C.", player: "A" },
+      ],
+      enemyHeroes: [],
+      roster: [known],
+      table: null,
+      map: null,
+    });
+    expect(unknownSeat.comfort.avg).toBeCloseTo(0.4);
+    expect(playedNone.comfort.avg).toBeCloseTo(0.2);
+    expect(unknownSeat.unplayed).toEqual([]);
+    expect(unknownSeat.quality).toBeGreaterThan(playedNone.quality);
   });
 
   it("never lets a lock beat its step's best, and counts Varian as the tank", () => {

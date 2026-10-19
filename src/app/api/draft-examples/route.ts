@@ -2,6 +2,7 @@ import { mkdir, readFile, readdir, writeFile } from "fs/promises";
 import path from "path";
 import { NextResponse } from "next/server";
 import { rowsFromBanHexExamples } from "@/lib/lobby/banHexCatalog";
+import { mismatchCaseSource, type FinalScreenConflict } from "@/lib/lobby/finalScreen";
 import { heroFromPlateText } from "@/lib/lobby/screenLobby";
 
 export const dynamic = "force-dynamic";
@@ -12,6 +13,8 @@ const BAN_HEX_DIR = path.join(process.cwd(), "examples", "ban-hexes");
 const BAN_HEX_MANIFEST = path.join(BAN_HEX_DIR, "manifest.json");
 const BAN_HEX_CATALOG = path.join(process.cwd(), "src", "lib", "lobby", "banHexCatalog.json");
 const FRAME_DIR = path.join(process.cwd(), "examples", "drafts");
+const MISMATCH_DIR = path.join(process.cwd(), "examples", "mismatches");
+const MISMATCH_TEST_DIR = path.join(process.cwd(), "src", "lib", "lobby", "mismatches");
 const MANIFEST = path.join(PORTRAIT_DIR, "manifest.json");
 const MAX_PER_HERO = 4;
 const MAX_FRAMES = 8;
@@ -83,6 +86,30 @@ export async function GET() {
   return NextResponse.json({ examples });
 }
 
+function heroList(value: unknown): string[] | null {
+  if (!Array.isArray(value) || value.length > 8) return null;
+  const heroes: string[] = [];
+  for (const hero of value) {
+    if (typeof hero !== "string" || hero.length > 40) return null;
+    heroes.push(hero);
+  }
+  return heroes;
+}
+
+function conflictFrom(value: unknown): FinalScreenConflict | null {
+  if (!value || typeof value !== "object") return null;
+  const row = value as { before?: { our?: unknown; their?: unknown }; screen?: { our?: unknown; their?: unknown } };
+  const beforeOur = heroList(row.before?.our);
+  const beforeTheir = heroList(row.before?.their);
+  const screenOur = heroList(row.screen?.our);
+  const screenTheir = heroList(row.screen?.their);
+  if (!beforeOur || !beforeTheir || !screenOur || !screenTheir) return null;
+  return {
+    before: { our: beforeOur, their: beforeTheir },
+    screen: { our: screenOur, their: screenTheir },
+  };
+}
+
 /** Save a labeled portrait, or one full draft frame, from the live watch. */
 export async function POST(request: Request) {
   const body = (await request.json()) as {
@@ -90,7 +117,31 @@ export async function POST(request: Request) {
     hero?: unknown;
     image?: unknown;
     source?: unknown;
+    conflict?: unknown;
   };
+  if (body.kind === "mismatch") {
+    const image = asBase64(body.image, 12_000_000);
+    const conflict = conflictFrom(body.conflict);
+    if (!image || !conflict) {
+      return NextResponse.json({ error: "Expected the loading screen and both comps" }, { status: 400 });
+    }
+    const bytes = Buffer.from(image, "base64");
+    if (bytes[0] !== 0x89 || bytes[1] !== 0x50) {
+      return NextResponse.json({ error: "Expected a png frame" }, { status: 400 });
+    }
+    const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z");
+    const imageName = `mismatch-${stamp}.png`;
+    const imagePath = `examples/mismatches/${imageName}`;
+    await mkdir(MISMATCH_DIR, { recursive: true });
+    await mkdir(MISMATCH_TEST_DIR, { recursive: true });
+    await writeFile(path.join(MISMATCH_DIR, imageName), bytes);
+    const testName = `mismatch-${stamp}.test.ts`;
+    await writeFile(
+      path.join(MISMATCH_TEST_DIR, testName),
+      mismatchCaseSource(imagePath, conflict),
+    );
+    return NextResponse.json({ ok: true, saved: true, image: imagePath, test: `src/lib/lobby/mismatches/${testName}` });
+  }
   if (body.kind === "ban-hex") {
     const hero = heroFromPlateText(typeof body.hero === "string" ? body.hero : "");
     const image = asBase64(body.image, 500_000);

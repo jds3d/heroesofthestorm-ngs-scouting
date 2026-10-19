@@ -72,7 +72,7 @@ const DRAFT_BAN_GOLDEN: {
   {
     file: "braxis 1.png",
     map: "Braxis Holdout",
-    left: ["Qhira", null, null],
+    left: ["Qhira", "Chen", null],
     right: ["Maiev", "Chromie", null],
   },
   {
@@ -246,6 +246,16 @@ describe("ban hex catalog", () => {
     );
     const xal = cropHex(image, DRAFT_BAN_HEXES.left[1]);
     expect(matchBanPixels(xal.pixels, xal.width, xal.height)).toBe("Xal'atath");
+  });
+
+  it("names Sky Temple 2 bans as Dehaka and Johanna on the left, Falstad and Xal'atath on the right", () => {
+    setBanHexMapContext("Sky Temple");
+    const image = decodePng(
+      readFileSync(path.join(process.cwd(), "examples", "drafts", "sky temple 2.png")),
+    );
+    expect(readDraftBanRow(image, "left")).toEqual(["Dehaka", "Johanna", null]);
+    expect(readDraftBanRow(image, "right")).toEqual(["Falstad", "Xal'atath", null]);
+    setBanHexMapContext(null);
   });
 
   it("names Hogger and Whitemane on Alterac with hex examples in the catalog", () => {

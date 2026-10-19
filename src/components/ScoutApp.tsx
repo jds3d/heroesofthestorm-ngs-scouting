@@ -1059,6 +1059,7 @@ export function ScoutApp() {
             watchOnly
             stormLeagueOnly
             planLoadingLabel={livePlanLoadingLabel}
+            poolTrack={slTrack}
             onSuggestionsGate={setSuggestionsGate}
             tournamentMode={tournamentDraft}
             onTournamentModeChange={setTournamentDraft}

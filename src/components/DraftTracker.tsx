@@ -82,6 +82,23 @@ function syncActivity(
   return null;
 }
 
+/** Why suggested bans are still blank. The list ranks heroes they play, so it waits on Storm League pools. */
+export function suggestedBanWaitLabel(rows: readonly SlTrackRow[]): string {
+  const theirs = rows.filter((row) => row.side === "them");
+  const pulling = theirs.filter((row) => row.status === "queued" || row.status === "pulling");
+  if (!theirs.length) {
+    return "Suggested bans. Their names are not in yet, so the Storm League lookups have not started. Each player is a separate Heroes Profile request, and the list ranks heroes they play, so it stays blank until a pool with games comes back.";
+  }
+  if (pulling.length) {
+    const names = pulling.slice(0, 4).map((row) => row.name);
+    const extra = pulling.length - names.length;
+    const who = extra > 0 ? `${names.join(", ")}, and ${extra} more` : names.join(", ");
+    return `Suggested bans for ${who}. Storm League games are loading from Heroes Profile, one request per player. The list ranks heroes they actually play, so it stays blank until the first pool with games comes back.`;
+  }
+  const who = theirs.map((row) => row.name).join(", ");
+  return `Suggested bans. Storm League lookups for ${who} finished without a pool of games, so there is nothing to rank heroes they play.`;
+}
+
 function statusLine(row: SlTrackRow): string {
   if (row.status === "queued") return "Waiting";
   if (row.status === "pulling") return "Pulling history";

@@ -2,7 +2,7 @@ import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import { heroKey } from "@/lib/scoring/heroMeta";
-import { DraftTracker } from "./DraftTracker";
+import { DraftTracker, suggestedBanWaitLabel } from "./DraftTracker";
 import {
   formatTimeLeft,
   scoutExpectedMs,
@@ -98,6 +98,24 @@ describe("time left", () => {
     expect(html).toContain("Storm League history still loading for HuckIt");
     expect(html).toContain("progressbar");
     expect(html).toContain('aria-valuenow="50"');
+  });
+
+  it("says which suggested bans are waiting and why the lookup is slow", () => {
+    expect(suggestedBanWaitLabel([])).toContain("Their names are not in yet");
+    expect(suggestedBanWaitLabel([])).toContain("separate Heroes Profile request");
+    const pulling = suggestedBanWaitLabel([
+      { name: "Blood", side: "them", status: "pulling", games: 0 },
+      { name: "Stux", side: "them", status: "pulling", games: 0 },
+      { name: "Huckit", side: "us", status: "found", games: 20 },
+    ]);
+    expect(pulling).toContain("Suggested bans for Blood, Stux");
+    expect(pulling).toContain("one request per player");
+    expect(pulling).not.toContain("Huckit");
+    expect(
+      suggestedBanWaitLabel([
+        { name: "Blood", side: "them", status: "miss", games: 0 },
+      ]),
+    ).toContain("finished without a pool of games");
   });
 
   it("drops the countdown once every Storm League lookup has settled", () => {

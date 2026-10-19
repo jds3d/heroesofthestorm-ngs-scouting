@@ -35,13 +35,27 @@ const WATCH_BOXES: readonly DraftBox[] = [
   DRAFT_TITLE_BOX,
   DRAFT_STATUS_BOX,
   PARTY_NAME_ROW,
-  DRAFT_CENTER_HASH_BOX,
+  // The center splash is not in this key. Its animation would wake a read
+  // every frame and hold the next plate behind that OCR. A lock changes a
+  // portrait or a nameplate, which are here. The splash is read afterwards.
   ...DRAFT_BAN_HEXES.left,
   ...DRAFT_BAN_HEXES.right,
   ...DRAFT_PLATE_SLOTS.left,
   ...DRAFT_PLATE_SLOTS.right,
   ...DRAFT_SLOT_NAMES.left,
   ...DRAFT_SLOT_NAMES.right,
+];
+
+/**
+ * Nameplates and portraits. The draft fingerprint includes both, so a lock
+ * still updates the board. OCR hashes the nameplates alone — a portrait glow
+ * must not send a column through the reader again.
+ */
+export const NAME_WATCH_BOXES: readonly DraftBox[] = [
+  ...DRAFT_SLOT_NAMES.left,
+  ...DRAFT_SLOT_NAMES.right,
+  ...DRAFT_PLATE_SLOTS.left,
+  ...DRAFT_PLATE_SLOTS.right,
 ];
 
 function fnv1aStep(hash: number, byte: number): number {
@@ -111,6 +125,14 @@ export function regionFingerprint(
   }
 }
 
+export function joinedRegionFingerprint(
+  ctx: CanvasRenderingContext2D,
+  frame: FrameLike,
+  boxes: readonly DraftBox[],
+): string {
+  return boxes.map((box) => regionFingerprint(ctx, frame, box)).join("|");
+}
+
 /** One key for every crop the watch pipeline can change draft state from. */
 export function draftWatchFingerprintKey(
   ctx: CanvasRenderingContext2D,
@@ -127,6 +149,59 @@ export function draftWatchFingerprintFromRgba(
 
 export function watchBoxesForTests(): readonly DraftBox[] {
   return WATCH_BOXES;
+}
+
+export type OcrFingerprints = {
+  title: string;
+  status: string;
+  /** Left nameplates only. Portrait glow is not part of this hash. */
+  namesLeft: string;
+  /** Right nameplates only. */
+  namesRight: string;
+  center: string;
+};
+
+/**
+ * Which text reads a new frame still needs.
+ * A column whose nameplates match the last read is reused. One side locking
+ * does not send the other column through OCR again.
+ */
+export function ocrRefreshPlan(
+  current: OcrFingerprints,
+  cached: OcrFingerprints | null,
+): { title: boolean; status: boolean; left: boolean; right: boolean; center: boolean } {
+  if (!cached) {
+    return { title: true, status: true, left: true, right: true, center: true };
+  }
+  return {
+    title: current.title !== cached.title,
+    status: current.status !== cached.status,
+    left: current.namesLeft !== cached.namesLeft,
+    right: current.namesRight !== cached.namesRight,
+    center: current.center !== cached.center,
+  };
+}
+
+/**
+ * Keep last lines for a column that was not sent to OCR.
+ * An empty picture comes back as an empty list, and that list must not wipe
+ * the column we skipped.
+ */
+export function mergeColumnReads<T>(
+  plan: { left: boolean; right: boolean; center: boolean },
+  fresh: { left?: T[]; right?: T[]; center?: T[] },
+  cached: { left: T[]; right: T[]; center: T[] } | null,
+): { left: T[]; right: T[]; center: T[] } {
+  return {
+    left: plan.left ? (fresh.left ?? []) : (cached?.left ?? []),
+    right: plan.right ? (fresh.right ?? []) : (cached?.right ?? []),
+    center: plan.center ? (fresh.center ?? []) : (cached?.center ?? []),
+  };
+}
+
+/** The queue row is not on the draft lobby. A draft frame reads the ten plates instead. */
+export function shouldReadPartyNames(phase: "draft" | "menu" | "wait"): boolean {
+  return phase !== "draft";
 }
 
 function cropRgb(

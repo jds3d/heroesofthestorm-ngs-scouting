@@ -11,6 +11,7 @@ import {
   firstPickFromObservedBoard,
   fitObservedPickOrder,
   isDraftSideKnown,
+  pickCountsFit,
   resolveFirstPick,
   pickingFlagsBySlot,
   resolveLiveTurn,
@@ -27,6 +28,7 @@ import {
   sideFromStatus,
   nextBanSide,
   banSideFromSplash,
+  acceptLockedPlates,
   acceptPlatePicks,
   banFrameKeepsLockedPicks,
   openingTeamBanCard,
@@ -51,6 +53,8 @@ import {
   menuScreenSeen,
   watchPhase,
   namesFromColumn,
+  draftFromPartyQueue,
+  isPartyMedalName,
   partyNamesFromText,
   nextTurn,
   opponentColumn,
@@ -286,6 +290,15 @@ describe("openSeatPlayers", () => {
       ),
     ).toEqual(["MoJoE"]);
   });
+
+  it("drops an OCR slip of a player who already locked", () => {
+    expect(
+      openSeatPlayers(
+        [{ player: "Hucklt" }, { player: "HuckIt" }, { player: "MoJoE" }],
+        [true, false, false],
+      ),
+    ).toEqual(["MoJoE"]);
+  });
 });
 
 describe("draft nameplates", () => {
@@ -356,6 +369,7 @@ describe("draft locks from the screen", () => {
     expect(playerFromSlotText("Li-Ming Thomas")).toBe("Thomas");
     expect(heroFromPlateText("MALGANS")).toBe("Mal'Ganis");
     expect(heroFromPlateText("MAL'GANS")).toBe("Mal'Ganis");
+    expect(heroFromPlateText("OHIRA")).toBe("Qhira");
     expect(heroFromPlateText("novawolf117")).toBeNull();
     expect(readSlotPlate(["VALLA", "novawolf117"])).toEqual({
       hero: "Valla",
@@ -440,6 +454,24 @@ describe("draft locks from the screen", () => {
         ally: false,
         heroOnPlate: true,
         plate: "locked",
+      }),
+    ).toBe(true);
+    expect(
+      portraitIsLocked({
+        phase: "ban",
+        faceFilled: true,
+        plate: "locked",
+        ally: true,
+        heroOnPlate: true,
+      }),
+    ).toBe(true);
+    expect(
+      portraitIsLocked({
+        phase: "ban",
+        faceFilled: true,
+        plate: "shown",
+        ally: true,
+        heroOnPlate: true,
       }),
     ).toBe(false);
   });
@@ -543,6 +575,20 @@ describe("draft locks from the screen", () => {
     const dark = Array.from({ length: 12 }, () => ({ luma: 30, sat: 0.8 }));
     expect(borderLooksLockedSamples(glow)).toBe(true);
     expect(borderLooksLockedSamples(dark)).toBe(false);
+  });
+
+  it("keeps plate order when the center splash names only one locked hero", () => {
+    expect(
+      takeNewLocks(
+        [],
+        [
+          { hero: "Sgt. Hammer", player: "TOP" },
+          { hero: "Lt. Morales", player: "Prolith" },
+          { hero: "Artanis", player: "Rantore" },
+        ],
+        ["Artanis"],
+      ).heroes,
+    ).toEqual(["Sgt. Hammer", "Lt. Morales", "Artanis"]);
   });
 
   it("locks heroes in announcement order instead of portrait order", () => {
@@ -894,6 +940,33 @@ describe("draft locks from the screen", () => {
     ).toEqual(["Topgun707", "Beachyman", "HuckIt", "MoJoE", "MrHustler"]);
   });
 
+  it("preloads our queue and ignores rank medals as the other team", () => {
+    const names = partyNamesFromText(
+      "Platinum MsBells27 Diamond DuMaMay Selected HuckIt Beachyman MrHustler Gold",
+    );
+    expect(names).toEqual([
+      "MsBells27",
+      "DuMaMay",
+      "HuckIt",
+      "Beachyman",
+      "MrHustler",
+    ]);
+    expect(isPartyMedalName("Platinum")).toBe(true);
+    expect(isPartyMedalName("Beachyman")).toBe(false);
+    const draft = draftFromPartyQueue([
+      ...names,
+      "Platinum",
+      "Diamond",
+      "Selected",
+    ]);
+    expect(draft.ourOpenPlayers).toEqual(names);
+    expect(draft.theirOpenPlayers).toEqual([]);
+    expect(draft.firstPick).toBeNull();
+    expect(draft.map).toBeNull();
+    expect(draft.ourPicks).toEqual([]);
+    expect(draft.theirPicks).toEqual([]);
+  });
+
   it("reads RED PICK as their turn when we are on the left", () => {
     expect(bannerTurn("RED PICK")).toEqual({ phase: "pick", color: "red" });
     expect(bannerTurn("REDPICK")).toEqual({ phase: "pick", color: "red" });
@@ -902,6 +975,11 @@ describe("draft locks from the screen", () => {
       color: null,
     });
     expect(bannerTurn("Waiting for Enemy Ban...")).toEqual({ phase: "ban", color: null });
+    expect(bannerTurn("BRIGHTWING\nWaiting for Enemy...")).toEqual({
+      phase: "pick",
+      color: null,
+    });
+    expect(bannerTurn("Waiting for Enemy...")).toEqual({ phase: "pick", color: null });
     expect(bannerTurn("Waiting for Team Ban...")).toEqual({ phase: "ban", color: null });
     expect(bannerTurn("《Waiting for Team Banv")).toEqual({ phase: "ban", color: null });
     expect(firstBanSideFromStatus("Waiting for Enemy Ban...")).toBe("them");
@@ -914,6 +992,21 @@ describe("draft locks from the screen", () => {
     expect(acceptPlatePicks({ banPhase: true, picksStarted: false })).toBe(false);
     expect(acceptPlatePicks({ banPhase: false, picksStarted: false })).toBe(false);
     expect(acceptPlatePicks({ banPhase: false, picksStarted: true })).toBe(true);
+    expect(
+      acceptLockedPlates({ lockedCount: 3, lockPhase: null, keepCommitted: false }),
+    ).toBe(true);
+    expect(
+      acceptLockedPlates({ lockedCount: 0, lockPhase: null, keepCommitted: false }),
+    ).toBe(false);
+    expect(
+      acceptLockedPlates({ lockedCount: 2, lockPhase: "ban", keepCommitted: false }),
+    ).toBe(false);
+    expect(
+      acceptLockedPlates({ lockedCount: 2, lockPhase: "ban", keepCommitted: true }),
+    ).toBe(true);
+    expect(
+      acceptLockedPlates({ lockedCount: 1, lockPhase: "pick", keepCommitted: false }),
+    ).toBe(true);
     expect(
       plateLockPhase({
         bannerPhase: "ban",
@@ -1016,6 +1109,27 @@ describe("draft locks from the screen", () => {
     });
   });
 
+  it("does not call two enemy locks and zero of ours their first pick", () => {
+    const illegal = {
+      firstPick: "them" as const,
+      ourBans: ["Dehaka", "Johanna"],
+      theirBans: ["Falstad", "Xal'atath"],
+      ourPicks: [] as string[],
+      theirPicks: ["Brightwing", "Abathur"],
+      phase: "pick" as const,
+      turn: { side: "their" as const, kind: "pick" as const },
+    };
+    expect(pickCountsFit(true, 0, 2)).toBe(false);
+    expect(pickCountsFit(false, 0, 2)).toBe(false);
+    expect(resolveFirstPick(illegal)).toBeNull();
+    expect(
+      isDraftSideKnown({
+        ...EMPTY_LIVE_DRAFT,
+        ...illegal,
+      }),
+    ).toBe(false);
+  });
+
   it("treats a whitish plate as a lock and a blue plate as shown", () => {
     const white = Array.from({ length: 80 }, () => ({ r: 210, g: 206, b: 198 }));
     const blue = Array.from({ length: 80 }, () => ({ r: 40, g: 90, b: 190 }));
@@ -1030,6 +1144,33 @@ describe("draft locks from the screen", () => {
     expect(plateFill([])).toBe("empty");
     expect(plateFill(enemyOpen, false)).toBe("shown");
     expect(plateFill(enemyLock, false)).toBe("locked");
+  });
+
+  it("still locks Qhira's light plate when the capture is darker", () => {
+    const image = decodePng(
+      readFileSync(path.join(process.cwd(), "examples", "drafts", "sky temple 2.png")),
+    );
+    const dim = (index: number) => {
+      const box = DRAFT_SLOT_NAMES.left[index];
+      const x = Math.round(box.x * image.width);
+      const y = Math.round(box.y * image.height);
+      const w = Math.round(box.w * image.width);
+      const h = Math.round(box.h * image.height);
+      const pixels = [];
+      for (let row = 0; row < h; row++) {
+        for (let col = 0; col < w; col++) {
+          const i = ((y + row) * image.width + (x + col)) * 4;
+          pixels.push({
+            r: Math.round((image.data[i] ?? 0) * 0.8),
+            g: Math.round((image.data[i + 1] ?? 0) * 0.8),
+            b: Math.round((image.data[i + 2] ?? 0) * 0.8),
+          });
+        }
+      }
+      return plateFill(pixels, true);
+    };
+    expect(dim(4)).toBe("locked");
+    expect(["shown", "empty"]).toContain(dim(0));
   });
 
   it("counts a ban hex only when a face is in it", () => {
@@ -1144,14 +1285,17 @@ describe("draft locks from the screen", () => {
     );
   });
 
-  it("drops a hover hero that was briefly remembered as a pick", () => {
+  it("keeps a registered pick when a later frame reads that plate as a hover", () => {
     expect(
       pruneHoverPicks(
         ["Greymane", "Qhira"],
         ["goz", "HuckIt"],
         ["Greymane", "Alarak"],
       ),
-    ).toEqual({ heroes: ["Qhira"], players: ["HuckIt"] });
+    ).toEqual({
+      heroes: ["Greymane", "Qhira"],
+      players: ["goz", "HuckIt"],
+    });
   });
 
   it("locks the whitish plate and leaves the blue plate as shown", () => {
@@ -1174,7 +1318,10 @@ describe("draft locks from the screen", () => {
         { heroes: ["Chen", "Anub'arak", "Sylvanas"], players: ["Beachyman", "PeterWiggin", null] },
         read.shown,
       ),
-    ).toEqual({ heroes: ["Chen", "Sylvanas"], players: ["Beachyman", null] });
+    ).toEqual({
+      heroes: ["Chen", "Anub'arak", "Sylvanas"],
+      players: ["Beachyman", "PeterWiggin", null],
+    });
   });
 
   it("counts filled ban hexes without inventing a hero name", () => {

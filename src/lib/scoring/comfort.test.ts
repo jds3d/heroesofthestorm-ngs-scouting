@@ -28,6 +28,9 @@ import {
   heroesForOpenPlayers,
   slHeroSuggestions,
   sourceMapGames,
+  belowBarSeatPenalty,
+  playerPoolGames,
+  poolConfidence,
   stormLeagueGames,
   stormLeagueScore,
   suggestablePairOwners,
@@ -214,6 +217,10 @@ describe("suggest bar", () => {
     expect(heroUnplayedBy([player], "Yrel")).toBe(false);
     expect(playerHeroGames([player], "Yrel", "EkeeB")).toBe(8);
     expect(rosterAnyoneHasGamesOn([player], "Yrel")).toBe(true);
+    expect(heroUnplayedBy([player], "E.T.C.")).toBe(true);
+    expect(
+      heroUnplayedBy([player, playerWithoutHistory("C10vurhd1")], "E.T.C."),
+    ).toBe(false);
     expect(floorComfortFromGames(8)).toBeGreaterThan(0);
   });
 
@@ -222,6 +229,17 @@ describe("suggest bar", () => {
       Math.min(COMFORT_PICK_CAP, 0.15 * COMFORT_PICK_MULTIPLIER),
     );
     expect(BELOW_BAR_SEAT_PENALTY).toBeLessThan(0);
+    expect(poolConfidence(4)).toBeLessThan(0.2);
+    expect(poolConfidence(200)).toBeGreaterThan(0.9);
+    const thin = belowBarSeatPenalty(4, "their");
+    const deep = belowBarSeatPenalty(200, "their");
+    const ours = belowBarSeatPenalty(200, "our");
+    expect(thin).toBeGreaterThan(deep);
+    expect(Math.abs(thin)).toBeLessThan(8);
+    expect(deep).toBe(BELOW_BAR_SEAT_PENALTY);
+    expect(ours).toBeGreaterThan(deep);
+    expect(ours).toBeLessThan(0);
+    expect(playerPoolGames(playerFromStormLeague("APex", new Map([["Muradin", sl(3, 1)]])))).toBe(4);
   });
 
   it("allows core heroes and blocks off-pool shells", () => {

@@ -1013,6 +1013,213 @@ export function howOurFiveFights(
   return parts.length ? parts.join(" ") : null;
 }
 
+const ENGAGE_KIT: Record<string, string> = {
+  Stitches: "Hook or Gorge",
+  Garrosh: "Into the Fray",
+  ETC: "Powerslide",
+  Diablo: "Shadow Charge",
+  "Anub'arak": "Impale",
+  Tyrael: "Judgment",
+  MalGanis: "Night Rush",
+  Johanna: "Condemn",
+  Muradin: "Storm Bolt",
+  Arthas: "a root walk-up",
+  Mei: "a slide",
+  Blaze: "a bunker walk-up",
+};
+
+function fightRoleRank(hero: string): number {
+  const role = heroRole(hero);
+  const tags = tagsOf(hero);
+  const dive = tags.includes("dive") || tags.includes("engage") || tags.includes("pick");
+  if (role === "Tank") return dive ? 0 : 1;
+  if (role === "Bruiser" && dive) return 2;
+  if (role.includes("Assassin") && tags.includes("dive")) return 3;
+  if (role === "Bruiser") return 4;
+  if (role.includes("Assassin")) return 5;
+  return 6;
+}
+
+function thenList(heroes: readonly string[]): string {
+  if (heroes.length <= 1) return heroes[0] ?? "";
+  if (heroes.length === 2) return `${heroes[0]}, then ${heroes[1]}`;
+  return `${heroes.slice(0, -1).join(", then ")}, then ${heroes[heroes.length - 1]}`;
+}
+
+/**
+ * One paragraph for the five: who starts the fight, and the follow-up order.
+ * The healer is in the order, not the voice of the plan.
+ */
+export function teamfightStrategy(
+  ourHeroes: readonly string[],
+  theirHeroes: readonly string[] = [],
+): string | null {
+  const our = ourHeroes.filter(Boolean);
+  if (our.length < 2) return null;
+  const ranked = [...our].sort(
+    (a, b) => fightRoleRank(a) - fightRoleRank(b) || a.localeCompare(b),
+  );
+  const starter = ranked[0];
+  if (!starter || fightRoleRank(starter) >= 6) return null;
+  const rest = ranked.slice(1);
+  const kit = ENGAGE_KIT[heroKey(starter)];
+  const target =
+    theirHeroes.find((hero) => heroRole(hero).includes("Assassin")) ??
+    theirHeroes.find((hero) => heroRole(hero) === "Healer") ??
+    null;
+  const onto = target ? ` onto ${target}` : " onto their backline";
+  const start = kit
+    ? `${starter} starts with ${kit}${onto}.`
+    : `${starter} starts the fight${onto}.`;
+  const follow = rest.length
+    ? ` ${thenList(rest)} follow, in that order, on the same target.`
+    : "";
+  const warn =
+    rest.length && fightRoleRank(rest[0]) <= 3
+      ? ` Do not send ${rest[0]} in before ${starter} lands.`
+      : "";
+  return `${start}${follow}${warn}`;
+}
+
+const TWO_LANE_MAPS = new Set([
+  "Braxis Holdout",
+  "Battlefield of Eternity",
+  "Hanamura Temple",
+]);
+
+/** One hero can clear two lanes between waves. Chen cannot. */
+const DOUBLE_SOAK = new Set(
+  [
+    "Xul",
+    "Leoric",
+    "Malthael",
+    "Sonya",
+    "Dehaka",
+    "Hogger",
+    "Ragnaros",
+    "Gazlowe",
+    "Azmodan",
+    "Zagara",
+    "Probius",
+    "Nazeebo",
+    "The Lost Vikings",
+  ].map(heroKey),
+);
+
+function laneShape(map: string | null): "two" | "shrine" | "three" {
+  if (map && TWO_LANE_MAPS.has(map)) return "two";
+  if (map === "Dragon Shire") return "shrine";
+  return "three";
+}
+
+function englishList(names: readonly string[]): string {
+  if (names.length <= 1) return names[0] ?? "";
+  if (names.length === 2) return `${names[0]} and ${names[1]}`;
+  return `${names.slice(0, -1).join(", ")}, and ${names[names.length - 1]}`;
+}
+
+/** Higher is a better permanent solo. A 4-man bruiser still beats sending the tank. */
+function soloRank(hero: string): number {
+  if (heroIsOfflaner(hero)) return 100 + offlaneFitness(hero);
+  if (heroRole(hero) === "Bruiser") return 40 + offlaneFitness(hero);
+  return -1;
+}
+
+function bestSolo(heroes: readonly string[]): string | null {
+  const ranked = heroes.filter((hero) => soloRank(hero) > 0);
+  ranked.sort((a, b) => soloRank(b) - soloRank(a) || a.localeCompare(b));
+  return ranked[0] ?? null;
+}
+
+function sameHero(a: string, b: string | null): boolean {
+  return b != null && heroKey(a) === heroKey(b);
+}
+
+function fourMan(heroes: readonly string[], solo: string | null): string[] {
+  const rest = heroes.filter((hero) => !sameHero(hero, solo));
+  const tank = rest.filter((hero) => heroRole(hero) === "Tank");
+  const heal = rest.filter(
+    (hero) => heroRole(hero) === "Healer" || heroRole(hero) === "Support",
+  );
+  const used = new Set([...tank, ...heal].map((hero) => heroKey(hero)));
+  const damage = rest.filter((hero) => !used.has(heroKey(hero)));
+  return [...tank, ...damage, ...heal];
+}
+
+function shrineHolder(four: readonly string[]): string | null {
+  const ranged = four.filter((hero) => heroRole(hero).includes("Ranged"));
+  const safe = ranged.find((hero) =>
+    tagsOf(hero).some((tag) => tag === "safe" || tag === "global"),
+  );
+  if (safe) return safe;
+  if (ranged[0]) return ranged[0];
+  return four.find((hero) => heroRole(hero) === "Bruiser") ?? null;
+}
+
+/**
+ * Their best lane split, and the split that beats it.
+ * The solo matches their solo. The tank stays with the four.
+ * Two heroes only visit the solo lane for a kill, then leave.
+ */
+export function laneAssignment(args: {
+  map: string | null;
+  ourHeroes: readonly string[];
+  theirHeroes: readonly string[];
+}): string | null {
+  const our = args.ourHeroes.filter(Boolean);
+  const their = args.theirHeroes.filter(Boolean);
+  if (our.length < 2) return null;
+  const shape = laneShape(args.map);
+  const where = args.map ? `On ${args.map}` : "On a three-lane map";
+  const ourSolo = bestSolo(our);
+  const theirSolo = bestSolo(their);
+  const four = fourMan(our, ourSolo);
+  const tank = four.find((hero) => heroRole(hero) === "Tank") ?? null;
+  const theirSoloName = theirSolo ?? "a damage hero";
+  const theirPlan = theirSolo
+    ? `their best is a 1-4 with ${theirSolo} in the solo lane`
+    : "they have no solo laner, so a damage hero will lose the off lane";
+
+  if (shape === "shrine") {
+    const holder = shrineHolder(four);
+    const mid = four.filter((hero) => !sameHero(hero, holder));
+    const shrine = holder
+      ? `${ourSolo ?? "One hero"} holds one shrine. ${holder} holds the other. ${englishList(mid)} hold mid.`
+      : `${ourSolo ?? "One hero"} holds one shrine. ${englishList(four)} hold mid and the other shrine.`;
+    const trap =
+      tank && mid.includes(tank)
+        ? ` ${tank} does not sit on a shrine.`
+        : "";
+    return `${where} their best is 1-1-3, one hero on each shrine. Match it. ${shrine}${trap}`;
+  }
+
+  if (!ourSolo) {
+    return `${where} ${theirPlan}. We have no solo laner, so ${tank ?? "the tank"} stays with ${englishList(four)} and we give the soak.`;
+  }
+
+  const canDouble = shape === "three" && DOUBLE_SOAK.has(heroKey(ourSolo));
+  if (canDouble) {
+    return `${where} ${theirPlan}. ${ourSolo} double-soaks the other two lanes, so ${englishList(four)} match their four and the soak still favors you. A second hero in ${theirSoloName}'s lane gives away that 4v4.`;
+  }
+
+  const gank =
+    tank && four.some((hero) => heroRole(hero).includes("Assassin") && tagsOf(hero).includes("dive"))
+      ? (() => {
+          const diver = four.find(
+            (hero) => heroRole(hero).includes("Assassin") && tagsOf(hero).includes("dive"),
+          );
+          return diver
+            ? ` ${tank} and ${diver} can rotate onto ${theirSoloName} for a kill, then both return to the four.`
+            : "";
+        })()
+      : "";
+  const stay =
+    shape === "two"
+      ? ` Two heroes living in ${theirSoloName}'s lane lose the objective.`
+      : ` A second hero does not live in ${theirSoloName}'s lane.`;
+  return `${where} ${theirPlan}. Match it. ${ourSolo} takes that lane. ${englishList(four)} are the four.${stay}${gank}`;
+}
+
 /**
  * Live board copy for the interactive draft — shape + how it fights, built
  * from the *current* five (alts included), not the pre-draft Stitches brief.

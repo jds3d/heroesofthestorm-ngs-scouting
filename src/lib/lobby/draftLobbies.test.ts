@@ -12,31 +12,22 @@ import {
   SLOT_LINE_STRIDE,
   NAMEPLATE_CELL_WIDTH,
   bansFromHexFaces,
-  bannerTurn,
   firstBanSideFromStatus,
   mapFromTitle,
   nameplateCell,
   ocrFold,
   plateFill,
   portraitFilled,
-  openSeatPlayers,
-  portraitIsLocked,
-  portraitTeamRim,
+  pickingFlagsBySlot,
+  columnPickingFromOcrLines,
   readsBySlot,
-  firstPickFromBanBoard,
-  resolveFirstPick,
   pickCountsFit,
-  inferFirstPick,
   progressFromObserved,
-  reorderOurPicksForDraftZip,
-  fitObservedPickOrder,
-  sideFromStatus,
-  banFrameKeepsLockedPicks,
   NO_BAN,
-  UNSEEN_BAN,
   type DraftBox,
 } from "@/lib/lobby/screenLobby";
 import { readThreeBanHexSlots, setBanHexMapContext } from "@/lib/lobby/banFace";
+import { emptyWatchMemory, nextWatchedDraft } from "@/lib/lobby/watchDraft";
 import { heroKey } from "@/lib/scoring/heroMeta";
 import { DRAFT_ORDER } from "@/lib/scoring/draftPlan";
 import { nextStepSuggestion } from "@/lib/scoring/pickPairs";
@@ -178,160 +169,98 @@ async function loadLobby(file: string) {
   const centerText = labels.center.map((line) => line.text).join(" ");
   const leftReads = readsBySlot(plates.left);
   const rightReads = readsBySlot(plates.right);
+  const leftPickingFlags = pickingFlagsBySlot(plates.left);
+  const rightPickingFlags = pickingFlagsBySlot(plates.right);
   const locks = (reads: SlotRead[], faces: boolean[]) =>
     reads.flatMap((read, slot) =>
       faces[slot] && read.hero ? [{ hero: read.hero, player: read.player, slot }] : [],
     );
   const leftFaces = DRAFT_PLATE_SLOTS.left.map((box) => portraitFilled(boxRgb(image, box)));
   const rightFaces = DRAFT_PLATE_SLOTS.right.map((box) => portraitFilled(boxRgb(image, box)));
-  const bannerText = `${titleText}\n${statusText}`;
-  let phase = bannerTurn(bannerText).phase;
-  const keepCommitted = banFrameKeepsLockedPicks(`${bannerText}\n${centerText}`);
-  const turn = sideFromStatus(bannerText);
-  const pixelAt = (x: number, y: number) => {
-    const [r, g, b] = sample(image, x, y);
-    return { r, g, b };
-  };
-  const lockedPicks = (
+  const slotRows = (
     ally: boolean,
-    slots: readonly DraftBox[],
-    nameSlots: readonly DraftBox[],
     reads: SlotRead[],
+    portraits: readonly DraftBox[],
+    names: readonly DraftBox[],
+    picking: boolean[],
   ) =>
-    slots.flatMap((box, slot) => {
-      const read = reads[slot];
-      const nameBox = nameSlots[slot];
-      if (!read?.hero || !nameBox) return [];
-      const plate = plateFill(boxRgb(image, nameBox), ally);
-      if (
-        !portraitIsLocked({
-          phase,
-          keepCommitted,
-          faceFilled: portraitFilled(boxRgb(image, box)),
-          plate,
+    reads.flatMap((read, slot) => {
+      const nameBox = names[slot];
+      const faceBox = portraits[slot];
+      if (!read.hero || !nameBox || !faceBox) return [];
+      return [
+        {
+          hero: read.hero,
+          player: read.player,
+          slot,
+          plate: plateFill(boxRgb(image, nameBox), ally),
+          faceFilled: portraitFilled(boxRgb(image, faceBox)),
           ally,
-          heroOnPlate: true,
-        })
-      ) {
-        return [];
-      }
-      return [{ hero: read.hero, player: read.player, slot }];
+          slotPicking: picking[slot] ?? false,
+        },
+      ];
     });
-  const seatLocked = (
-    ally: boolean,
-    slots: readonly DraftBox[],
-    nameSlots: readonly DraftBox[],
-    reads: SlotRead[],
-  ) =>
-    slots.map((box, index) => {
-      const read = reads[index];
-      const nameBox = nameSlots[index];
-      const plate = nameBox ? plateFill(boxRgb(image, nameBox), ally) : undefined;
-      return portraitIsLocked({
-        phase,
-        keepCommitted,
-        faceFilled: portraitFilled(boxRgb(image, box)),
-        plate,
-        ally,
-        heroOnPlate: Boolean(read?.hero),
-      });
-    });
-  const ourPicks = lockedPicks(true, DRAFT_PLATE_SLOTS.left, DRAFT_SLOT_NAMES.left, leftReads);
-  const theirPicks = lockedPicks(
-    false,
-    DRAFT_PLATE_SLOTS.right,
-    DRAFT_SLOT_NAMES.right,
-    rightReads,
-  );
-  const ourOpen = openSeatPlayers(
-    leftReads,
-    seatLocked(true, DRAFT_PLATE_SLOTS.left, DRAFT_SLOT_NAMES.left, leftReads),
-  );
-  const theirOpen = openSeatPlayers(
-    rightReads,
-    seatLocked(false, DRAFT_PLATE_SLOTS.right, DRAFT_SLOT_NAMES.right, rightReads),
-  );
-  if (!phase && ourPicks.length + theirPicks.length > 0) {
-    phase = "pick";
-  }
+  const leftShown = leftReads.flatMap((read, slot) => {
+    const nameBox = DRAFT_SLOT_NAMES.left[slot];
+    if (!read.hero || !nameBox) return [];
+    if (plateFill(boxRgb(image, nameBox), true) !== "shown") return [];
+    return [read.hero];
+  });
   const map = mapFromTitle(titleText);
   setBanHexMapContext(map);
   const leftBanRead = readBanSide(image, "left");
   const rightBanRead = readBanSide(image, "right");
   setBanHexMapContext(null);
-  const ourBans = leftBanRead.chronological;
-  const theirBans = rightBanRead.chronological;
-  let firstPick =
-    (phase === "pick" && ourPicks.length + theirPicks.length === 0
-      ? null
-      : firstPickFromBanBoard(ourBans, theirBans, { phase })) ??
-    firstBanSideFromStatus(statusText) ??
-    null;
-  const weFirstGuess =
-    firstPick === "us" || firstPick === "them"
-      ? firstPick === "us"
-      : firstPickFromBanBoard(ourBans, theirBans) === "us";
-  const fitted = fitObservedPickOrder(
-    {
-      weFirst: weFirstGuess,
-      firstPick,
-      phase,
-      map,
-      ourBans,
-      theirBans,
-      ourPicks: ourPicks.map((pick) => pick.hero),
-      theirPicks: theirPicks.map((pick) => pick.hero),
-      ourPickPlayers: ourPicks.map((pick) => pick.player),
-      theirPickPlayers: theirPicks.map((pick) => pick.player),
+  const hexes = (
+    read: ReturnType<typeof readBanSide>,
+  ) =>
+    read.slotHeroes.map((hero, index) => ({
+      hero: hero === NO_BAN ? null : hero,
+      filled: read.filled[index] ?? false,
+      passed: read.passed[index] ?? false,
+      vector: null,
+    }));
+  const watched = nextWatchedDraft({
+    memory: emptyWatchMemory(),
+    frame: {
+      left: leftReads.flatMap((read) => (read.player ? [read.player] : [])),
+      right: rightReads.flatMap((read) => (read.player ? [read.player] : [])),
+      leftSlots: slotRows(true, leftReads, DRAFT_PLATE_SLOTS.left, DRAFT_SLOT_NAMES.left, leftPickingFlags),
+      rightSlots: slotRows(false, rightReads, DRAFT_PLATE_SLOTS.right, DRAFT_SLOT_NAMES.right, rightPickingFlags),
+      leftShown,
+      rightShown: [],
+      leftReads,
+      rightReads,
+      leftPicking: columnPickingFromOcrLines(plates.left),
+      rightPicking: columnPickingFromOcrLines(plates.right),
+      leftPickingFlags,
+      rightPickingFlags,
     },
-    {
-      our: ourPicks.map((pick) => pick.slot),
-      their: theirPicks.map((pick) => pick.slot),
-    },
-  );
-  const ourZip = reorderOurPicksForDraftZip(
-    fitted.ourPicks,
-    fitted.ourPickPlayers,
-  );
-  const theirZip = {
-    heroes: fitted.theirPicks,
-    players: fitted.theirPickPlayers,
-  };
-  const inferredFirst = inferFirstPick({
-    ourPicks: ourZip.heroes.length,
-    theirPicks: theirZip.heroes.length,
-    phase,
-    turnSide: turn,
+    titleText,
+    statusText,
+    centerText,
+    leftHexes: hexes(leftBanRead),
+    rightHexes: hexes(rightBanRead),
+    roster: [],
   });
-  if (inferredFirst) {
-    firstPick = inferredFirst;
-  }
-  firstPick =
-    resolveFirstPick({
-      firstPick,
-      ourBans,
-      theirBans,
-      ourPicks: ourZip.heroes,
-      theirPicks: theirZip.heroes,
-      phase,
-      turn: turn && phase ? { side: turn, kind: phase } : null,
-      ourPickSlots: ourPicks.map((pick) => pick.slot),
-      theirPickSlots: theirPicks.map((pick) => pick.slot),
-    }) ?? firstPick;
+  const draft = watched.draft;
+  const withSlots = (
+    heroes: string[],
+    players: (string | null)[],
+    locked: { hero: string; slot: number }[],
+  ) =>
+    heroes.map((hero, index) => ({
+      hero,
+      player: players[index] ?? null,
+      slot: locked.find((lock) => heroKey(lock.hero) === heroKey(hero))?.slot ?? index,
+    }));
   const progress =
-    firstPick == null
+    draft.firstPick == null
       ? null
       : progressFromObserved({
-          weFirst: firstPick === "us",
-          firstPick,
-          phase,
-          map,
-          ourBans,
-          theirBans,
-          ourPicks: ourZip.heroes,
-          theirPicks: theirZip.heroes,
-          ourPickPlayers: ourZip.players,
-          theirPickPlayers: theirZip.players,
+          ...draft,
+          weFirst: draft.firstPick === "us",
+          firstPick: draft.firstPick,
         });
   return {
     width: image.width,
@@ -339,9 +268,9 @@ async function loadLobby(file: string) {
     map: mapFromTitle(titleText),
     titleText,
     statusText,
-    turn: sideFromStatus(statusText),
+    turn: draft.turn?.side ?? null,
     banTurn: firstBanSideFromStatus(statusText),
-    phase: bannerTurn(bannerText).phase,
+    phase: draft.phase,
     leftBans: leftBanRead.filled,
     rightBans: rightBanRead.filled,
     leftBanHeroes: leftBanRead.slotHeroes,
@@ -352,19 +281,13 @@ async function loadLobby(file: string) {
     rightReads,
     leftLocks: locks(leftReads, leftFaces),
     rightLocks: locks(rightReads, rightFaces),
-    firstPick,
-    ourPicks,
-    theirPicks: theirZip.heroes.map((hero, index) => ({
-      hero,
-      player: theirZip.players[index] ?? null,
-      slot:
-        theirPicks.find((pick) => heroKey(pick.hero) === heroKey(hero))?.slot ??
-        index,
-    })),
+    firstPick: draft.firstPick,
+    ourPicks: withSlots(draft.ourPicks, draft.ourPickPlayers, watched.leftLocked),
+    theirPicks: withSlots(draft.theirPicks, draft.theirPickPlayers, watched.rightLocked),
     order: progress?.actions ?? [],
     next: progress?.next ?? null,
-    ourOpen,
-    theirOpen,
+    ourOpen: draft.ourOpenPlayers ?? [],
+    theirOpen: draft.theirOpenPlayers ?? [],
   };
 }
 
@@ -469,7 +392,7 @@ describe("draft lobby screenshots", () => {
       expect(draft.height).toBe(1440);
       expect(draft.map).toBe("Volskaya Foundry");
       expect(draft.turn).toBe("their");
-      expect(draft.phase).toBeNull();
+      expect(draft.phase).toBe("pick");
       expect(draft.leftBans).toEqual([true, true, true]);
       expect(draft.rightBans).toEqual([true, true, true]);
       expect(draft.leftBanHeroes).toEqual(["Johanna", "Sgt. Hammer", "Tyrael"]);
@@ -684,7 +607,7 @@ describe("draft lobby screenshots", () => {
       expect(draft.map).toBe("Braxis Holdout");
       expect(draft.phase).toBe("pick");
       expect(draft.firstPick).toBe("us");
-      expect(draft.leftBanHeroes).toEqual(["Qhira", null, null]);
+      expect(draft.leftBanHeroes).toEqual(["Qhira", "Chen", null]);
       expect(draft.rightBanHeroes).toEqual(["Maiev", "Chromie", null]);
       expect(draft.ourPicks).toEqual([]);
       expect(draft.theirPicks).toEqual([]);
@@ -693,7 +616,7 @@ describe("draft lobby screenshots", () => {
       expect(listed(draft.order)).toEqual([
         ["our", "ban", "Qhira", ""],
         ["their", "ban", "Maiev", ""],
-        ["our", "ban", UNSEEN_BAN, ""],
+        ["our", "ban", "Chen", ""],
         ["their", "ban", "Chromie", ""],
       ]);
       expect(draft.next).toEqual({ side: "our", kind: "pick" });
@@ -813,21 +736,25 @@ describe("draft lobby screenshots", () => {
   );
 
   it(
-    "loads Haunted Mines blue ban with ally locks ignored and ban order intact",
+    "loads Haunted Mines blue ban with locked picks and ban order intact",
     async () => {
       const draft = await loadLobby(path.join(DRAFTS, "haunted mines 1.png"));
       expect(draft.map).toBe("Haunted Mines");
       expect(draft.phase).toBe("ban");
       expect(draft.firstPick).toBe("them");
-      expect(draft.next).toEqual({ side: "their", kind: "pick" });
+      expect(draft.next).toEqual({ side: "our", kind: "ban" });
       expect(draft.leftBanHeroes[0]).toBe("Qhira");
       expect(draft.leftBanHeroes[1]).toBe("Falstad");
       expect(draft.leftBanHeroes[2]).toBeNull();
       expect(draft.rightBanHeroes[0]).toBe("Xal'atath");
       expect(draft.rightBanHeroes[1]).toBe("Kel'Thuzad");
       expect(draft.rightBanHeroes[2]).toBeNull();
-      expect(draft.ourPicks).toEqual([]);
-      expect(draft.theirPicks).toEqual([]);
+      expect(draft.ourPicks.map((pick) => pick.hero)).toEqual(["Sylvanas", "Brightwing"]);
+      expect(draft.theirPicks.map((pick) => pick.hero)).toEqual([
+        "Tracer",
+        "Tassadar",
+        "Arthas",
+      ]);
       expect(draft.leftReads.map((read) => read.hero)).toEqual([
         "Sylvanas",
         "Alarak",
@@ -924,6 +851,40 @@ describe("draft lobby screenshots", () => {
         picks: 1,
         last: true,
       });
+    },
+    180_000,
+  );
+
+  it(
+    "loads Sky Temple 2 with bans and locked picks",
+    async () => {
+      const draft = await loadLobby(path.join(DRAFTS, "sky temple 2.png"));
+      expect(draft.map).toBe("Sky Temple");
+      expect(draft.leftBanHeroes).toEqual(["Dehaka", "Johanna", null]);
+      expect(draft.rightBanHeroes).toEqual(["Falstad", "Xal'atath", null]);
+      // Dark hero plates on the left are hovers. Qhira's plate is light, so she is locked.
+      expect(draft.ourPicks.map((pick) => pick.hero)).toEqual(["Qhira"]);
+      expect(draft.ourPicks.map((pick) => folded(pick.player))).toEqual([ocrFold("HuckIt")]);
+      // The right column cannot hover. A hero name on that plate is a lock.
+      expect(draft.theirPicks.map((pick) => pick.hero)).toEqual(["Brightwing", "Abathur"]);
+      expect(draft.theirPicks.map((pick) => folded(pick.player))).toEqual([
+        ocrFold("GreyPowerVan"),
+        ocrFold("alexterrieur"),
+      ]);
+      // Their two locks are legal only after our first. 0–2 is not a draft.
+      expect(draft.firstPick).toBe("us");
+      expect(pickCountsFit(true, draft.ourPicks.length, draft.theirPicks.length)).toBe(true);
+      expect(pickCountsFit(false, draft.ourPicks.length, draft.theirPicks.length)).toBe(false);
+      expect(listed(draft.order)).toEqual([
+        ["our", "ban", "Dehaka", ""],
+        ["their", "ban", "Falstad", ""],
+        ["our", "ban", "Johanna", ""],
+        ["their", "ban", "Xal'atath", ""],
+        ["our", "pick", "Qhira", ocrFold("HuckIt")],
+        ["their", "pick", "Brightwing", ocrFold("GreyPowerVan")],
+        ["their", "pick", "Abathur", ocrFold("alexterrieur")],
+      ]);
+      expect(draft.next).toEqual({ side: "our", kind: "pick" });
     },
     180_000,
   );

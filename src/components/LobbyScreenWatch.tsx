@@ -7,6 +7,15 @@ import {
   readThreeBanHexSlots,
   setBanHexMapContext,
 } from "@/lib/lobby/banFace";
+import { matchMapTitle } from "@/lib/lobby/mapTitle";
+import {
+  FINAL_MAP_BOX,
+  FINAL_NAME_BOXES,
+  completeDraftFromFinalScreen,
+  finalScreenLikely,
+  mismatchQuestion,
+  seatsFromNameLines,
+} from "@/lib/lobby/finalScreen";
 import type { Worker } from "tesseract.js";
 import {
   DRAFT_BAN_HEXES,
@@ -44,6 +53,7 @@ import {
   pruneHoverPicks,
   readsBySlot,
   draftHeroList,
+  draftFromPartyQueue,
   partyNamesFromText,
   mapFromTitle,
   firstPickFromPickingSlots,
@@ -52,12 +62,12 @@ import {
   sideFromBannerColor,
   sideFromStatus,
   sideFromTeamSplash,
+  acceptLockedPlates,
   acceptPlatePicks,
   banFrameKeepsLockedPicks,
   plateLockPhase,
   banSideFromSplash,
   firstBanSideFromStatus,
-  slotsHoldPicks,
   snapToRoster,
   takeNewLocks,
   turnFromOcr,
@@ -70,18 +80,29 @@ import {
   type OpenTurn,
   type Rgb,
 } from "@/lib/lobby/screenLobby";
+import { nextWatchedDraft } from "@/lib/lobby/watchDraft";
 import {
   WATCH_IDLE_PAUSE_MS,
   allBanSlotSignals,
   draftWatchFingerprintKey,
+  joinedRegionFingerprint,
+  mergeColumnReads,
+  ocrRefreshPlan,
+  regionFingerprint,
+  shouldReadPartyNames,
   watchIdlePauseDue,
+  DRAFT_CENTER_HASH_BOX,
 } from "@/lib/lobby/watchFingerprint";
 
 type Phase = "idle" | "watching" | "reading";
 type Box = { x: number; y: number; w: number; h: number; rotate: number };
 
-/** Full parse while a draft is active. Slower tick when only pixel-gating. */
-const WATCH_TICK_DRAFT_MS = 2000;
+/**
+ * While a draft is up, look again well inside a second. An unchanged frame
+ * returns before OCR, so this does not re-read the nameplates every tick.
+ * A lock has to land within a couple of seconds of the plate changing.
+ */
+const WATCH_TICK_DRAFT_MS = 400;
 const WATCH_TICK_IDLE_MS = 6000;
 
 type BanHexSlot = {
@@ -352,6 +373,9 @@ export function LobbyScreenWatch({
   const streamRef = useRef<MediaStream | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const timerRef = useRef<number | null>(null);
+  const timerMsRef = useRef(0);
+  /** Bumped when a newer frame or a reset should drop an in-flight splash read. */
+  const frameSeqRef = useRef(0);
   const workerRef = useRef<Worker | null>(null);
   const hiddenRef = useRef(false);
   const busyRef = useRef(false);
@@ -373,6 +397,24 @@ export function LobbyScreenWatch({
   const frameSavedRef = useRef(false);
   const inDraftRef = useRef(false);
   const watchFingerprintRef = useRef("");
+  const ocrCacheRef = useRef<{
+    fingerprints: {
+      title: string;
+      status: string;
+      namesLeft: string;
+      namesRight: string;
+      center: string;
+    };
+    title: string;
+    status: string;
+    center: string;
+    lines: {
+      left: { text: string; top: number }[];
+      right: { text: string; top: number }[];
+      center: { text: string; top: number }[];
+    };
+    lobby: Awaited<ReturnType<typeof readLobby>>;
+  } | null>(null);
   const stableSinceRef = useRef(0);
   const idlePausedRef = useRef(false);
   /** Draft finished on screen — keep state and sharing until Reset draft. */
@@ -380,6 +422,9 @@ export function LobbyScreenWatch({
   const onReplaySyncRef = useRef(onReplaySync);
   const leftNamesRef = useRef<string[]>([]);
   const rightNamesRef = useRef<string[]>([]);
+  const ourSeatNamesRef = useRef<(string | null)[]>([]);
+  const theirSeatNamesRef = useRef<(string | null)[]>([]);
+  const mismatchSavedRef = useRef(false);
 
   useEffect(() => {
     onReplaySyncRef.current = onReplaySync;
@@ -437,6 +482,7 @@ export function LobbyScreenWatch({
       window.clearInterval(timerRef.current);
       timerRef.current = null;
     }
+    timerMsRef.current = 0;
   }
 
   function setIdlePaused(paused: boolean) {
@@ -467,12 +513,16 @@ export function LobbyScreenWatch({
   if (resumeRef) resumeRef.current = resumeIdleWatch;
 
   function armWatchTimer() {
-    clearWatchTimer();
     const video = videoRef.current;
     const worker = workerRef.current;
-    if (!video || !worker || hiddenRef.current || !streamRef.current) return;
-    if (idlePausedRef.current) return;
+    if (!video || !worker || hiddenRef.current || !streamRef.current || idlePausedRef.current) {
+      clearWatchTimer();
+      return;
+    }
     const ms = inDraftRef.current ? WATCH_TICK_DRAFT_MS : WATCH_TICK_IDLE_MS;
+    if (timerRef.current != null && timerMsRef.current === ms) return;
+    clearWatchTimer();
+    timerMsRef.current = ms;
     timerRef.current = window.setInterval(() => {
       void readFrame(video, worker);
     }, ms);
@@ -507,6 +557,7 @@ export function LobbyScreenWatch({
   }, [phase]);
 
   function stopWatch() {
+    frameSeqRef.current += 1;
     clearWatchTimer();
     setIdlePaused(false);
     for (const track of streamRef.current?.getTracks() ?? []) track.stop();
@@ -526,12 +577,27 @@ export function LobbyScreenWatch({
     return result.data.text;
   }
 
+  async function readMapTitle(
+    ctx: CanvasRenderingContext2D,
+    frame: HTMLCanvasElement,
+    worker: Worker,
+  ): Promise<string> {
+    const region = sampleRegion(ctx, frame, DRAFT_TITLE_BOX);
+    const matched = matchMapTitle(region.pixels, region.width, region.height);
+    if (matched) return matched;
+    return readColumn(frame, worker, DRAFT_TITLE_BOX);
+  }
+
   function scoutHeaders(): Record<string, string> {
     const secret = process.env.NEXT_PUBLIC_SCOUT_API_SECRET?.trim();
     return secret ? { "x-scout-secret": secret } : {};
   }
 
-  function canvasBlob(canvas: HTMLCanvasElement, type: string, quality: number): Promise<Blob | null> {
+  function canvasBlob(
+    canvas: HTMLCanvasElement,
+    type: string,
+    quality?: number,
+  ): Promise<Blob | null> {
     return new Promise((resolve) => canvas.toBlob((blob) => resolve(blob), type, quality));
   }
 
@@ -562,8 +628,15 @@ export function LobbyScreenWatch({
   }
 
   async function pictureOf(canvas: HTMLCanvasElement): Promise<string | null> {
+    // Nameplates stay PNG so a light plate still reads "QHIRA". The center
+    // splash PNG is about 3.7MB and the OCR route then rejects the whole
+    // request, which drops every player name and every pick.
+    const png = await canvasBlob(canvas, "image/png");
     const blob =
-      (await canvasBlob(canvas, "image/webp", 0.9)) ?? (await canvasBlob(canvas, "image/jpeg", 0.92));
+      png && png.size <= 1_600_000
+        ? png
+        : ((await canvasBlob(canvas, "image/webp", 0.9)) ??
+          (await canvasBlob(canvas, "image/jpeg", 0.92)));
     if (!blob) return null;
     const bytes = new Uint8Array(await blob.arrayBuffer());
     let binary = "";
@@ -621,6 +694,12 @@ function framePixelAt(
 /** Names and locked heroes from the five slots on each side. */
 async function readLobby(
   frame: HTMLCanvasElement,
+  plan: { left: boolean; right: boolean; center: boolean },
+  cachedLines: {
+    left: OcrLine[];
+    right: OcrLine[];
+    center: OcrLine[];
+  } | null,
 ): Promise<{
   left: string[];
   right: string[];
@@ -653,34 +732,46 @@ async function readLobby(
   leftPickingFlags: boolean[];
   rightPickingFlags: boolean[];
   center: OcrLine[];
+  lines: { left: OcrLine[]; right: OcrLine[]; center: OcrLine[] };
 } | null> {
-  const leftPlate = stackNameplates(frame, DRAFT_SLOT_NAMES.left);
-  const rightPlate = stackNameplates(frame, DRAFT_SLOT_NAMES.right);
-  const centerPlate = deskewedColumn(frame, DRAFT_TURN_BOX);
-  if (!leftPlate || !rightPlate) return null;
-  const [left, right, center] = await Promise.all([
-    pictureOf(leftPlate),
-    pictureOf(rightPlate),
-    centerPlate ? pictureOf(centerPlate) : Promise.resolve(null),
-  ]);
-  if (!left || !right) return null;
-  const res = await fetch("/api/ocr/names", {
-    method: "POST",
-    headers: { "content-type": "application/json", ...scoutHeaders() },
-    body: JSON.stringify({ left, right, center }),
-  });
-  if (!res.ok) return null;
-  const data = (await res.json()) as {
-    left?: OcrLine[];
-    right?: OcrLine[];
-    center?: OcrLine[];
-  };
-  const leftReads = readsBySlot(data.left ?? []);
-  const rightReads = readsBySlot(data.right ?? []);
-  const leftPickingFlags = pickingFlagsBySlot(data.left ?? []);
-  const rightPickingFlags = pickingFlagsBySlot(data.right ?? []);
-  const leftPicking = columnPickingFromOcrLines(data.left ?? []);
-  const rightPicking = columnPickingFromOcrLines(data.right ?? []);
+  let fresh: { left?: OcrLine[]; right?: OcrLine[]; center?: OcrLine[] } = {};
+  if (plan.left || plan.right || plan.center) {
+    const leftPlate = plan.left ? stackNameplates(frame, DRAFT_SLOT_NAMES.left) : null;
+    const rightPlate = plan.right ? stackNameplates(frame, DRAFT_SLOT_NAMES.right) : null;
+    const centerPlate = plan.center ? deskewedColumn(frame, DRAFT_TURN_BOX) : null;
+    if (plan.left && !leftPlate) return null;
+    if (plan.right && !rightPlate) return null;
+    const [left, right, center] = await Promise.all([
+      leftPlate ? pictureOf(leftPlate) : Promise.resolve(""),
+      rightPlate ? pictureOf(rightPlate) : Promise.resolve(""),
+      centerPlate ? pictureOf(centerPlate) : Promise.resolve(""),
+    ]);
+    if (plan.left && !left) return null;
+    if (plan.right && !right) return null;
+    if (!left && !right && !center) return null;
+    const res = await fetch("/api/ocr/names", {
+      method: "POST",
+      headers: { "content-type": "application/json", ...scoutHeaders() },
+      body: JSON.stringify({
+        left: left || "",
+        right: right || "",
+        center: center || "",
+      }),
+    });
+    if (!res.ok) return null;
+    fresh = (await res.json()) as {
+      left?: OcrLine[];
+      right?: OcrLine[];
+      center?: OcrLine[];
+    };
+  }
+  const lines = mergeColumnReads(plan, fresh, cachedLines);
+  const leftReads = readsBySlot(lines.left);
+  const rightReads = readsBySlot(lines.right);
+  const leftPickingFlags = pickingFlagsBySlot(lines.left);
+  const rightPickingFlags = pickingFlagsBySlot(lines.right);
+  const leftPicking = columnPickingFromOcrLines(lines.left);
+  const rightPicking = columnPickingFromOcrLines(lines.right);
   const ctx = frame.getContext("2d");
   const pixelAt = ctx ? framePixelAt(ctx, frame) : null;
   const slots = (
@@ -751,7 +842,8 @@ async function readLobby(
     rightPicking,
     leftPickingFlags,
     rightPickingFlags,
-    center: data.center ?? [],
+    center: lines.center,
+    lines,
   };
 }
 
@@ -764,9 +856,11 @@ async function readLobby(
   }
 
   function clearObserved() {
+    frameSeqRef.current += 1;
     draftCompleteRef.current = false;
     inDraftRef.current = false;
     watchFingerprintRef.current = "";
+    ocrCacheRef.current = null;
     stableSinceRef.current = 0;
     setIdlePaused(false);
     announcedPicksRef.current = [];
@@ -774,6 +868,9 @@ async function readLobby(
     lastOursKeyRef.current = "";
     leftNamesRef.current = [];
     rightNamesRef.current = [];
+    ourSeatNamesRef.current = [];
+    theirSeatNamesRef.current = [];
+    mismatchSavedRef.current = false;
     openTurnRef.current = null;
     picksStartedRef.current = false;
     draftRef.current = {
@@ -796,6 +893,102 @@ async function readLobby(
     clearObserved();
   }, [resetEpoch]);
 
+  async function saveMismatch(
+    frame: HTMLCanvasElement,
+    conflict: {
+      before: { our: string[]; their: string[] };
+      screen: { our: string[]; their: string[] };
+    },
+  ) {
+    const blob = await canvasBlob(frame, "image/png");
+    if (!blob) return;
+    const bytes = new Uint8Array(await blob.arrayBuffer());
+    let binary = "";
+    for (let i = 0; i < bytes.length; i += 0x8000) {
+      binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+    }
+    await fetch("/api/draft-examples", {
+      method: "POST",
+      headers: { "content-type": "application/json", ...scoutHeaders() },
+      body: JSON.stringify({ kind: "mismatch", image: btoa(binary), conflict }),
+    }).catch(() => undefined);
+  }
+
+  async function finishFromLoadingScreen(
+    ctx: CanvasRenderingContext2D,
+    frame: HTMLCanvasElement,
+    worker: Worker,
+  ): Promise<boolean> {
+    const pixelAt = framePixelAt(ctx, frame);
+    if (!pixelAt || !finalScreenLikely(frame.width, frame.height, pixelAt)) return false;
+    const draft = draftRef.current;
+    const leftPlate = stackNameplates(frame, FINAL_NAME_BOXES.left);
+    const rightPlate = stackNameplates(frame, FINAL_NAME_BOXES.right);
+    if (!leftPlate || !rightPlate) return true;
+    const [left, right] = await Promise.all([pictureOf(leftPlate), pictureOf(rightPlate)]);
+    if (!left || !right) return true;
+    const res = await fetch("/api/ocr/names", {
+      method: "POST",
+      headers: { "content-type": "application/json", ...scoutHeaders() },
+      body: JSON.stringify({ left, right, center: "" }),
+    });
+    if (!res.ok) return true;
+    const data = (await res.json()) as {
+      left?: { text: string; top: number; x?: number }[];
+      right?: { text: string; top: number; x?: number }[];
+    };
+    const mapText = draft.map ? "" : await readColumn(frame, worker, FINAL_MAP_BOX);
+    const completed = completeDraftFromFinalScreen({
+      draft,
+      blue: seatsFromNameLines(data.right ?? []),
+      red: seatsFromNameLines(data.left ?? []),
+      ourNames: oursRef.current,
+      roster: rosterRef.current,
+      mapText,
+    });
+    if (!completed) {
+      setStatus("Loading screen is up. Still reading both teams.");
+      return true;
+    }
+    if (completed.conflict) {
+      const question = mismatchQuestion(completed.conflict);
+      if (!mismatchSavedRef.current) {
+        mismatchSavedRef.current = true;
+        await saveMismatch(frame, completed.conflict);
+      }
+      draftCompleteRef.current = true;
+      clearWatchTimer();
+      setStatus(question);
+      return true;
+    }
+    draftRef.current = completed.draft;
+    onDraftRef.current(completed.draft);
+    inDraftRef.current = true;
+    if (completed.ourNames.length >= 3) {
+      const oursKey = completed.ourNames.map((name) => name.toLowerCase()).join("|");
+      if (oursKey !== lastOursKeyRef.current) {
+        lastOursKeyRef.current = oursKey;
+        onOurSideRef.current?.(completed.ourNames);
+      }
+    }
+    if (completed.theirNames.length >= 3) {
+      const key = completed.theirNames.map((name) => name.toLowerCase()).join("|");
+      if (key !== lastKeyRef.current) {
+        lastKeyRef.current = key;
+        setNames(completed.theirNames);
+        if (completed.theirNames.length === 5) onLobbyRef.current(completed.theirNames);
+      }
+    }
+    if (completed.draft.sealed) {
+      draftCompleteRef.current = true;
+      clearWatchTimer();
+      setStatus("Draft complete. Filled the remaining picks from the loading screen.");
+    } else {
+      setStatus("Loading screen is up. Still reading both teams.");
+    }
+    return true;
+  }
+
   function titleBrightShare(
     ctx: CanvasRenderingContext2D,
     frame: HTMLCanvasElement,
@@ -806,231 +999,66 @@ async function readLobby(
     return bright / pixels.length;
   }
 
-  async function readFrame(video: HTMLVideoElement, worker: Worker) {
-    if (busyRef.current || video.readyState < 2) return;
-    if (hiddenRef.current) return;
-    if (idlePausedRef.current) return;
-    if (draftCompleteRef.current) return;
-    const epoch = epochRef.current;
-    busyRef.current = true;
-    try {
-      const frame = document.createElement("canvas");
-      frame.width = video.videoWidth;
-      frame.height = video.videoHeight;
-      const ctx = frame.getContext("2d", { willReadFrequently: true });
-      if (!ctx) return;
-      ctx.drawImage(video, 0, 0);
-      const fingerprint = draftWatchFingerprintKey(ctx, frame);
-      const banSlots = allBanSlotSignals(ctx, frame);
-      const lobbyLikely = draftLobbyLikelyOnFrame({
-        titleBrightShare: titleBrightShare(ctx, frame),
-        banSlots,
-      });
-      if (!inDraftRef.current && !lobbyLikely) {
-        watchFingerprintRef.current = "";
-        if (lastKeyRef.current || lastOursKeyRef.current) forgetNames();
-        setStatus(
-          "Watching the main screen. No draft lobby visible — checking slowly.",
-        );
-        return;
-      }
-      if (
-        inDraftRef.current &&
-        watchFingerprintRef.current &&
-        fingerprint === watchFingerprintRef.current
-      ) {
-        const stableMs = Date.now() - stableSinceRef.current;
-        if (watchIdlePauseDue(stableMs)) {
-          enterIdlePause();
-        }
-        return;
-      }
-      setPhase("reading");
-      const roster = rosterRef.current;
-      const titleText = await readColumn(frame, worker, DRAFT_TITLE_BOX);
-      const centerText = await readColumn(frame, worker, DRAFT_TURN_BOX);
-      const statusText = await readColumn(frame, worker, DRAFT_STATUS_BOX);
-      if (epoch !== epochRef.current) return;
-      const screenPhase = watchPhase(
-        `${titleText}\n${centerText}\n${statusText}`,
-        inDraftRef.current,
-      );
-      if (screenPhase !== "draft") {
-        if (
-          screenPhase === "menu" &&
-          (inDraftRef.current || lastOursKeyRef.current || lastKeyRef.current)
-        ) {
-          if (draftCompleteRef.current || liveDraftBoardFull(draftRef.current)) {
-            setStatus(
-              "Draft complete — still on the board until you click Reset draft.",
-            );
-            return;
-          }
-          await onReplaySyncRef.current?.();
-          if (epoch !== epochRef.current) return;
-          clearObserved();
-        } else if (screenPhase === "wait") {
-          forgetNames();
-        }
-        setStatus(
-          screenPhase === "menu"
-            ? "On the game menu. Waiting for the draft."
-            : "Watching the main screen. Waiting for the draft.",
-        );
-        return;
-      }
-      if (!inDraftRef.current) {
-        await onReplaySyncRef.current?.();
-        if (epoch !== epochRef.current) return;
-      }
-      inDraftRef.current = true;
-      const lobbyPromise = readLobby(frame);
-      const partyText = await readColumn(frame, worker, PARTY_NAME_ROW);
-      const mapHint = mapFromTitle(titleText) ?? draftRef.current.map ?? null;
-      setBanHexMapContext(mapHint);
-      const leftHexes = readSideBanHexes(ctx, frame, DRAFT_BAN_HEXES.left);
-      const rightHexes = readSideBanHexes(ctx, frame, DRAFT_BAN_HEXES.right);
-      setBanHexMapContext(null);
-      const lobby = await lobbyPromise;
-      const rapidCenter = (lobby?.center ?? []).map((line) => line.text).join("\n");
-      const centerSource = rapidCenter.trim() ? rapidCenter : centerText;
-      const usOnLeft = true;
-      const banner = bannerTurn(`${centerSource}\n${statusText}`);
-      const centerRead = turnFromOcr(centerSource, roster);
-      if (banner.phase) centerRead.phase = banner.phase;
-      if ((centerRead.phase ?? banner.phase) === "pick" && centerRead.hero) {
-        const announced = announcedPicksRef.current;
-        const last = announced[announced.length - 1];
-        if (!last || heroKey(last) !== heroKey(centerRead.hero)) announced.push(centerRead.hero);
-      }
-      const draft = draftRef.current;
-      const knownNames = [...(lobby?.left ?? []), ...(lobby?.right ?? []), ...roster];
-      const snapPlate = (locks: { hero: string; player: string | null; slot: number }[]) =>
-        locks.map((lock) => ({
-          hero: lock.hero,
-          player: lock.player ? snapToRoster(lock.player, knownNames) : null,
-          slot: lock.slot,
-        }));
-      const banPhase = banner.phase === "ban" || centerRead.phase === "ban";
-      const bannerPhase = banPhase
-        ? "ban"
-        : (banner.phase ?? centerRead.phase ?? null);
-      const keepCommitted =
-        banPhase &&
-        banFrameKeepsLockedPicks(`${centerSource}\n${statusText}`);
-      const priorLockedPicks =
-        draft.ourPicks.length + draft.theirPicks.length;
-      const lockPhase = plateLockPhase({
-        bannerPhase,
+  /**
+   * Push one read onto the board. `learn` saves portrait examples; the fast
+   * nameplate pass skips that and leaves the fingerprint for the full pass.
+   * Returns true when this frame should stop (draft finished, or a reset landed).
+   */
+  function publishWatched(
+    lobby: Awaited<ReturnType<typeof readLobby>>,
+    titleText: string,
+    statusText: string,
+    centerSource: string,
+    learn: boolean,
+    frame: HTMLCanvasElement,
+    ctx: CanvasRenderingContext2D,
+    fingerprint: string,
+    epoch: number,
+  ): boolean {
+    const roster = rosterRef.current;
+    const partyText = "";
+    const mapHint = mapFromTitle(titleText) ?? draftRef.current.map ?? null;
+    setBanHexMapContext(mapHint);
+    const leftHexes = readSideBanHexes(ctx, frame, DRAFT_BAN_HEXES.left);
+    const rightHexes = readSideBanHexes(ctx, frame, DRAFT_BAN_HEXES.right);
+    setBanHexMapContext(null);
+    const watched = nextWatchedDraft({
+      memory: {
+        draft: draftRef.current,
+        announced: announcedPicksRef.current,
         picksStarted: picksStartedRef.current,
-        priorLockedPicks,
-      });
-      const platePhase = lockPhase ?? bannerPhase;
-      const lockedSlots = (
-        rows: {
-          hero: string;
-          player: string | null;
-          slot: number;
-          plate: PlateFill;
-          faceFilled: boolean;
-          teamRim: { blue: number; red: number };
-          ally: boolean;
-          slotPicking?: boolean;
-        }[],
-      ) =>
-        snapPlate(
-          rows.filter((row) =>
-            portraitIsLocked({
-              phase: platePhase,
-              keepCommitted: keepCommitted && platePhase === "ban",
-              faceFilled: row.faceFilled,
-              plate: row.plate,
-              ally: row.ally,
-              heroOnPlate: true,
-              slotPicking: row.slotPicking,
-            }),
-          ),
-        );
-      const leftLocked = lockedSlots(lobby?.leftSlots ?? []);
-      const rightLocked = lockedSlots(lobby?.rightSlots ?? []);
-      const slotted =
-        slotsHoldPicks(leftLocked.length + rightLocked.length) &&
-        (lockPhase === "pick" || (keepCommitted && platePhase === "ban"));
-      const fromSlots = null;
-      if (slotted) picksStartedRef.current = true;
-      if (!banPhase && (banner.phase === "pick" || fromSlots === "pick")) {
-        picksStartedRef.current = true;
-      }
-      const allowPicks =
-        slotted ||
-        acceptPlatePicks({
-          banPhase,
-          picksStarted: picksStartedRef.current,
-        }) ||
-        (lockPhase === "pick" && picksStartedRef.current);
-      const ourShown = usOnLeft ? lobby?.leftShown ?? [] : lobby?.rightShown ?? [];
-      const theirShown = usOnLeft ? lobby?.rightShown ?? [] : lobby?.leftShown ?? [];
-      const ourPruned = pruneHoverPicks(
-        draft.ourPicks,
-        draft.ourPickPlayers,
-        ourShown,
-      );
-      const theirPruned = pruneHoverPicks(
-        draft.theirPicks,
-        draft.theirPickPlayers,
-        theirShown,
-      );
-      const ourLocked = allowPicks
-        ? takeNewLocks(
-            ourPruned.heroes,
-            usOnLeft ? leftLocked : rightLocked,
-            announcedPicksRef.current,
-            ourPruned.players,
-          )
-        : null;
-      const theirLocked = allowPicks
-        ? takeNewLocks(
-            theirPruned.heroes,
-            usOnLeft ? rightLocked : leftLocked,
-            announcedPicksRef.current,
-            theirPruned.players,
-          )
-        : null;
-      let ourPicks = ourLocked
-        ? ourLocked.heroes
-        : picksStartedRef.current
-          ? draft.ourPicks
-          : [];
-      let theirPicks = theirLocked
-        ? theirLocked.heroes
-        : picksStartedRef.current
-          ? draft.theirPicks
-          : [];
-      if (epoch !== epochRef.current) return;
-      if (lobby) {
-        const leftPlayers = lobby.left.map((name) => snapToRoster(name, roster));
-        const rightPlayers = lobby.right.map((name) => snapToRoster(name, roster));
-        if (leftPlayers.length >= 3) leftNamesRef.current = leftPlayers;
-        if (rightPlayers.length >= 3) rightNamesRef.current = rightPlayers;
-      }
-      const ourColumn = leftNamesRef.current;
-      const theirColumn = rightNamesRef.current;
-      const turn = nextTurn(
-        openTurnRef.current,
-        centerRead.phase ? centerRead : { ...centerRead, phase: banner.phase },
-        (player) => {
-          const fold = ocrFold(player);
-          if (fold === ocrFold("HuckIt")) return "our";
-          if (ourColumn.some((name) => ocrFold(name) === fold)) return "our";
-          if (oursRef.current.some((name) => ocrFold(name) === fold)) return "our";
-          if (theirColumn.some((name) => ocrFold(name) === fold)) return "their";
-          return null;
-        },
-        banner.color
-          ? sideFromBannerColor(banner.color, usOnLeft)
-          : banSideFromSplash(`${centerSource}\n${statusText}`),
-      );
-      openTurnRef.current = turn.open;
+        openTurn: openTurnRef.current,
+        ourColumn: leftNamesRef.current,
+        theirColumn: rightNamesRef.current,
+        ourSeatNames: ourSeatNamesRef.current,
+        theirSeatNames: theirSeatNamesRef.current,
+        ourRoster: oursRef.current,
+      },
+      frame: lobby,
+      titleText,
+      statusText,
+      centerText: centerSource,
+      leftHexes,
+      rightHexes,
+      roster,
+      faces: facesRef.current,
+      partyText,
+    });
+    announcedPicksRef.current = watched.memory.announced;
+    picksStartedRef.current = watched.memory.picksStarted;
+    openTurnRef.current = watched.memory.openTurn;
+    leftNamesRef.current = watched.memory.ourColumn;
+    rightNamesRef.current = watched.memory.theirColumn;
+    ourSeatNamesRef.current = watched.memory.ourSeatNames;
+    theirSeatNamesRef.current = watched.memory.theirSeatNames;
+    const leftLocked = watched.leftLocked;
+    const rightLocked = watched.rightLocked;
+    const nextDraft = watched.draft;
+    const ourColumn = watched.memory.ourColumn;
+    const theirColumn = watched.memory.theirColumn;
+    const inParty = watched.inParty;
+    const partyNames = partyNamesFromText(partyText).map((name) => snapToRoster(name, roster));
+    if (learn) {
       const nativeFrame = frame.height >= 1440;
       const learnPlate = (
         lock: { hero: string; slot: number | null },
@@ -1078,291 +1106,306 @@ async function readLobby(
           }).catch(() => undefined);
         });
       }
-      const namedHexes = (hexes: { filled: boolean; vector: number[] | null; hero: string | null }[]) =>
-        hexes.map((hex) =>
-          hex.hero ??
-          (hex.vector && facesRef.current.length ? matchPortrait(hex.vector, facesRef.current) : null),
-        );
-      const ourHexes = usOnLeft ? leftHexes : rightHexes;
-      const theirHexes = usOnLeft ? rightHexes : leftHexes;
-      const ourBans = bansFromHexFaces(
-        namedHexes(ourHexes),
-        ourHexes.map((hex) => hex.filled),
-        draft.ourBans,
-        ourHexes.map((hex) => hex.passed),
+    }
+    if (epoch !== epochRef.current) return true;
+    draftRef.current = nextDraft;
+    onDraftRef.current(nextDraft);
+    if (liveDraftBoardFull(nextDraft) && !draftCompleteRef.current) {
+      draftCompleteRef.current = true;
+      clearWatchTimer();
+      setStatus("Draft complete. Board stays here until you click Reset draft.");
+      return true;
+    }
+    if (ourColumn.length >= 3) {
+      const oursKey = ourColumn.map((name) => name.toLowerCase()).join("|");
+      if (oursKey !== lastOursKeyRef.current) {
+        lastOursKeyRef.current = oursKey;
+        onOurSideRef.current?.(ourColumn);
+      }
+    } else if (inParty) {
+      const partyKey = partyNames.map((name) => name.toLowerCase()).join("|");
+      if (partyKey !== lastOursKeyRef.current) {
+        lastOursKeyRef.current = partyKey;
+        onOurSideRef.current?.(partyNames);
+      }
+      setStatus(`In queue. Loading Storm League for ${partyNames.join(", ")}.`);
+    }
+    const opponents = inParty ? [] : theirColumn;
+    if (!inParty && opponents.length >= 3) {
+      const key = opponents.map((name) => name.toLowerCase()).join("|");
+      if (key !== lastKeyRef.current) {
+        lastKeyRef.current = key;
+        setNames(opponents);
+        if (opponents.length === 5) onLobbyRef.current(opponents);
+      }
+    }
+    const locks =
+      nextDraft.ourPicks.length +
+      nextDraft.theirPicks.length +
+      nextDraft.ourBans.length +
+      nextDraft.theirBans.length;
+    if (!inParty) {
+      const who =
+        ourColumn.length + theirColumn.length > 0
+          ? `Us: ${ourColumn.join(", ") || "…"}. Them: ${theirColumn.join(", ") || "…"}.`
+          : "Reading the name banners.";
+      setStatus(
+        locks > 0
+          ? `${who} We banned ${draftHeroList(nextDraft.ourBans)}, picked ${draftHeroList(nextDraft.ourPicks)}. They banned ${draftHeroList(nextDraft.theirBans)}, picked ${draftHeroList(nextDraft.theirPicks)}.`
+          : who,
       );
-      const theirBans = bansFromHexFaces(
-        namedHexes(theirHexes),
-        theirHexes.map((hex) => hex.filled),
-        draft.theirBans,
-        theirHexes.map((hex) => hex.passed),
-      );
-      const phase = banner.phase ?? centerRead.phase ?? fromSlots ?? (slotted ? "pick" : draft.phase);
-      if (banPhase && !picksStartedRef.current && !slotted) {
-        ourPicks = [];
-        theirPicks = [];
-      }
-      const fromBanBoard = firstPickFromBanBoard(ourBans, theirBans);
-      let firstPick = fromBanBoard ?? draft.firstPick;
-      if (
-        !firstPick &&
-        ourPicks.length + theirPicks.length === 0 &&
-        lobby
-      ) {
-        const fromSlotsSide = firstPickFromPickingSlots({
-          leftPicking: lobby.leftPicking,
-          rightPicking: lobby.rightPicking,
-          usOnLeft,
-        });
-        if (fromSlotsSide) firstPick = fromSlotsSide;
-      }
-      if (
-        !firstPick &&
-        ourBans.length + theirBans.length + ourPicks.length + theirPicks.length === 0
-      ) {
-        const fromStatus = firstBanSideFromStatus(`${statusText}\n${centerText}`);
-        if (fromStatus) firstPick = fromStatus;
-      }
-      const turnSide =
-        turn.open?.side ??
-        (banner.color ? sideFromBannerColor(banner.color, usOnLeft) : null) ??
-        sideFromStatus(`${statusText}\n${centerSource}`) ??
-        sideFromTeamSplash(`${centerSource}\n${statusText}`);
-      if (!firstPick && turn.open?.phase === "ban") {
-        firstPick = turn.open.side === "our" ? "us" : "them";
-      }
-      if (
-        !firstPick &&
-        banner.color &&
-        banner.phase &&
-        ourPicks.length + theirPicks.length === 0 &&
-        ourBans.length + theirBans.length === 0
-      ) {
-        const side = sideFromBannerColor(banner.color, usOnLeft);
-        firstPick = side === "our" ? "us" : "them";
-      }
-      if (ourPicks.length + theirPicks.length === 0) {
-        if (ourBans.length > 0 && theirBans.length === 0) firstPick = "us";
-        else if (theirBans.length > 0 && ourBans.length === 0) firstPick = "them";
-      }
-      if (firstPick === "them" && theirPicks.length === 0 && ourPicks.length > 0) {
-        firstPick = "us";
-      }
-      if (ourPicks.length + theirPicks.length > 0) {
-        const usFits = pickCountsFit(true, ourPicks.length, theirPicks.length);
-        const themFits = pickCountsFit(false, ourPicks.length, theirPicks.length);
-        if (usFits && !themFits) {
-          firstPick = "us";
-        } else if (themFits && !usFits) {
-          firstPick = "them";
-        } else {
-          const inferred = inferFirstPick({
-            ourPicks: ourPicks.length,
-            theirPicks: theirPicks.length,
-            phase,
-            turnSide,
-          });
-          const currentFits = firstPick
-            ? pickCountsFit(firstPick === "us", ourPicks.length, theirPicks.length)
-            : false;
-          if (inferred && (!firstPick || !currentFits)) firstPick = inferred;
-        }
-      }
-      let map = draft.map;
-      if (!map) map = mapFromTitle(titleText);
-      const seatCtx = frame.getContext("2d");
-      const seatPixels = seatCtx ? framePixelAt(seatCtx, frame) : null;
-      const namedSeats = (
-        reads: readonly { player: string | null }[],
-      ) =>
-        reads.map((read) => ({
-          player: read.player ? snapToRoster(read.player, knownNames) : null,
-        }));
-      const ourReads = usOnLeft ? lobby?.leftReads ?? [] : lobby?.rightReads ?? [];
-      const theirReads = usOnLeft ? lobby?.rightReads ?? [] : lobby?.leftReads ?? [];
-      const lockedFlags = (
-        boxes: readonly DraftBox[],
-        nameBoxes: readonly DraftBox[],
-        ally: boolean,
-        reads: readonly { hero: string | null; player: string | null }[],
-      ) =>
-        boxes.map((box, index) => {
-          if (!seatCtx || !seatPixels) return false;
-          const nameBox = nameBoxes[index];
-          const read = reads[index];
-          const pickingFlags = ally
-            ? lobby?.leftPickingFlags ?? []
-            : lobby?.rightPickingFlags ?? [];
-          return portraitIsLocked({
-            phase: platePhase,
-            keepCommitted: keepCommitted && platePhase === "ban",
-            faceFilled: portraitFilled(sampleBox(seatCtx, frame, box)),
-            plate: nameBox
-              ? plateFill(sampleBox(seatCtx, frame, nameBox), ally)
-              : undefined,
-            ally,
-            heroOnPlate: Boolean(read?.hero),
-            slotPicking: pickingFlags[index] ?? false,
-          });
-        });
-      const ourBoxes = usOnLeft ? DRAFT_PLATE_SLOTS.left : DRAFT_PLATE_SLOTS.right;
-      const theirBoxes = usOnLeft ? DRAFT_PLATE_SLOTS.right : DRAFT_PLATE_SLOTS.left;
-      const ourNameBoxes = usOnLeft ? DRAFT_SLOT_NAMES.left : DRAFT_SLOT_NAMES.right;
-      const theirNameBoxes = usOnLeft ? DRAFT_SLOT_NAMES.right : DRAFT_SLOT_NAMES.left;
-      const ourOpenPlayers =
-        lobby && ourReads.some((read) => read.player)
-          ? openSeatPlayers(
-              namedSeats(ourReads),
-              lockedFlags(ourBoxes, ourNameBoxes, true, ourReads),
-            )
-          : draft.ourOpenPlayers ?? [];
-      const theirOpenPlayers =
-        lobby && theirReads.some((read) => read.player)
-          ? openSeatPlayers(
-              namedSeats(theirReads),
-              lockedFlags(theirBoxes, theirNameBoxes, false, theirReads),
-            )
-          : draft.theirOpenPlayers ?? [];
-      let ourPickPlayers = ourLocked?.players ?? draft.ourPickPlayers;
-      let theirPickPlayers = theirLocked?.players ?? draft.theirPickPlayers;
-      if (allowPicks && firstPick && slotted) {
-        const ourZip = reorderOurPicksForDraftZip(ourPicks, ourPickPlayers);
-        ourPicks = ourZip.heroes;
-        ourPickPlayers = ourZip.players;
-      }
-      const turnPhase =
-        phase === "ban" || phase === "pick"
-          ? phase
-          : platePhase === "ban" || platePhase === "pick"
-            ? platePhase
-            : null;
-      const liveTurn = resolveLiveTurn({
-        phase: turnPhase,
-        leftPicking: lobby?.leftPicking ?? false,
-        rightPicking: lobby?.rightPicking ?? false,
-        usOnLeft,
-        bannerSide: turnSide,
-        openTurn: turn.open,
-        ourOpenPlayers,
-        theirOpenPlayers,
+    }
+    if (learn) {
+      watchFingerprintRef.current = fingerprint;
+      stableSinceRef.current = Date.now();
+    }
+    return false;
+  }
+
+  async function readFrame(video: HTMLVideoElement, worker: Worker) {
+    if (busyRef.current || video.readyState < 2) return;
+    if (hiddenRef.current) return;
+    if (idlePausedRef.current) return;
+    if (draftCompleteRef.current) return;
+    const epoch = epochRef.current;
+    busyRef.current = true;
+    try {
+      const frame = document.createElement("canvas");
+      frame.width = video.videoWidth;
+      frame.height = video.videoHeight;
+      const ctx = frame.getContext("2d", { willReadFrequently: true });
+      if (!ctx) return;
+      ctx.drawImage(video, 0, 0);
+      if (await finishFromLoadingScreen(ctx, frame, worker)) return;
+      const fingerprint = draftWatchFingerprintKey(ctx, frame);
+      const banSlots = allBanSlotSignals(ctx, frame);
+      const lobbyLikely = draftLobbyLikelyOnFrame({
+        titleBrightShare: titleBrightShare(ctx, frame),
+        banSlots,
       });
-      const weFirstGuess =
-        firstPick === "us" || firstPick === "them"
-          ? firstPick === "us"
-          : guessWeFirst({
-              firstPick,
-              ourBans,
-              theirBans,
-              ourPicks,
-              theirPicks,
-              ourPickPlayers,
-              theirPickPlayers,
-              phase,
-              turn: liveTurn,
-              map,
-            });
-      const ourLockRows = usOnLeft ? leftLocked : rightLocked;
-      const theirLockRows = usOnLeft ? rightLocked : leftLocked;
-      const fittedPicks = fitObservedPickOrder(
-        {
-          weFirst: weFirstGuess,
-          firstPick,
-          phase,
-          map,
-          ourBans,
-          theirBans,
-          ourPicks,
-          theirPicks,
-          ourPickPlayers,
-          theirPickPlayers,
-        },
-        {
-          our: pickSlotsFromPlateLocks(ourPicks, ourLockRows),
-          their: pickSlotsFromPlateLocks(theirPicks, theirLockRows),
-        },
-      );
-      ourPicks = fittedPicks.ourPicks;
-      theirPicks = fittedPicks.theirPicks;
-      ourPickPlayers = fittedPicks.ourPickPlayers;
-      theirPickPlayers = fittedPicks.theirPickPlayers;
-      const resolvedFirst =
-        resolveFirstPick({
-          firstPick,
-          ourBans,
-          theirBans,
-          ourPicks,
-          theirPicks,
-          phase,
-          turn: liveTurn,
-          ourPickSlots: pickSlotsFromPlateLocks(ourPicks, ourLockRows),
-          theirPickSlots: pickSlotsFromPlateLocks(theirPicks, theirLockRows),
-        }) ?? firstPick;
-      const nextDraft: LiveDraft = {
-        ourPicks,
-        theirPicks,
-        ourPickPlayers,
-        theirPickPlayers,
-        ourOpenPlayers,
-        theirOpenPlayers,
-        ourBans,
-        theirBans,
-        firstPick: resolvedFirst,
-        phase,
-        turn: liveTurn,
-        map,
-      };
-      if (epoch !== epochRef.current) return;
-      draftRef.current = nextDraft;
-      onDraftRef.current(nextDraft);
-      if (liveDraftBoardFull(nextDraft) && !draftCompleteRef.current) {
-        draftCompleteRef.current = true;
-        clearWatchTimer();
+      if (!inDraftRef.current && !lobbyLikely) {
+        watchFingerprintRef.current = "";
+        if (lastKeyRef.current || lastOursKeyRef.current) forgetNames();
         setStatus(
-          "Draft complete. Board stays here until you click Reset draft.",
+          "Watching the main screen. No draft lobby visible — checking slowly.",
         );
         return;
       }
-
-      const partyNames = partyNamesFromText(partyText).map((name) => snapToRoster(name, roster));
-      const inParty =
-        partyNames.length >= 3 && ourPicks.length + theirPicks.length === 0 && ourColumn.length < 3;
-      if (ourColumn.length >= 3) {
-        const oursKey = ourColumn.map((name) => name.toLowerCase()).join("|");
-        if (oursKey !== lastOursKeyRef.current) {
-          lastOursKeyRef.current = oursKey;
-          onOurSideRef.current?.(ourColumn);
+      if (
+        inDraftRef.current &&
+        watchFingerprintRef.current &&
+        fingerprint === watchFingerprintRef.current
+      ) {
+        const stableMs = Date.now() - stableSinceRef.current;
+        if (watchIdlePauseDue(stableMs)) {
+          enterIdlePause();
         }
-      } else if (inParty) {
-        const partyKey = partyNames.map((name) => name.toLowerCase()).join("|");
-        if (partyKey !== lastOursKeyRef.current) {
-          lastOursKeyRef.current = partyKey;
-          onOurSideRef.current?.(partyNames);
-        }
-        setStatus(`In queue. Loading Storm League for ${partyNames.join(", ")}.`);
+        return;
       }
-      const opponents = inParty ? [] : theirColumn;
-      if (!inParty && opponents.length >= 3) {
-        const key = opponents.map((name) => name.toLowerCase()).join("|");
-        if (key !== lastKeyRef.current) {
-          lastKeyRef.current = key;
-          setNames(opponents);
-          if (opponents.length === 5) onLobbyRef.current(opponents);
+      setPhase("reading");
+      const roster = rosterRef.current;
+      const currentFp = {
+        title: regionFingerprint(ctx, frame, DRAFT_TITLE_BOX),
+        status: regionFingerprint(ctx, frame, DRAFT_STATUS_BOX),
+        namesLeft: joinedRegionFingerprint(ctx, frame, DRAFT_SLOT_NAMES.left),
+        namesRight: joinedRegionFingerprint(ctx, frame, DRAFT_SLOT_NAMES.right),
+        center: regionFingerprint(ctx, frame, DRAFT_CENTER_HASH_BOX),
+      };
+      const cached = ocrCacheRef.current;
+      const plan = ocrRefreshPlan(currentFp, cached?.fingerprints ?? null);
+      const haveLines = Boolean(cached?.lines);
+      const refresh = {
+        left: plan.left || !haveLines,
+        right: plan.right || !haveLines,
+        center: plan.center || !haveLines,
+      };
+      const namesNeeded = refresh.left || refresh.right;
+      const seq = ++frameSeqRef.current;
+      // Nameplates commit a lock. The center splash is a second read so a
+      // hero is not stuck behind the big picture.
+      const namesPromise = namesNeeded
+        ? readLobby(
+            frame,
+            { left: refresh.left, right: refresh.right, center: false },
+            cached?.lines ?? null,
+          )
+        : Promise.resolve(null);
+      const centerPromise = refresh.center
+        ? readLobby(
+            frame,
+            { left: false, right: false, center: true },
+            cached?.lines ?? null,
+          )
+        : Promise.resolve(null);
+      const titlePromise = plan.title
+        ? readMapTitle(ctx, frame, worker)
+        : Promise.resolve(cached?.title ?? "");
+      const statusPromise = plan.status
+        ? readColumn(frame, worker, DRAFT_STATUS_BOX)
+        : Promise.resolve(cached?.status ?? "");
+      if (inDraftRef.current && namesNeeded) {
+        const quick = await namesPromise;
+        if (epoch !== epochRef.current || seq !== frameSeqRef.current) return;
+        if (
+          quick &&
+          publishWatched(
+            quick,
+            cached?.title ?? "",
+            cached?.status ?? "",
+            cached?.center ?? "",
+            false,
+            frame,
+            ctx,
+            fingerprint,
+            epoch,
+          )
+        ) {
+          return;
         }
       }
-      const locks = ourPicks.length + theirPicks.length + ourBans.length + theirBans.length;
-      if (!inParty) {
-        const who =
-          ourColumn.length + theirColumn.length > 0
-            ? `Us: ${ourColumn.join(", ") || "…"}. Them: ${theirColumn.join(", ") || "…"}.`
-            : "Reading the name banners.";
-        setStatus(
-          locks > 0
-            ? `${who} We banned ${draftHeroList(ourBans)}, picked ${draftHeroList(ourPicks)}. They banned ${draftHeroList(theirBans)}, picked ${draftHeroList(theirPicks)}.`
-            : who,
+      const [titleText, statusText] = await Promise.all([titlePromise, statusPromise]);
+      if (epoch !== epochRef.current || seq !== frameSeqRef.current) return;
+      const centerNow = inDraftRef.current ? null : await centerPromise;
+      if (epoch !== epochRef.current || seq !== frameSeqRef.current) return;
+      const lobbyFresh = namesNeeded ? await namesPromise : null;
+      const lobby = lobbyFresh ?? cached?.lobby ?? null;
+      const centerLines = centerNow?.center ?? lobby?.center ?? [];
+      const rapidCenter = centerLines.map((line) => line.text).join("\n");
+      const centerSource = rapidCenter.trim() ? rapidCenter : (cached?.center ?? "");
+      ocrCacheRef.current = {
+        fingerprints: {
+          title: currentFp.title,
+          status: currentFp.status,
+          namesLeft:
+            refresh.left && namesNeeded && !lobbyFresh
+              ? (cached?.fingerprints.namesLeft ?? "")
+              : currentFp.namesLeft,
+          namesRight:
+            refresh.right && namesNeeded && !lobbyFresh
+              ? (cached?.fingerprints.namesRight ?? "")
+              : currentFp.namesRight,
+          center: centerNow
+            ? currentFp.center
+            : (cached?.fingerprints.center ?? ""),
+        },
+        title: titleText,
+        status: statusText,
+        center: centerSource,
+        lines: {
+          left: lobbyFresh?.lines.left ?? cached?.lines?.left ?? [],
+          right: lobbyFresh?.lines.right ?? cached?.lines?.right ?? [],
+          center:
+            centerNow?.lines.center ??
+            lobbyFresh?.lines.center ??
+            cached?.lines?.center ??
+            [],
+        },
+        lobby,
+      };
+      let screenPhase = watchPhase(
+        `${titleText}\n${statusText}`,
+        inDraftRef.current,
+      );
+      if (screenPhase !== "draft") {
+        screenPhase = watchPhase(
+          `${titleText}\n${centerSource}\n${statusText}`,
+          inDraftRef.current,
         );
       }
-      watchFingerprintRef.current = fingerprint;
-      stableSinceRef.current = Date.now();
+      if (screenPhase !== "draft") {
+        if (
+          screenPhase === "menu" &&
+          (inDraftRef.current || lastOursKeyRef.current || lastKeyRef.current)
+        ) {
+          if (draftCompleteRef.current || liveDraftBoardFull(draftRef.current)) {
+            setStatus(
+              "Draft complete — still on the board until you click Reset draft.",
+            );
+            return;
+          }
+          await onReplaySyncRef.current?.();
+          if (epoch !== epochRef.current) return;
+          clearObserved();
+        } else if (screenPhase === "wait") {
+          forgetNames();
+        }
+        if (shouldReadPartyNames(screenPhase)) {
+          const partyText = await readColumn(frame, worker, PARTY_NAME_ROW);
+          const partyNames = partyNamesFromText(partyText).map((name) =>
+            snapToRoster(name, roster),
+          );
+          const draftAlreadyLocked =
+            draftRef.current.ourPicks.length + draftRef.current.theirPicks.length > 0;
+          if (partyNames.length >= 3 && !draftAlreadyLocked) {
+            const partyKey = partyNames.map((name) => name.toLowerCase()).join("|");
+            if (partyKey !== lastOursKeyRef.current) {
+              lastOursKeyRef.current = partyKey;
+              onOurSideRef.current?.(partyNames);
+            }
+            const queued = draftFromPartyQueue(partyNames);
+            draftRef.current = queued;
+            onDraftRef.current(queued);
+            setStatus(`In queue. Loading Storm League for ${partyNames.join(", ")}.`);
+            return;
+          }
+        }
+        setStatus(
+          screenPhase === "menu"
+            ? "On the game menu. Waiting for the draft."
+            : "Watching the main screen. Waiting for the draft.",
+        );
+        return;
+      }
+      if (!inDraftRef.current) {
+        await onReplaySyncRef.current?.();
+        if (epoch !== epochRef.current) return;
+      }
+      inDraftRef.current = true;
+      armWatchTimer();
+      if (
+        publishWatched(
+          lobby,
+          titleText,
+          statusText,
+          centerSource,
+          true,
+          frame,
+          ctx,
+          fingerprint,
+          epoch,
+        )
+      ) {
+        return;
+      }
+      if (refresh.center && !centerNow && lobby) {
+        void centerPromise.then((splash) => {
+          if (!splash) return;
+          if (epoch !== epochRef.current || seq !== frameSeqRef.current) return;
+          if (!inDraftRef.current || draftCompleteRef.current) return;
+          const text = splash.center.map((line) => line.text).join("\n").trim();
+          const cache = ocrCacheRef.current;
+          if (cache) {
+            ocrCacheRef.current = {
+              ...cache,
+              fingerprints: { ...cache.fingerprints, center: currentFp.center },
+              center: text || cache.center,
+              lines: { ...cache.lines, center: splash.lines.center },
+            };
+          }
+          if (!text) return;
+          publishWatched(
+            lobby,
+            titleText,
+            statusText,
+            text,
+            false,
+            frame,
+            ctx,
+            fingerprint,
+            epoch,
+          );
+        });
+      }
     } catch {
       setStatus("Could not read that frame. The watch is still running.");
     } finally {
@@ -1380,6 +1423,9 @@ async function readLobby(
     lastOursKeyRef.current = "";
     leftNamesRef.current = [];
     rightNamesRef.current = [];
+    ourSeatNamesRef.current = [];
+    theirSeatNamesRef.current = [];
+    mismatchSavedRef.current = false;
     announcedPicksRef.current = [];
     draftRef.current = {
       ...EMPTY_LIVE_DRAFT,
@@ -1392,6 +1438,7 @@ async function readLobby(
     picksStartedRef.current = false;
     inDraftRef.current = false;
     watchFingerprintRef.current = "";
+    ocrCacheRef.current = null;
     stableSinceRef.current = 0;
     onDraftRef.current(draftRef.current);
     setNames([]);
@@ -1405,7 +1452,7 @@ async function readLobby(
           displaySurface: "monitor",
           width: { ideal: 2560 },
           height: { ideal: 1440 },
-          frameRate: { ideal: 2 },
+          frameRate: { ideal: 8 },
         },
         audio: false,
         // Chrome: monitors only; no tab/window list when supported.
@@ -1430,7 +1477,7 @@ async function readLobby(
       const { createWorker, PSM } = await import("tesseract.js");
       const worker = await createWorker("eng");
       await worker.setParameters({
-        tessedit_pageseg_mode: PSM.SPARSE_TEXT,
+        tessedit_pageseg_mode: PSM.SINGLE_LINE,
         tessedit_char_whitelist: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'",
       });
       workerRef.current = worker;

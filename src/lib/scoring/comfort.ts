@@ -1,6 +1,6 @@
 import { leagueConfig } from "@/config/league";
 import type { HeroStat } from "@/lib/heroesprofile/types";
-import { snapToRoster } from "@/lib/lobby/screenLobby";
+import { playerFold, snapToRoster } from "@/lib/lobby/screenLobby";
 import { heroKey, heroRole } from "@/lib/scoring/heroMeta";
 import type {
   ComfortHero,
@@ -404,17 +404,57 @@ export function pairHasDistinctOwners(
   return anySuggestablePair(roster, [first, second], taken);
 }
 
+/** A recorded Storm League or NGS pool. An empty card is missing data, not a pool of zero. */
+export function playerHasHistory(scout: PlayerScout): boolean {
+  return scout.topHeroes.some((row) => heroRowGames(row) > 0);
+}
+
 /**
- * Nobody on this roster has the hero on record at all. Different from being
- * under the suggest bar — this five cannot play it.
+ * Every player has a recorded pool, and none of those pools include the hero.
+ * A player with no history makes that unknowable: missing data is not a forced fill.
  */
 export function heroUnplayedBy(roster: PlayerScout[], hero: string): boolean {
   if (!roster.length) return false;
+  if (roster.some((scout) => !playerHasHistory(scout))) return false;
   return !rosterAnyoneHasGamesOn(roster, hero);
 }
 
 /** Scorecard penalty for a pick nobody on the five plays. */
 export const UNPLAYED_PICK_PENALTY = -30;
+
+/**
+ * How much a logged pool is evidence of what someone will play.
+ * About 0.1 at 4 games, about 0.5 at 30, and near 1 past 80.
+ */
+export function poolConfidence(games: number): number {
+  if (games <= 0) return 0;
+  return 1 - Math.exp(-games / 40);
+}
+
+/** Games across Storm League and NGS rows. Comfort-only rows still count as a sample. */
+export function playerPoolGames(scout: PlayerScout): number {
+  let games = 0;
+  for (const hero of scout.topHeroes) {
+    const fromSources =
+      (hero.sources.stormLeague?.games ?? 0) +
+      (hero.sources.ngsCurrent?.games ?? 0) +
+      (hero.sources.ngsPrior?.games ?? 0);
+    games += Math.max(hero.games, fromSources);
+  }
+  return games;
+}
+
+/**
+ * Pull a named seat off a hero that is missing from their pool.
+ * A four-game card barely moves the score. A deep pool on the other team
+ * does, because they are likely to stay on what they play. Our seats stay
+ * lighter: the comp we should draft matters more than the pocket.
+ */
+export function belowBarSeatPenalty(poolGames: number, side: "our" | "their"): number {
+  const confidence = poolConfidence(poolGames);
+  const weight = side === "their" ? 1 : 0.35;
+  return Math.round(BELOW_BAR_SEAT_PENALTY * confidence * weight);
+}
 
 /**
  * When a pick is scored for a named seat and that player is under the suggest
@@ -808,12 +848,12 @@ export function slHeroSuggestions(args: {
   roster: PlayerScout[];
   /** Hero keys already locked or banned. */
   gone: ReadonlySet<string>;
-  /** Lowercase display names who already locked a hero. */
+  /** Display names who already locked a hero. OCR slips count as the same player. */
   takenPlayers?: ReadonlySet<string>;
 }): SlHeroSuggestion[] {
   const goneKeys = new Set([...args.gone].map((hero) => heroKey(hero)));
   const taken = new Set(
-    [...(args.takenPlayers ?? [])].map((name) => name.toLowerCase()),
+    [...(args.takenPlayers ?? [])].map((name) => playerFold(name)),
   );
   const rows: {
     player: string;
@@ -822,7 +862,7 @@ export function slHeroSuggestions(args: {
 
   for (const player of args.roster) {
     const name = playerDisplayName(player.battletag);
-    if (!name || taken.has(name.toLowerCase())) continue;
+    if (!name || taken.has(playerFold(name))) continue;
     const options = player.topHeroes
       .map((hero) => {
         const rank = slRank(hero);

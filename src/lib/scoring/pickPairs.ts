@@ -276,6 +276,36 @@ export function scoreOrderedPair(args: {
 }
 
 /**
+ * Required roles the last two picks have to cover.
+ * A missing healer cannot be left to a later lock when this double is the
+ * last picks — one of the two heroes has to be that healer. The partner
+ * stays flexible. Other holes are only forced when the healer is already locked.
+ */
+export function rolesThisPairMustCover(
+  lockedHeroes: readonly string[],
+  picksAfter: number,
+): RequiredRole[] {
+  if (picksAfter > 0) return [];
+  const missing = checkRequiredRoles(lockedHeroes).missing;
+  if (missing.includes("healer")) return ["healer"];
+  return missing.slice(0, 2);
+}
+
+/** True when the two locks fill every role this pair is required to cover. */
+export function pairCoversRoles(
+  lockedHeroes: readonly string[],
+  first: string,
+  second: string,
+  roles: readonly RequiredRole[],
+): boolean {
+  if (!roles.length) return true;
+  const have = new Set(
+    assignRequiredRoles([...lockedHeroes, first, second]).values(),
+  );
+  return roles.every((role) => have.has(role));
+}
+
+/**
  * Rank unordered seat-hero pairs. For each set, try both lock orders and
  * keep the better one. Caps per-seat fan-out for speed.
  */
@@ -290,9 +320,17 @@ export function rankDoublePickPairs(args: {
   table: DraftMetaTable | null | undefined;
   maxPerSeat?: number;
   maxPairs?: number;
+  /**
+   * Heroes that must survive the per-seat cap even when their solo score is low.
+   * Used so a healer is not trimmed off before the pair is built.
+   */
+  protect?: (hero: string) => boolean;
+  /** Drop pairs that do not fill the roles this window has to cover. */
+  requirePair?: (first: string, second: string) => boolean;
 }): RankedPickPair[] {
   const maxPerSeat = args.maxPerSeat ?? 5;
   const maxPairs = args.maxPairs ?? 6;
+  const protectLimit = 2;
   if (args.seats.length < 2) return [];
 
   const trimmed = args.seats.map((s) => {
@@ -303,12 +341,24 @@ export function rankDoublePickPairs(args: {
     );
     const seen = new Set<string>();
     const out: PairSeatCand[] = [];
-    for (const c of sorted) {
+    const push = (c: PairSeatCand) => {
       const k = heroKey(c.hero);
-      if (seen.has(k)) continue;
+      if (seen.has(k)) return;
       seen.add(k);
       out.push(c);
+    };
+    if (args.protect) {
+      let kept = 0;
+      for (const c of sorted) {
+        if (kept >= protectLimit) break;
+        if (!args.protect(c.hero)) continue;
+        push(c);
+        kept += 1;
+      }
+    }
+    for (const c of sorted) {
       if (out.length >= maxPerSeat) break;
+      push(c);
     }
     return { role: s.role, player: s.player, cands: out };
   });
@@ -354,10 +404,13 @@ export function rankDoublePickPairs(args: {
     }
   }
 
-  return [...bestByKey.values()]
-    .sort((a, b) => b.total - a.total || a.first.localeCompare(b.first))
-    .slice(0, maxPairs)
-    .map(({ key: _k, ...rest }) => rest);
+  let ranked = [...bestByKey.values()].sort(
+    (a, b) => b.total - a.total || a.first.localeCompare(b.first),
+  );
+  if (args.requirePair) {
+    ranked = ranked.filter((pair) => args.requirePair!(pair.first, pair.second));
+  }
+  return ranked.slice(0, maxPairs).map(({ key: _k, ...rest }) => rest);
 }
 
 /** Points added for each required role this pair covers that was still open. */

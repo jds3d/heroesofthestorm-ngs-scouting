@@ -2,7 +2,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from "child_process";
 import path from "path";
 import readline from "readline";
 
-export type OcrLine = { text: string; top: number; score: number };
+export type OcrLine = { text: string; top: number; score: number; x?: number };
 
 type Reply = {
   id: number;
@@ -16,6 +16,8 @@ type Reply = {
 
 let child: ChildProcessWithoutNullStreams | null = null;
 let sequence = 0;
+/** One JSON line at a time. Two in-flight reads must not interleave on the pipe. */
+let stdinChain: Promise<void> = Promise.resolve();
 export type ColumnRead = {
   left: OcrLine[];
   right: OcrLine[];
@@ -42,6 +44,20 @@ function pythonBin(): string {
 function failAll(error: Error) {
   for (const waiter of waiting.values()) waiter.reject(error);
   waiting.clear();
+}
+
+function writeRequest(proc: ChildProcessWithoutNullStreams, line: string): Promise<void> {
+  const next = stdinChain.then(
+    () =>
+      new Promise<void>((resolve, reject) => {
+        proc.stdin.write(line, (error) => (error ? reject(error) : resolve()));
+      }),
+  );
+  stdinChain = next.then(
+    () => undefined,
+    () => undefined,
+  );
+  return next;
 }
 
 function ensureChild(): ChildProcessWithoutNullStreams {
@@ -135,7 +151,8 @@ function readNameColumnsOnce(
         reject(error);
       },
     });
-    proc.stdin.write(
+    void writeRequest(
+      proc,
       `${JSON.stringify({
         id,
         left,
@@ -144,6 +161,11 @@ function readNameColumnsOnce(
         picksRight: picks?.right ?? "",
         center: center ?? "",
       })}\n`,
-    );
+    ).catch((error: unknown) => {
+      if (!waiting.has(id)) return;
+      waiting.delete(id);
+      clearTimeout(timer);
+      reject(error instanceof Error ? error : new Error("name reader write failed"));
+    });
   });
 }

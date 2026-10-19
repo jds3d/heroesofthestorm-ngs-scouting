@@ -414,17 +414,14 @@ export function readThreeBanHexSlots(
       identified.push(null);
       continue;
     }
-    const isFilled = banHexFilled(crop.pixels);
-    const hero = isFilled
-      ? matchBanPixels(crop.pixels, crop.width, crop.height)
-      : null;
-    if (isFilled && !hero && noBanPlateMatch(crop.pixels, crop.width, crop.height)) {
+    const hero = matchBanPixels(crop.pixels, crop.width, crop.height);
+    if (!hero && noBanPlateMatch(crop.pixels, crop.width, crop.height)) {
       filled.push(false);
       identified.push(null);
       passed[passed.length - 1] = true;
       continue;
     }
-    filled.push(isFilled);
+    filled.push(Boolean(hero));
     identified.push(hero);
   }
   if (crops.length === 3) {

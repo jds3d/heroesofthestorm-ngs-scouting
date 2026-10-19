@@ -247,6 +247,11 @@ export type LiveDraft = {
   /** Whose ban or pick the plates / banner say is open right now. */
   turn?: LiveTurn | null;
   map: string | null;
+  /**
+   * The loading screen showed both teams. Picks are final even when a ban
+   * was never read off the draft lobby.
+   */
+  sealed?: boolean;
 };
 
 export type LiveTurn = { side: "our" | "their"; kind: "ban" | "pick" };
@@ -365,12 +370,12 @@ export function openSeatPlayers(
   const lockedNames = new Set<string>();
   seats.forEach((seat, index) => {
     const name = seat.player?.trim();
-    if (name && locked[index]) lockedNames.add(name.toLowerCase());
+    if (name && locked[index]) lockedNames.add(playerFold(name));
   });
   seats.forEach((seat, index) => {
     const name = seat.player?.trim();
     if (!name || locked[index]) return;
-    const key = name.toLowerCase();
+    const key = playerFold(name);
     if (seen.has(key) || lockedNames.has(key)) return;
     seen.add(key);
     out.push(name);
@@ -456,13 +461,56 @@ export function heroOnPlate(text: string): string | null {
   return null;
 }
 
+/**
+ * Words painted on the Storm League party screen that are not battletags:
+ * the rank medals, and "No Role Selected".
+ */
+const PARTY_MEDAL_WORDS = new Set([
+  "platinum",
+  "diamond",
+  "gold",
+  "silver",
+  "bronze",
+  "master",
+  "grandmaster",
+  "selected",
+  "unranked",
+]);
+
+export function isPartyMedalName(name: string): boolean {
+  return PARTY_MEDAL_WORDS.has(name.toLowerCase().replace(/[^a-z]/g, ""));
+}
+
+/**
+ * The queue screen names our five. The opponent has not loaded, and a rank
+ * medal is not a player.
+ */
+export function draftFromPartyQueue(partyNames: readonly string[]): LiveDraft {
+  const ours: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of partyNames) {
+    const name = raw.trim();
+    if (!name || isPartyMedalName(name)) continue;
+    const fold = name.toLowerCase();
+    if (seen.has(fold)) continue;
+    seen.add(fold);
+    ours.push(name);
+    if (ours.length === 5) break;
+  }
+  return {
+    ...EMPTY_LIVE_DRAFT,
+    ourOpenPlayers: ours,
+    theirOpenPlayers: [],
+  };
+}
+
 /** Names from the party-row OCR crop, left to right (at most five). */
 export function partyNamesFromText(text: string): string[] {
   const names: string[] = [];
   const seen = new Set<string>();
   for (const token of text.split(/[^A-Za-z0-9']+/)) {
     const name = plateNameToken(token);
-    if (!name || name.length < 5) continue;
+    if (!name || name.length < 5 || isPartyMedalName(name)) continue;
     const fold = name.toLowerCase();
     if (seen.has(fold)) continue;
     seen.add(fold);
@@ -613,9 +661,9 @@ function allyPlateFill(pixels: readonly Rgb[]): PlateFill {
   cast.sort((a, b) => a - b);
   const medianLuma = lumas[Math.floor(lumas.length / 2)] ?? 0;
   const medianCast = cast[Math.floor(cast.length / 2)] ?? 0;
-  // Locked ally picks are bright but usually not the brightest wash on the column.
-  // A hover can read bright too; the mid band between ~126 and ~136 is hover on reference shots.
-  if (medianCast >= 50 || medianLuma < 115) return "shown";
+  // A light lock stays above the dark hover plates even when a screen capture
+  // is dimmer than the reference PNG. Hovers on those shots sit near 80.
+  if (medianCast >= 50 || medianLuma < 100) return "shown";
   return "locked";
 }
 
@@ -663,13 +711,13 @@ export function colorfulFraction(pixels: readonly Rgb[]): number {
 }
 
 /**
- * A ban hex with a hero face in it. An empty hex is the dark frame only.
- * The magenta "banning" arrow on draft lobby shrines.png scores about 0.28, so it
- * stays under this cut. Real ban faces on draft lobby volskaya.png score 0.36 and up.
+ * Fast "something is in this hex" check for lobby detection. It is not used
+ * to accept or reject a ban name — that is the face match.
+ * The magenta banning arrow on draft lobby shrines.png scores about 0.28.
  */
 export function banHexFilled(pixels: readonly Rgb[]): boolean {
   if (pixels.length < 20) return false;
-  return colorfulFraction(pixels) > 0.33;
+  return colorfulFraction(pixels) > 0.29;
 }
 
 /**
@@ -961,20 +1009,19 @@ export function platesForLines(
   return { locked, shown };
 }
 
-/** Drop a hero that is on screen on a blue plate, even if an earlier frame locked it. */
+/**
+ * A hero already registered as a lock stays registered.
+ * A later frame that misses the portrait, or reads a covered plate as a hover,
+ * does not take it off the board.
+ */
 export function dropShownLocks(
   locked: { heroes: string[]; players: (string | null)[] },
-  shown: readonly string[],
+  _shown: readonly string[],
 ): { heroes: string[]; players: (string | null)[] } {
-  const drop = new Set(shown.map((hero) => heroKey(hero)));
-  const heroes: string[] = [];
-  const players: (string | null)[] = [];
-  locked.heroes.forEach((hero, index) => {
-    if (drop.has(heroKey(hero))) return;
-    heroes.push(hero);
-    players.push(locked.players[index] ?? null);
-  });
-  return { heroes, players };
+  return {
+    heroes: [...locked.heroes],
+    players: locked.heroes.map((_, index) => locked.players[index] ?? null),
+  };
 }
 
 /**
@@ -1088,8 +1135,9 @@ export function portraitTeamRim(
 }
 
 /**
- * A locked pick after bans. Ally hovers use a blue nameplate; enemy seats never hover —
- * a read hero name on their column is always a lock. Otherwise use nameplate color only.
+ * A hero name plate with a light background is locked. A dark plate is a hover.
+ * The enemy column has no hovers: fog of war hides what they are considering,
+ * so a hero name printed on their plate is a lock in either phase.
  */
 export function portraitIsLocked(args: {
   phase: "ban" | "pick" | null;
@@ -1098,51 +1146,36 @@ export function portraitIsLocked(args: {
   teamRim?: { blue: number; red: number };
   plate?: PlateFill;
   ally?: boolean;
-  /** OCR read a hero name on this nameplate (enemy column treats this as locked). */
+  /** OCR read a hero name on this nameplate. */
   heroOnPlate?: boolean;
-  /** The slot banner still says PICKING — hover, not a lock. */
+  /** The slot banner still says PICKING — an ally hover, not a lock. */
   slotPicking?: boolean;
   /**
-   * Second ban round. A committed white or pink plate is a pick that was
-   * locked before this ban. Opening "BLUE BAN" / "RED BAN" cards do not set this.
+   * Kept for callers that still pass the second-ban flag. Plate color and the
+   * enemy name decide the lock; this flag no longer overrides them.
    */
   keepCommitted?: boolean;
 }): boolean {
-  if (args.phase === "ban" && args.keepCommitted) {
-    if (args.slotPicking || args.plate !== "locked" || !args.faceFilled) return false;
-    if (args.ally === true && !args.heroOnPlate) return false;
-    if (args.ally === false && !args.heroOnPlate) return false;
-    return true;
-  }
-  if (args.phase === "ban") {
-    return false;
-  }
+  if (args.ally === false) return Boolean(args.heroOnPlate);
   if (args.slotPicking) return false;
-  if (args.ally === false && args.heroOnPlate) return true;
-  if (args.ally === true && !args.heroOnPlate) return false;
-  if (!args.faceFilled) return false;
-  if (args.plate === "shown" || args.plate === "empty") return false;
+  if (!args.heroOnPlate || !args.faceFilled) return false;
   return args.plate === "locked";
 }
 
-/** Drop picks that are visible again on a blue hover plate. */
+/**
+ * Keep every pick that has already been registered.
+ * `shown` is the heroes a later frame painted on a hover plate. Covering a
+ * locked portrait can look like that. It does not erase the lock.
+ */
 export function pruneHoverPicks(
   prev: readonly string[],
   prevPlayers: readonly (string | null)[],
-  shown: readonly string[],
+  _shown: readonly string[],
 ): { heroes: string[]; players: (string | null)[] } {
-  if (!shown.length) {
-    return { heroes: [...prev], players: [...prevPlayers] };
-  }
-  const drop = new Set(shown.map((hero) => heroKey(hero)));
-  const heroes: string[] = [];
-  const players: (string | null)[] = [];
-  prev.forEach((hero, index) => {
-    if (drop.has(heroKey(hero))) return;
-    heroes.push(hero);
-    players.push(prevPlayers[index] ?? null);
-  });
-  return { heroes, players };
+  return {
+    heroes: [...prev],
+    players: prev.map((_, index) => prevPlayers[index] ?? null),
+  };
 }
 
 /** Same rule, plus a saturated blue or red rim that is bright but not white. */
@@ -1168,6 +1201,101 @@ function asSlotLocks(
  */
 function platePlayerKey(name: string): string {
   return name.trim().toLowerCase();
+}
+
+type SharedPlate = { hero: string; plate: PlateFill; slot: number };
+type SharedRead = { hero: string | null };
+
+function heroPlateState(
+  hero: string,
+  reads: readonly SharedRead[],
+  slots: readonly SharedPlate[],
+): "locked" | "open" | "absent" {
+  const key = heroKey(hero);
+  const plates: PlateFill[] = [];
+  reads.forEach((read, index) => {
+    if (!read.hero || heroKey(read.hero) !== key) return;
+    const plate = slots.find((slot) => slot.slot === index)?.plate;
+    if (plate) plates.push(plate);
+  });
+  for (const slot of slots) {
+    if (heroKey(slot.hero) === key) plates.push(slot.plate);
+  }
+  if (plates.some((plate) => plate === "locked")) return "locked";
+  if (plates.length > 0) return "open";
+  return "absent";
+}
+
+function withoutHero(
+  heroes: readonly string[],
+  players: readonly (string | null)[],
+  hero: string,
+): { heroes: string[]; players: (string | null)[] } {
+  const key = heroKey(hero);
+  const nextHeroes: string[] = [];
+  const nextPlayers: (string | null)[] = [];
+  heroes.forEach((name, index) => {
+    if (heroKey(name) === key) return;
+    nextHeroes.push(name);
+    nextPlayers.push(players[index] ?? null);
+  });
+  return { heroes: nextHeroes, players: nextPlayers };
+}
+
+/**
+ * The same hero on both teams means one of the reads is a hover.
+ * Look at the nameplates again. A highlighted plate is the lock.
+ * A plate that is on screen and not highlighted is not.
+ */
+export function settleSharedPicks(args: {
+  ourPicks: readonly string[];
+  theirPicks: readonly string[];
+  ourPlayers: readonly (string | null)[];
+  theirPlayers: readonly (string | null)[];
+  ourReads: readonly SharedRead[];
+  theirReads: readonly SharedRead[];
+  ourSlots: readonly SharedPlate[];
+  theirSlots: readonly SharedPlate[];
+}): {
+  ourPicks: string[];
+  theirPicks: string[];
+  ourPlayers: (string | null)[];
+  theirPlayers: (string | null)[];
+} {
+  let ourPicks = [...args.ourPicks];
+  let theirPicks = [...args.theirPicks];
+  let ourPlayers = args.ourPicks.map((_, index) => args.ourPlayers[index] ?? null);
+  let theirPlayers = args.theirPicks.map((_, index) => args.theirPlayers[index] ?? null);
+  const shared = ourPicks.filter((hero) =>
+    theirPicks.some((other) => heroKey(other) === heroKey(hero)),
+  );
+  for (const hero of shared) {
+    const ours = heroPlateState(hero, args.ourReads, args.ourSlots);
+    const theirs = heroPlateState(hero, args.theirReads, args.theirSlots);
+    if (ours === "locked" && theirs !== "locked") {
+      const next = withoutHero(theirPicks, theirPlayers, hero);
+      theirPicks = next.heroes;
+      theirPlayers = next.players;
+    } else if (theirs === "locked" && ours !== "locked") {
+      const next = withoutHero(ourPicks, ourPlayers, hero);
+      ourPicks = next.heroes;
+      ourPlayers = next.players;
+    } else if (ours === "open") {
+      const next = withoutHero(ourPicks, ourPlayers, hero);
+      ourPicks = next.heroes;
+      ourPlayers = next.players;
+      if (theirs === "open") {
+        const other = withoutHero(theirPicks, theirPlayers, hero);
+        theirPicks = other.heroes;
+        theirPlayers = other.players;
+      }
+    } else if (theirs === "open") {
+      const next = withoutHero(theirPicks, theirPlayers, hero);
+      theirPicks = next.heroes;
+      theirPlayers = next.players;
+    }
+  }
+  return { ourPicks, theirPicks, ourPlayers, theirPlayers };
 }
 
 export function takeNewLocks(
@@ -1209,7 +1337,11 @@ export function takeNewLocks(
     announced.findIndex((name) => heroKey(name) === heroKey(hero));
   const slotAt = (hero: string) =>
     bright.findIndex((lock) => heroKey(lock.hero) === heroKey(hero));
+  const announcedFresh = fresh.filter((lock) => announcedAt(lock.hero) !== -1).length;
   fresh.sort((a, b) => {
+    // One center splash is the hero on screen now, not the first lock of the
+    // draft. Slot order stands until at least two heroes were announced.
+    if (announcedFresh < 2) return slotAt(a.hero) - slotAt(b.hero);
     const ia = announcedAt(a.hero);
     const ib = announcedAt(b.hero);
     const ra = ia === -1 ? announced.length + slotAt(a.hero) : ia;
@@ -1252,6 +1384,14 @@ export function heroFromPlateText(text: string): string | null {
   const list = plateHeroList();
   const exact = list.find((hero) => hero.norm === joined);
   if (exact) return exact.hero;
+  if (joined.length >= 5) {
+    const near = list.filter(
+      (hero) =>
+        Math.abs(hero.norm.length - joined.length) <= 1 &&
+        editDistance(hero.norm, joined) <= 1,
+    );
+    if (near.length === 1) return near[0].hero;
+  }
   if (joined.length >= 6) {
     const prefix = list.filter((hero) => {
       const gap = Math.abs(hero.norm.length - joined.length);
@@ -1259,12 +1399,6 @@ export function heroFromPlateText(text: string): string | null {
       return hero.norm.startsWith(joined) || joined.startsWith(hero.norm);
     });
     if (prefix.length === 1) return prefix[0].hero;
-    const near = list.filter(
-      (hero) =>
-        Math.abs(hero.norm.length - joined.length) <= 1 &&
-        editDistance(hero.norm, joined) <= 1,
-    );
-    if (near.length === 1) return near[0].hero;
   }
   for (const token of text.split(/[^A-Za-z0-9']+/)) {
     if (token.length < 3) continue;
@@ -1297,6 +1431,15 @@ export function ocrFold(name: string): string {
     .replace(/[il1|!]/g, "l")
     .replace(/[o0]/g, "o")
     .replace(/[^a-z0-9]/g, "");
+}
+
+/**
+ * One player across a battletag suffix and an OCR slip.
+ * HuckIt, Hucklt, and HuckIt#1686 are the same seat.
+ */
+export function playerFold(name: string | null | undefined): string {
+  const base = name?.split("#")[0]?.trim() ?? "";
+  return base ? ocrFold(base) : "";
 }
 
 function editDistance(a: string, b: string): number {
@@ -1397,10 +1540,8 @@ export function bannerTurn(text: string): {
     !phase &&
     /\bwaiting for enemy\b/.test(lower) &&
     !/\bwaiting for enemy ban\b/.test(lower) &&
-    (/\bred\s+pick\b/i.test(lower) ||
-      /\bblue\s+pick\b/i.test(lower) ||
-      tight.includes("redpick") ||
-      tight.includes("bluepick"))
+    !tight.includes("enemyban") &&
+    !tight.includes("teamban")
   ) {
     phase = "pick";
   }
@@ -1513,6 +1654,21 @@ export function banSideFromSplash(text: string): "our" | "their" | null {
  */
 export function acceptPlatePicks(args: { banPhase: boolean; picksStarted: boolean }): boolean {
   return args.picksStarted && !args.banPhase;
+}
+
+/**
+ * Heroes already locked on the name plates count even when the center banner
+ * has not said "pick". "Waiting for Enemy..." is that case. The opening
+ * team-color ban card is the exception: those side portraits are showcases.
+ */
+export function acceptLockedPlates(args: {
+  lockedCount: number;
+  lockPhase: "ban" | "pick" | null;
+  keepCommitted: boolean;
+}): boolean {
+  if (!slotsHoldPicks(args.lockedCount)) return false;
+  if (args.lockPhase === "ban") return args.keepCommitted;
+  return true;
 }
 
 /**
@@ -1664,11 +1820,14 @@ function liveDraftSlotFilled(hero: string): boolean {
 
 /** All six bans and ten picks read from the screen (matches scout “draft complete”). */
 export function liveDraftBoardFull(draft: LiveDraft): boolean {
-  return (
-    draft.ourBans.filter(liveDraftSlotFilled).length === 3 &&
-    draft.theirBans.filter(liveDraftSlotFilled).length === 3 &&
+  const picks =
     draft.ourPicks.filter(liveDraftSlotFilled).length === 5 &&
-    draft.theirPicks.filter(liveDraftSlotFilled).length === 5
+    draft.theirPicks.filter(liveDraftSlotFilled).length === 5;
+  if (draft.sealed && picks) return true;
+  return (
+    picks &&
+    draft.ourBans.filter(liveDraftSlotFilled).length === 3 &&
+    draft.theirBans.filter(liveDraftSlotFilled).length === 3
   );
 }
 
@@ -2033,6 +2192,9 @@ export function resolveFirstPick(
       if (resolved) return resolved;
       if (ourPicks === 5 && theirPicks === 5) return "us";
     }
+    // Two of their locks before we have one cannot happen on either side.
+    // A ban-board guess must not keep that board.
+    if (!usFits && !themFits) return null;
   }
 
   if (
@@ -2107,6 +2269,15 @@ export function isDraftSideKnown(
   draft: LiveDraft | null,
 ): boolean {
   if (!draft) return false;
+  const our = draft.ourPicks.length;
+  const their = draft.theirPicks.length;
+  if (
+    our + their > 0 &&
+    !pickCountsFit(true, our, their) &&
+    !pickCountsFit(false, our, their)
+  ) {
+    return false;
+  }
   if (resolveFirstPick(draft)) return true;
   if (!observedDraftHasProgress(draft)) return false;
   const usScore = draftFitScore(draft, true);
