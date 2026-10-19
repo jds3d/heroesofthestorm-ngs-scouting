@@ -72,6 +72,8 @@ import {
   takeNewLocks,
   turnFromOcr,
   draftLobbyLikelyOnFrame,
+  draftShortOfPicks,
+  bothSidesPickedFive,
   liveDraftBoardFull,
   watchPhase,
   type DraftBox,
@@ -419,6 +421,13 @@ export function LobbyScreenWatch({
   const idlePausedRef = useRef(false);
   /** Draft finished on screen — keep state and sharing until Reset draft. */
   const draftCompleteRef = useRef(false);
+  /** Loading screen grabbed while a lobby read was still running. */
+  const heldLoadingRef = useRef<HTMLCanvasElement | null>(null);
+  const loadingArrivedDuringBusyRef = useRef(false);
+  const loadingTriesRef = useRef(0);
+  /** Last draft-lobby frame, kept so the loading screen is not what gets saved. */
+  const lastLobbyShotRef = useRef<{ frame: HTMLCanvasElement; draft: LiveDraft } | null>(null);
+  const reviewSavedRef = useRef(false);
   const onReplaySyncRef = useRef(onReplaySync);
   const leftNamesRef = useRef<string[]>([]);
   const rightNamesRef = useRef<string[]>([]);
@@ -588,6 +597,45 @@ export function LobbyScreenWatch({
     return readColumn(frame, worker, DRAFT_TITLE_BOX);
   }
 
+  function reviewBoard(draft: LiveDraft) {
+    const picks = (heroes: string[], players: (string | null)[]) =>
+      heroes.flatMap((hero, index) =>
+        hero && hero !== "__unseen__"
+          ? [{ hero, player: players[index] ?? null }]
+          : [],
+      );
+    return {
+      map: draft.map,
+      firstPick: draft.firstPick,
+      ourBans: draft.ourBans.filter((hero) => hero && hero !== "__unseen__"),
+      theirBans: draft.theirBans.filter((hero) => hero && hero !== "__unseen__"),
+      ourPicks: picks(draft.ourPicks, draft.ourPickPlayers),
+      theirPicks: picks(draft.theirPicks, draft.theirPickPlayers),
+    };
+  }
+
+  async function saveDraftReview(frame: HTMLCanvasElement, draft: LiveDraft) {
+    if (reviewSavedRef.current) return;
+    const board = reviewBoard(draft);
+    if (board.ourPicks.length + board.theirPicks.length === 0) return;
+    reviewSavedRef.current = true;
+    const blob = await canvasBlob(frame, "image/png");
+    if (!blob) {
+      reviewSavedRef.current = false;
+      return;
+    }
+    const bytes = new Uint8Array(await blob.arrayBuffer());
+    let binary = "";
+    for (let i = 0; i < bytes.length; i += 0x8000) {
+      binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+    }
+    await fetch("/api/draft-examples", {
+      method: "POST",
+      headers: { "content-type": "application/json", ...scoutHeaders() },
+      body: JSON.stringify({ kind: "review", image: btoa(binary), board }),
+    }).catch(() => undefined);
+  }
+
   function scoutHeaders(): Record<string, string> {
     const secret = process.env.NEXT_PUBLIC_SCOUT_API_SECRET?.trim();
     return secret ? { "x-scout-secret": secret } : {};
@@ -673,6 +721,24 @@ function stackNameplates(frame: HTMLCanvasElement, boxes: readonly DraftBox[]): 
     out.drawImage(frame, sx, sy, sw, sh, dx, dy, dw, dh);
   });
   return plate;
+}
+
+function snapshotVideo(video: HTMLVideoElement): HTMLCanvasElement | null {
+  if (video.readyState < 2 || video.videoWidth < 32 || video.videoHeight < 32) return null;
+  const frame = document.createElement("canvas");
+  frame.width = video.videoWidth;
+  frame.height = video.videoHeight;
+  const ctx = frame.getContext("2d", { willReadFrequently: true });
+  if (!ctx) return null;
+  ctx.drawImage(video, 0, 0);
+  return frame;
+}
+
+function canvasIsLoadingScreen(frame: HTMLCanvasElement): boolean {
+  const ctx = frame.getContext("2d", { willReadFrequently: true });
+  if (!ctx) return false;
+  const pixelAt = framePixelAt(ctx, frame);
+  return Boolean(pixelAt && finalScreenLikely(frame.width, frame.height, pixelAt));
 }
 
 function framePixelAt(
@@ -871,6 +937,11 @@ async function readLobby(
     ourSeatNamesRef.current = [];
     theirSeatNamesRef.current = [];
     mismatchSavedRef.current = false;
+    heldLoadingRef.current = null;
+    loadingArrivedDuringBusyRef.current = false;
+    loadingTriesRef.current = 0;
+    lastLobbyShotRef.current = null;
+    reviewSavedRef.current = false;
     openTurnRef.current = null;
     picksStartedRef.current = false;
     draftRef.current = {
@@ -1004,7 +1075,7 @@ async function readLobby(
    * nameplate pass skips that and leaves the fingerprint for the full pass.
    * Returns true when this frame should stop (draft finished, or a reset landed).
    */
-  function publishWatched(
+  async function publishWatched(
     lobby: Awaited<ReturnType<typeof readLobby>>,
     titleText: string,
     statusText: string,
@@ -1014,7 +1085,7 @@ async function readLobby(
     ctx: CanvasRenderingContext2D,
     fingerprint: string,
     epoch: number,
-  ): boolean {
+  ): Promise<boolean> {
     const roster = rosterRef.current;
     const partyText = "";
     const mapHint = mapFromTitle(titleText) ?? draftRef.current.map ?? null;
@@ -1053,7 +1124,10 @@ async function readLobby(
     theirSeatNamesRef.current = watched.memory.theirSeatNames;
     const leftLocked = watched.leftLocked;
     const rightLocked = watched.rightLocked;
-    const nextDraft = watched.draft;
+    let nextDraft = watched.draft;
+    if (bothSidesPickedFive(nextDraft) && !nextDraft.sealed) {
+      nextDraft = { ...nextDraft, sealed: true };
+    }
     const ourColumn = watched.memory.ourColumn;
     const theirColumn = watched.memory.theirColumn;
     const inParty = watched.inParty;
@@ -1107,13 +1181,15 @@ async function readLobby(
         });
       }
     }
+    lastLobbyShotRef.current = { frame, draft: nextDraft };
     if (epoch !== epochRef.current) return true;
     draftRef.current = nextDraft;
     onDraftRef.current(nextDraft);
     if (liveDraftBoardFull(nextDraft) && !draftCompleteRef.current) {
       draftCompleteRef.current = true;
       clearWatchTimer();
-      setStatus("Draft complete. Board stays here until you click Reset draft.");
+      await saveDraftReview(frame, nextDraft);
+      setStatus("Draft complete. Saved the lobby screenshot for review.");
       return true;
     }
     if (ourColumn.length >= 3) {
@@ -1163,19 +1239,42 @@ async function readLobby(
   }
 
   async function readFrame(video: HTMLVideoElement, worker: Worker) {
-    if (busyRef.current || video.readyState < 2) return;
+    if (video.readyState < 2) return;
     if (hiddenRef.current) return;
     if (idlePausedRef.current) return;
     if (draftCompleteRef.current) return;
+    const live = snapshotVideo(video);
+    if (live && canvasIsLoadingScreen(live)) {
+      if (!heldLoadingRef.current) loadingTriesRef.current = 0;
+      heldLoadingRef.current = live;
+    }
+    if (busyRef.current) {
+      if (heldLoadingRef.current) loadingArrivedDuringBusyRef.current = true;
+      return;
+    }
     const epoch = epochRef.current;
     busyRef.current = true;
     try {
-      const frame = document.createElement("canvas");
-      frame.width = video.videoWidth;
-      frame.height = video.videoHeight;
+      const held = heldLoadingRef.current;
+      if (held) {
+        if (!reviewSavedRef.current && lastLobbyShotRef.current) {
+          await saveDraftReview(lastLobbyShotRef.current.frame, lastLobbyShotRef.current.draft);
+        }
+        const heldCtx = held.getContext("2d", { willReadFrequently: true });
+        if (heldCtx) {
+          loadingTriesRef.current += 1;
+          await finishFromLoadingScreen(heldCtx, held, worker);
+        }
+        if (draftCompleteRef.current || loadingTriesRef.current >= 3) {
+          heldLoadingRef.current = null;
+          loadingTriesRef.current = 0;
+        }
+        return;
+      }
+      if (!live) return;
+      const frame = live;
       const ctx = frame.getContext("2d", { willReadFrequently: true });
       if (!ctx) return;
-      ctx.drawImage(video, 0, 0);
       if (await finishFromLoadingScreen(ctx, frame, worker)) return;
       const fingerprint = draftWatchFingerprintKey(ctx, frame);
       const banSlots = allBanSlotSignals(ctx, frame);
@@ -1248,7 +1347,7 @@ async function readLobby(
         if (epoch !== epochRef.current || seq !== frameSeqRef.current) return;
         if (
           quick &&
-          publishWatched(
+          (await publishWatched(
             quick,
             cached?.title ?? "",
             cached?.status ?? "",
@@ -1258,7 +1357,7 @@ async function readLobby(
             ctx,
             fingerprint,
             epoch,
-          )
+          ))
         ) {
           return;
         }
@@ -1323,6 +1422,15 @@ async function readLobby(
             );
             return;
           }
+          if (draftShortOfPicks(draftRef.current)) {
+            if (!reviewSavedRef.current && lastLobbyShotRef.current) {
+              await saveDraftReview(lastLobbyShotRef.current.frame, lastLobbyShotRef.current.draft);
+            }
+            setStatus(
+              "A pick is still missing. Holding this draft until the loading screen shows who locked it.",
+            );
+            return;
+          }
           await onReplaySyncRef.current?.();
           if (epoch !== epochRef.current) return;
           clearObserved();
@@ -1363,7 +1471,7 @@ async function readLobby(
       inDraftRef.current = true;
       armWatchTimer();
       if (
-        publishWatched(
+        await publishWatched(
           lobby,
           titleText,
           statusText,
@@ -1378,7 +1486,7 @@ async function readLobby(
         return;
       }
       if (refresh.center && !centerNow && lobby) {
-        void centerPromise.then((splash) => {
+        void centerPromise.then(async (splash) => {
           if (!splash) return;
           if (epoch !== epochRef.current || seq !== frameSeqRef.current) return;
           if (!inDraftRef.current || draftCompleteRef.current) return;
@@ -1393,7 +1501,7 @@ async function readLobby(
             };
           }
           if (!text) return;
-          publishWatched(
+          await publishWatched(
             lobby,
             titleText,
             statusText,
@@ -1410,6 +1518,18 @@ async function readLobby(
       setStatus("Could not read that frame. The watch is still running.");
     } finally {
       busyRef.current = false;
+      const arrivedDuringRead = loadingArrivedDuringBusyRef.current;
+      loadingArrivedDuringBusyRef.current = false;
+      if (
+        arrivedDuringRead &&
+        heldLoadingRef.current &&
+        !draftCompleteRef.current &&
+        !hiddenRef.current
+      ) {
+        const pendingVideo = videoRef.current;
+        const pendingWorker = workerRef.current;
+        if (pendingVideo && pendingWorker) void readFrame(pendingVideo, pendingWorker);
+      }
       if (streamRef.current) {
         setPhase("watching");
         armWatchTimer();
@@ -1426,6 +1546,11 @@ async function readLobby(
     ourSeatNamesRef.current = [];
     theirSeatNamesRef.current = [];
     mismatchSavedRef.current = false;
+    heldLoadingRef.current = null;
+    loadingArrivedDuringBusyRef.current = false;
+    loadingTriesRef.current = 0;
+    lastLobbyShotRef.current = null;
+    reviewSavedRef.current = false;
     announcedPicksRef.current = [];
     draftRef.current = {
       ...EMPTY_LIVE_DRAFT,

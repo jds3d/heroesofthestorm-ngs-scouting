@@ -3,6 +3,7 @@ import path from "path";
 import { NextResponse } from "next/server";
 import { rowsFromBanHexExamples } from "@/lib/lobby/banHexCatalog";
 import { mismatchCaseSource, type FinalScreenConflict } from "@/lib/lobby/finalScreen";
+import { reviewCaseSource, type DraftReviewBoard } from "@/lib/lobby/reviewCase";
 import { heroFromPlateText } from "@/lib/lobby/screenLobby";
 
 export const dynamic = "force-dynamic";
@@ -15,6 +16,8 @@ const BAN_HEX_CATALOG = path.join(process.cwd(), "src", "lib", "lobby", "banHexC
 const FRAME_DIR = path.join(process.cwd(), "examples", "drafts");
 const MISMATCH_DIR = path.join(process.cwd(), "examples", "mismatches");
 const MISMATCH_TEST_DIR = path.join(process.cwd(), "src", "lib", "lobby", "mismatches");
+const REVIEW_DIR = path.join(process.cwd(), "examples", "reviews");
+const REVIEW_TEST_DIR = path.join(process.cwd(), "src", "lib", "lobby", "reviews");
 const MANIFEST = path.join(PORTRAIT_DIR, "manifest.json");
 const MAX_PER_HERO = 4;
 const MAX_FRAMES = 8;
@@ -110,6 +113,57 @@ function conflictFrom(value: unknown): FinalScreenConflict | null {
   };
 }
 
+function reviewNames(value: unknown, max: number): string[] | null {
+  if (!Array.isArray(value) || value.length > max) return null;
+  const names: string[] = [];
+  for (const name of value) {
+    if (typeof name !== "string" || name.length > 40) return null;
+    names.push(name);
+  }
+  return names;
+}
+
+function reviewPicks(value: unknown): { hero: string; player: string | null }[] | null {
+  if (!Array.isArray(value) || value.length > 5) return null;
+  const picks: { hero: string; player: string | null }[] = [];
+  for (const row of value) {
+    if (!row || typeof row !== "object") return null;
+    const hero = (row as { hero?: unknown }).hero;
+    const player = (row as { player?: unknown }).player;
+    if (typeof hero !== "string" || hero.length > 40) return null;
+    if (player != null && (typeof player !== "string" || player.length > 40)) return null;
+    picks.push({ hero, player: typeof player === "string" ? player : null });
+  }
+  return picks;
+}
+
+function reviewBoardFrom(value: unknown): DraftReviewBoard | null {
+  if (!value || typeof value !== "object") return null;
+  const row = value as {
+    map?: unknown;
+    firstPick?: unknown;
+    ourBans?: unknown;
+    theirBans?: unknown;
+    ourPicks?: unknown;
+    theirPicks?: unknown;
+  };
+  const ourBans = reviewNames(row.ourBans, 8);
+  const theirBans = reviewNames(row.theirBans, 8);
+  const ourPicks = reviewPicks(row.ourPicks);
+  const theirPicks = reviewPicks(row.theirPicks);
+  if (!ourBans || !theirBans || !ourPicks || !theirPicks) return null;
+  if (row.map != null && (typeof row.map !== "string" || row.map.length > 80)) return null;
+  if (row.firstPick != null && row.firstPick !== "us" && row.firstPick !== "them") return null;
+  return {
+    map: typeof row.map === "string" ? row.map : null,
+    firstPick: row.firstPick === "us" || row.firstPick === "them" ? row.firstPick : null,
+    ourBans,
+    theirBans,
+    ourPicks,
+    theirPicks,
+  };
+}
+
 /** Save a labeled portrait, or one full draft frame, from the live watch. */
 export async function POST(request: Request) {
   const body = (await request.json()) as {
@@ -118,7 +172,36 @@ export async function POST(request: Request) {
     image?: unknown;
     source?: unknown;
     conflict?: unknown;
+    board?: unknown;
   };
+  if (body.kind === "review") {
+    const image = asBase64(body.image, 12_000_000);
+    const board = reviewBoardFrom(body.board);
+    if (!image || !board) {
+      return NextResponse.json({ error: "Expected the lobby screenshot and the read" }, { status: 400 });
+    }
+    const bytes = Buffer.from(image, "base64");
+    if (bytes[0] !== 0x89 || bytes[1] !== 0x50) {
+      return NextResponse.json({ error: "Expected a png frame" }, { status: 400 });
+    }
+    const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z");
+    const imageName = `review-${stamp}.png`;
+    const imagePath = `examples/reviews/${imageName}`;
+    await mkdir(REVIEW_DIR, { recursive: true });
+    await mkdir(REVIEW_TEST_DIR, { recursive: true });
+    await writeFile(path.join(REVIEW_DIR, imageName), bytes);
+    const testName = `review-${stamp}.test.ts`;
+    await writeFile(
+      path.join(REVIEW_TEST_DIR, testName),
+      reviewCaseSource(imagePath, board),
+    );
+    return NextResponse.json({
+      ok: true,
+      saved: true,
+      image: imagePath,
+      test: `src/lib/lobby/reviews/${testName}`,
+    });
+  }
   if (body.kind === "mismatch") {
     const image = asBase64(body.image, 12_000_000);
     const conflict = conflictFrom(body.conflict);

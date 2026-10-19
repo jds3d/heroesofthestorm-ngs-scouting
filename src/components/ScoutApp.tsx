@@ -829,7 +829,11 @@ export function ScoutApp() {
             {meta?.homeTeam ?? "Little Buff Boyz"}
           </span>
           . Pick your next A-league opponent to pull comfort pools, draft
-          tendencies, and ban priorities.
+          tendencies, and ban priorities.{" "}
+          <a href="/review" className="font-semibold text-[var(--accent)]">
+            Review finished drafts
+          </a>
+          .
         </p>
       </header>
       )}

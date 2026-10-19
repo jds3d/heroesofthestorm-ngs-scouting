@@ -47,6 +47,8 @@ import {
   namesFromOcrLines,
   draftLobbyLikelyOnFrame,
   liveDraftBoardFull,
+  bothSidesPickedFive,
+  draftShortOfPicks,
   EMPTY_LIVE_DRAFT,
   draftLobbySeen,
   mapFromTitle,
@@ -374,6 +376,12 @@ describe("draft locks from the screen", () => {
     expect(readSlotPlate(["VALLA", "novawolf117"])).toEqual({
       hero: "Valla",
       player: "novawolf117",
+    });
+    expect(heroFromPlateText("Wizard")).toBeNull();
+    expect(heroFromPlateText("LI-MING")).toBe("Li-Ming");
+    expect(readSlotPlate(["ARTHAS", "Wizard"])).toEqual({
+      hero: "Arthas",
+      player: "Wizard",
     });
     expect(nameFromPlate("MALGANS\nPeterWiggin")).toBe("PeterWiggin");
     expect(nameFromPlate("MAL'GANS")).toBeNull();
@@ -877,6 +885,30 @@ describe("draft locks from the screen", () => {
     expect(liveDraftBoardFull({ ...EMPTY_LIVE_DRAFT })).toBe(false);
   });
 
+  it("holds a draft that is still missing a pick and grades once both fives are in", () => {
+    const short = {
+      ...EMPTY_LIVE_DRAFT,
+      ourPicks: ["Kel'Thuzad", "Auriel", "Leoric", "Johanna"],
+      theirPicks: ["Anduin", "Gul'dan", "Lunara", "Zeratul", "Rehgar"],
+    };
+    expect(draftShortOfPicks(short)).toBe(true);
+    expect(draftShortOfPicks(EMPTY_LIVE_DRAFT)).toBe(false);
+    expect(bothSidesPickedFive(short)).toBe(false);
+    expect(
+      bothSidesPickedFive({
+        ...short,
+        ourPicks: ["Kel'Thuzad", "Auriel", "Leoric", "Johanna", "Ana"],
+      }),
+    ).toBe(true);
+    expect(
+      liveDraftBoardFull({
+        ...short,
+        ourPicks: ["Kel'Thuzad", "Auriel", "Leoric", "Johanna", "Ana"],
+        sealed: true,
+      }),
+    ).toBe(true);
+  });
+
   it("detects a likely draft lobby from pixels without OCR", () => {
     expect(
       draftLobbyLikelyOnFrame({ titleBrightShare: 0.02, banSlots: [] }),
@@ -930,6 +962,12 @@ describe("draft locks from the screen", () => {
         { text: "Frijolito", top: 340 },
       ]),
     ).toEqual([{ hero: "Dehaka", player: "SuperGoBu" }]);
+    expect(
+      locksFromOcrLines([
+        { text: "ARTHAS", top: 80 },
+        { text: "Wizard", top: 140 },
+      ]),
+    ).toEqual([{ hero: "Arthas", player: "Wizard" }]);
     expect(watchPhase("", true)).toBe("draft");
     expect(watchPhase(menu, true)).toBe("menu");
   });

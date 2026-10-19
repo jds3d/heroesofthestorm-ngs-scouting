@@ -1,7 +1,7 @@
 import { NGS_MAP_POOL } from "@/config/ngsMaps";
 import { DRAFT_ORDER } from "@/lib/scoring/draftPlan";
 import { HERO_META, heroKey } from "@/lib/scoring/heroMeta";
-import { allDraftHeroes, heroDraftSlug } from "@/lib/scoring/heroPortrait";
+import { allDraftHeroes } from "@/lib/scoring/heroPortrait";
 import type { ReplayAction } from "@/lib/review/replayDraft";
 
 function isHero(token: string): boolean {
@@ -1368,10 +1368,10 @@ let plateHeroes: { norm: string; hero: string }[] | null = null;
 function plateHeroList(): { norm: string; hero: string }[] {
   if (plateHeroes) return plateHeroes;
   const byNorm = new Map<string, string>();
+  // The plate prints LI-MING, not the portrait file name. That file is
+  // "wizard", and a player named Wizard is not Li-Ming.
   for (const hero of allDraftHeroes()) {
     byNorm.set(plateNorm(hero), hero);
-    const slug = heroDraftSlug(hero);
-    if (slug) byNorm.set(plateNorm(slug), hero);
   }
   plateHeroes = [...byNorm.entries()].map(([norm, hero]) => ({ norm, hero }));
   return plateHeroes;
@@ -1818,11 +1818,30 @@ function liveDraftSlotFilled(hero: string): boolean {
   return Boolean(hero && hero !== UNSEEN_BAN);
 }
 
+function filledPicks(heroes: readonly string[]): number {
+  return heroes.filter(liveDraftSlotFilled).length;
+}
+
+/** Both teams have five real picks. A missed ban does not count against this. */
+export function bothSidesPickedFive(draft: LiveDraft): boolean {
+  return filledPicks(draft.ourPicks) === 5 && filledPicks(draft.theirPicks) === 5;
+}
+
+/**
+ * A draft has started and at least one hero is still missing.
+ * The lobby can close before that lock is read. Keep the board and take the
+ * missing hero from the loading screen instead of wiping the draft.
+ */
+export function draftShortOfPicks(draft: LiveDraft): boolean {
+  const ours = filledPicks(draft.ourPicks);
+  const theirs = filledPicks(draft.theirPicks);
+  if (ours + theirs === 0) return false;
+  return ours < 5 || theirs < 5;
+}
+
 /** All six bans and ten picks read from the screen (matches scout “draft complete”). */
 export function liveDraftBoardFull(draft: LiveDraft): boolean {
-  const picks =
-    draft.ourPicks.filter(liveDraftSlotFilled).length === 5 &&
-    draft.theirPicks.filter(liveDraftSlotFilled).length === 5;
+  const picks = bothSidesPickedFive(draft);
   if (draft.sealed && picks) return true;
   return (
     picks &&
