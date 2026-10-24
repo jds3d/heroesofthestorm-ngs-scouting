@@ -75,4 +75,66 @@ describe("seat names", () => {
     expect(second.draft.ourOpenPlayers).toContain("JohnnyB");
     expect(second.draft.ourOpenPlayers).not.toContain("omnyD");
   });
+
+  it("keeps an ally hover off the locks and on the hover list", () => {
+    const memory = emptyWatchMemory();
+    memory.picksStarted = true;
+    const frame: WatchFrame = {
+      left: ["Sporty", "HuckIt"],
+      right: ["Deep"],
+      leftShown: ["Johanna"],
+      rightShown: [],
+      leftReads: [
+        { hero: "Johanna", player: "Sporty" },
+        { hero: null, player: "HuckIt" },
+        { hero: null, player: null },
+        { hero: null, player: null },
+        { hero: null, player: null },
+      ],
+      rightReads: [
+        { hero: "Anduin", player: "Deep" },
+        { hero: null, player: null },
+        { hero: null, player: null },
+        { hero: null, player: null },
+        { hero: null, player: null },
+      ],
+      leftSlots: [
+        {
+          hero: "Johanna",
+          player: "Sporty",
+          slot: 0,
+          plate: "shown",
+          faceFilled: true,
+          ally: true,
+        },
+      ],
+      rightSlots: [
+        {
+          hero: "Anduin",
+          player: "Deep",
+          slot: 0,
+          plate: "locked",
+          faceFilled: true,
+          ally: false,
+        },
+      ],
+      leftPicking: true,
+      rightPicking: false,
+      leftPickingFlags: [true, false, false, false, false],
+      rightPickingFlags: [false, false, false, false, false],
+    };
+    const next = nextWatchedDraft({
+      memory,
+      frame,
+      titleText: "Volskaya Foundry",
+      statusText: "Picking",
+      centerText: "BLUE PICK",
+      leftHexes: [],
+      rightHexes: [],
+      roster: ["Sporty#1", "HuckIt#1", "Deep#1"],
+    });
+    expect(next.draft.ourPicks).not.toContain("Johanna");
+    expect(next.draft.ourHovers).toEqual([{ hero: "Johanna", player: "Sporty" }]);
+    expect(next.draft.theirPicks).toContain("Anduin");
+  });
 });

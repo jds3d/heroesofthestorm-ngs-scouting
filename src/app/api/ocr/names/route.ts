@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { readNameColumns } from "@/lib/ocr/nameReader";
+import { readNameColumns, readSlotPlates } from "@/lib/ocr/nameReader";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -23,7 +23,30 @@ export async function POST(request: Request) {
     picksLeft?: unknown;
     picksRight?: unknown;
     center?: unknown;
+    slots?: unknown;
   };
+  if (Array.isArray(body.slots) && body.slots.length > 0) {
+    const slots: { side: "left" | "right"; index: number; image: string }[] = [];
+    for (const slot of body.slots.slice(0, 5)) {
+      if (!slot || typeof slot !== "object") continue;
+      const row = slot as { side?: unknown; index?: unknown; image?: unknown };
+      const image = picture(row.image);
+      if (row.side !== "left" && row.side !== "right") continue;
+      const index = typeof row.index === "number" ? row.index : -1;
+      if (!image || index < 0 || index > 4) continue;
+      slots.push({ side: row.side, index, image });
+    }
+    if (slots.length === 0) {
+      return NextResponse.json({ error: "Expected a picture." }, { status: 400 });
+    }
+    try {
+      const read = await readSlotPlates(slots);
+      return NextResponse.json({ slots: read });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Name reader failed";
+      return NextResponse.json({ error: message }, { status: 503 });
+    }
+  }
   const left = picture(body.left);
   const right = picture(body.right);
   const center = picture(body.center);

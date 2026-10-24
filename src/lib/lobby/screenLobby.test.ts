@@ -25,6 +25,8 @@ import {
   portraitFilled,
   readSlotPlate,
   readsBySlot,
+  replaceSlotLines,
+  keepFresherSlotLines,
   sideFromStatus,
   nextBanSide,
   banSideFromSplash,
@@ -50,6 +52,7 @@ import {
   bothSidesPickedFive,
   draftShortOfPicks,
   EMPTY_LIVE_DRAFT,
+  draftWithoutLock,
   draftLobbySeen,
   mapFromTitle,
   menuScreenSeen,
@@ -80,6 +83,8 @@ import {
   borderLooksLockedSamples,
   DRAFT_PLATE_SLOTS,
   DRAFT_SLOT_NAMES,
+  allySlotPlate,
+  dropShownPlates,
   portraitIsLocked,
   portraitTeamRim,
   rememberHeroes,
@@ -457,6 +462,35 @@ describe("draft locks from the screen", () => {
     ).toBe(true);
     expect(
       portraitIsLocked({
+        phase: "pick",
+        faceFilled: true,
+        ally: false,
+        heroOnPlate: true,
+        plate: "shown",
+      }),
+    ).toBe(true);
+    expect(
+      portraitIsLocked({
+        phase: "pick",
+        faceFilled: true,
+        ally: false,
+        heroOnPlate: true,
+        plate: "empty",
+      }),
+    ).toBe(true);
+    expect(
+      dropShownPlates(
+        ["Johanna", "Maiev"],
+        ["SportySpice", "HoboBaggins"],
+        [{ hero: "Johanna" }, { hero: "Maiev" }],
+        [
+          { slot: 0, plate: "locked" },
+          { slot: 1, plate: "shown" },
+        ],
+      ),
+    ).toEqual({ heroes: ["Johanna"], players: ["SportySpice"] });
+    expect(
+      portraitIsLocked({
         phase: "ban",
         faceFilled: true,
         ally: false,
@@ -788,6 +822,39 @@ describe("draft locks from the screen", () => {
       { side: "our", kind: "ban", hero: UNSEEN_BAN },
       { side: "their", kind: "ban", hero: UNSEEN_BAN },
       { side: "our", kind: "ban", hero: UNSEEN_BAN },
+    ]);
+  });
+
+  it("keeps the last pick wave when a second-round ban was not read", () => {
+    const actions = actionsFromObserved({
+      weFirst: true,
+      firstPick: "us",
+      phase: "pick",
+      map: "Garden of Terror",
+      ourBans: ["Johanna", "Dehaka"],
+      theirBans: ["Xal'atath", "Qhira", "Brightwing"],
+      ourPicks: ["Cassia", "E.T.C.", "Artanis", "Whitemane", "Genji"],
+      theirPicks: ["Garrosh", "Li Li", "Orphea", "Sylvanas", "Kerrigan"],
+      ourPickPlayers: [],
+      theirPickPlayers: [],
+    });
+    expect(actions.map((action) => action.hero)).toEqual([
+      "Johanna",
+      "Xal'atath",
+      "Dehaka",
+      "Qhira",
+      "Cassia",
+      "Garrosh",
+      "Li Li",
+      "E.T.C.",
+      "Artanis",
+      "Brightwing",
+      UNSEEN_BAN,
+      "Orphea",
+      "Sylvanas",
+      "Whitemane",
+      "Genji",
+      "Kerrigan",
     ]);
   });
 
@@ -1182,6 +1249,9 @@ describe("draft locks from the screen", () => {
     expect(plateFill([])).toBe("empty");
     expect(plateFill(enemyOpen, false)).toBe("shown");
     expect(plateFill(enemyLock, false)).toBe("locked");
+    const face = Array.from({ length: 200 }, () => ({ r: 230, g: 230, b: 235 }));
+    expect(allySlotPlate(face, blue)).toBe("shown");
+    expect(allySlotPlate(face, white)).toBe("locked");
   });
 
   it("still locks Qhira's light plate when the capture is darker", () => {
@@ -1255,6 +1325,24 @@ describe("draft locks from the screen", () => {
     expect(slots[0]).toEqual({ hero: "Abathur", player: "L337" });
     expect(slots[3]).toEqual({ hero: null, player: "hiimrick" });
     expect(slots[1]).toEqual({ hero: null, player: null });
+  });
+
+  it("keeps a newer single-plate read when the column read is older", () => {
+    const column = [
+      { text: "JOHANNA", top: 20 },
+      { text: "Bunny", top: 50 },
+      { text: "REHGAR", top: 420 },
+    ];
+    const withTyrael = replaceSlotLines(column, 3, [
+      { text: "TYRAEL", top: 4 },
+      { text: "Saffiel", top: 40 },
+    ]);
+    expect(readsBySlot(withTyrael)[0]?.hero).toBe("Johanna");
+    expect(readsBySlot(withTyrael)[1]?.hero).toBe("Rehgar");
+    expect(readsBySlot(withTyrael)[3]).toEqual({ hero: "Tyrael", player: "Saffiel" });
+    const columnAgain = replaceSlotLines(withTyrael, 3, [{ text: "YREL", top: 4 }]);
+    const kept = keepFresherSlotLines(columnAgain, withTyrael, [3]);
+    expect(readsBySlot(kept)[3]?.hero).toBe("Tyrael");
   });
 
   it("names a ban hex from the face and keeps that name when a later frame is blank", () => {
@@ -1429,5 +1517,32 @@ describe("draft locks from the screen", () => {
     expect(
       inferFirstPick({ ourPicks: 3, theirPicks: 3, phase: "pick", turnSide: "our" }),
     ).toBe("them");
+  });
+
+  it("drops one ban in place and one pick with its player", () => {
+    const draft = {
+      ...EMPTY_LIVE_DRAFT,
+      ourBans: ["Johanna", "Qhira", "Falstad"],
+      ourPicks: ["Tyrael", "Rehgar"],
+      ourPickPlayers: ["Saffiel", "Huckit"],
+      sealed: true,
+    };
+    const bans = draftWithoutLock(draft, {
+      side: "our",
+      kind: "ban",
+      index: 1,
+      hero: "Qhira",
+    });
+    expect(bans.ourBans).toEqual(["Johanna", "", "Falstad"]);
+    expect(bans.sealed).toBe(false);
+    const picks = draftWithoutLock(draft, {
+      side: "our",
+      kind: "pick",
+      index: 0,
+      hero: "Tyrael",
+    });
+    expect(picks.ourPicks).toEqual(["Rehgar"]);
+    expect(picks.ourPickPlayers).toEqual(["Huckit"]);
+    expect(picks.sealed).toBe(false);
   });
 });

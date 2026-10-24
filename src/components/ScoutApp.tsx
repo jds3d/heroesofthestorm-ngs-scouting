@@ -19,6 +19,7 @@ import {
   rosterTagsForLobby,
   rosterTagsPresent,
   type LiveDraft,
+  type ScreenReread,
 } from "@/lib/lobby/screenLobby";
 import {
   addLiveLoadCallStats,
@@ -156,6 +157,8 @@ export function ScoutApp() {
   const [sharing, setSharing] = useState(false);
   const [screenWatchIdlePaused, setScreenWatchIdlePaused] = useState(false);
   const resumeScreenWatchRef = useRef<(() => void) | null>(null);
+  const saveReviewRef = useRef<(() => Promise<string>) | null>(null);
+  const rereadRef = useRef<((lock: ScreenReread) => void) | null>(null);
   const [lobbyNames, setLobbyNames] = useState<string[]>([]);
   const [screenOurNames, setScreenOurNames] = useState<string[]>([]);
   const [statsNote, setStatsNote] = useState<string | null>(null);
@@ -864,6 +867,8 @@ export function ScoutApp() {
           resetEpoch={watchReset}
           onIdlePausedChange={setScreenWatchIdlePaused}
           resumeRef={resumeScreenWatchRef}
+          saveReviewRef={saveReviewRef}
+          rereadRef={rereadRef}
         />
         {!sharing && (
         <>
@@ -1058,6 +1063,11 @@ export function ScoutApp() {
             theirRoster={opponentStorm}
             draftMeta={watchMeta}
             onWatchReset={resetLiveDraft}
+            onSaveReview={() =>
+              saveReviewRef.current?.() ??
+              Promise.resolve("No screen to save. Share the main screen first.")
+            }
+            onRereadLock={(lock) => rereadRef.current?.(lock)}
             ourLikely={[]}
             map={liveDraft?.map}
             watchOnly
@@ -1087,6 +1097,14 @@ export function ScoutApp() {
           report={report}
           review={review}
           liveDraft={liveDraft}
+          onSaveReview={
+            sharing
+              ? () =>
+                  saveReviewRef.current?.() ??
+                  Promise.resolve("No screen to save. Share the main screen first.")
+              : undefined
+          }
+          onRereadLock={sharing ? (lock) => rereadRef.current?.(lock) : undefined}
         />
       ) : null}
     </div>

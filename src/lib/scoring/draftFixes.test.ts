@@ -64,6 +64,7 @@ import {
   scoreDuos,
   SYNERGY_DUO,
   isMapSpecialist,
+  mapFitRead,
   mapSpecialistTooltip,
   nakedOfflaneOpeningRisk,
   type DraftMetaTable,
@@ -1132,6 +1133,7 @@ describe("data-driven structure checks", () => {
       mapStats: [
         { hero: "Tyrael", map: "Infernal Shrines", winRate: 57, games: 120 },
         { hero: "Tyrael", map: "Tomb of the Spider Queen", winRate: 48, games: 90 },
+        { hero: "Tyrael", map: "Sky Temple", winRate: 43, games: 110 },
       ],
     });
 
@@ -1145,6 +1147,19 @@ describe("data-driven structure checks", () => {
     expect(isMapSpecialist(table, "Tyrael", "Infernal Shrines")?.map).not.toBe("Blackheart's Bay");
     expect(mapSpecialistTooltip(isMapSpecialist(table, "Tyrael", "Infernal Shrines"))).toContain("57.0% WR");
     expect(mapSpecialistTooltip(isMapSpecialist(table, "Tyrael", "Infernal Shrines"))).toContain("95% CI target");
+    const tomb = mapFitRead(table, "Tyrael", "Tomb of the Spider Queen");
+    expect(tomb.points).toBe(0);
+    expect(tomb.detail).toContain("48.0% WR");
+    expect(tomb.detail).toContain("→ 0");
+    expect(tomb.formula).toContain("(48.0 - 50.0) = -2.0pp");
+    const shrines = mapFitRead(table, "Tyrael", "Infernal Shrines");
+    expect(Math.round(shrines.points)).toBe(13);
+    expect(shrines.detail).toContain("57.0% WR");
+    expect(shrines.detail).toContain("(6 + min(10, 7.0)) = 13.0 → 13");
+    const sky = mapFitRead(table, "Tyrael", "Sky Temple");
+    expect(Math.round(sky.points)).toBe(-13);
+    expect(sky.detail).toContain("43.0% WR");
+    expect(sky.detail).toContain("-(6 + min(10, 7.0)) = -13.0 → -13");
   });
 
   it("fails fast when the map-stat dataset is empty instead of silently treating it as zero", () => {

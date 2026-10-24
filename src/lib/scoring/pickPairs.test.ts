@@ -60,7 +60,7 @@ describe("rolesThisPairMustCover", () => {
   it("does not ask for a healer once one is locked", () => {
     expect(
       rolesThisPairMustCover(["Arthas", "Brightwing", "Valla"], 0),
-    ).toEqual(["offlane"]);
+    ).toEqual([]);
   });
 });
 

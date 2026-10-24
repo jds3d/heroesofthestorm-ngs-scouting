@@ -42,6 +42,11 @@ export const leagueConfig = {
   /** Scout report JSON freshness (rebuilds scoring; sources may be forever). */
   reportTtlMs: 7 * 24 * 60 * 60 * 1000,
   ngsBaseUrl: "https://www.nexusgamingseries.org",
+  /**
+   * The seat running this scout. That hover is still a choice, so the board
+   * keeps showing who to pick. Every other ally hover is treated as a lock.
+   */
+  selfPlayer: "HuckIt",
   /** Heroes Profile external API v1 */
   heroesProfileBaseUrl: "https://www.heroesprofile.com/api/external/v1",
   /** Region can be NA or 1 on v1 */

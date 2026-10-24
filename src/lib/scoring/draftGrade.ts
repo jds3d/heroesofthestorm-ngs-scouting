@@ -265,7 +265,7 @@ export function scoreFive(args: {
   ignoreComfort?: boolean;
 }) {
   const heroes = args.seats.map((s) => s.hero);
-  const roles = checkRequiredRoles(heroes);
+  const roles = checkRequiredRoles(heroes, args.map);
   const comfort = args.ignoreComfort
     ? { points: 0, avg: 0, scored: false }
     : comfortScore(args.seats, args.roster);
@@ -292,7 +292,8 @@ export function scoreFive(args: {
     : QUALITY_RAW_MAX - COMFORT_GRADE_CAP;
   const quality = clamp(
     Math.round((raw / rawMax) * 100) -
-      MISSING_ROLE_QUALITY * roles.missing.length -
+      MISSING_ROLE_QUALITY * roles.missing.length +
+      roles.waveclearPoints -
       UNPLAYED_SEAT_QUALITY * unplayed.length,
     0,
     100,

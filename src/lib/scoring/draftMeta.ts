@@ -98,6 +98,8 @@ export type ComputedHeroMeta = {
   matchupsLoaded?: boolean;
   /** Maps where your WR is meaningfully above baseline. */
   mapStrong: { map: string; winRate: number; games: number; deltaPp: number }[];
+  /** Every map sample, including edges too small to score. */
+  mapSamples?: { map: string; winRate: number; games: number; deltaPp: number }[];
   note: string;
 };
 
@@ -224,7 +226,7 @@ function buildSynergies(
   );
 }
 
-function mapEdges(
+function mapSamples(
   hero: string,
   baselineWr: number,
   mapRows: HeroMapStat[],
@@ -232,9 +234,8 @@ function mapEdges(
   const mine = mapRows.filter((r) => heroKey(r.hero) === heroKey(hero));
   const out: ComputedHeroMeta["mapStrong"] = [];
   for (const row of mine) {
-    if (row.games < 50) continue;
+    if (row.games <= 0) continue;
     const deltaPp = row.winRate - baselineWr;
-    if (deltaPp < 3) continue;
     out.push({
       map: row.map,
       winRate: Math.round(row.winRate * 10) / 10,
@@ -242,7 +243,11 @@ function mapEdges(
       deltaPp: Math.round(deltaPp * 10) / 10,
     });
   }
-  return out.sort((a, b) => b.deltaPp - a.deltaPp);
+  return out.sort((a, b) => b.deltaPp - a.deltaPp || b.games - a.games);
+}
+
+function mapEdges(samples: ComputedHeroMeta["mapStrong"]): ComputedHeroMeta["mapStrong"] {
+  return samples.filter((row) => row.games >= 50 && row.deltaPp >= 3);
 }
 
 function classifyTiming(
@@ -321,6 +326,7 @@ export function buildDraftMetaTable(args: {
     const counteredBy = hardCounters(key, wr, enemies, globalByKey);
     const allySamples = buildAllySamples(wr, allies);
     const synergiesWith = buildSynergies(wr, allies);
+    const maps = mapSamples(key, wr, mapStats);
     const influence = g?.influence ?? 0;
     const popularity = g?.popularity ?? 0;
     const partial = {
@@ -340,7 +346,8 @@ export function buildDraftMetaTable(args: {
         enemies !== undefined ? buildPairGameCounts(enemies) : undefined,
       allyGameCounts: allies !== undefined ? buildPairGameCounts(allies) : undefined,
       matchupsLoaded: enemies !== undefined || allies !== undefined,
-      mapStrong: mapEdges(key, wr, mapStats),
+      mapSamples: maps,
+      mapStrong: mapEdges(maps),
     };
     byHero[key] = { ...partial, note: buildNote(partial) };
   }
@@ -373,6 +380,7 @@ export function heroDraftMeta(
     allySamples: [],
     matchupSamples: [],
     matchupsLoaded: false,
+    mapSamples: [],
     mapStrong: [],
     note: "No Storm League sample for this hero yet.",
   };
@@ -845,6 +853,8 @@ export function enemyDuos(
 export type DuoWeights = { perPp: number; perDuoCap: number; totalCap: number };
 export const SYNERGY_DUO: DuoWeights = { perPp: 1.15, perDuoCap: 12, totalCap: 18 };
 export const MATCHUP_DUO: DuoWeights = { perPp: 0.55, perDuoCap: 14, totalCap: 24 };
+/** The solo-lane matchup is one fight, weighted above a generic hero pairing. */
+export const LANE_MATCHUP_DUO: DuoWeights = { perPp: 1.1, perDuoCap: 16, totalCap: 16 };
 /** Expected picks are not locked, so this span is half of MATCHUP_DUO. */
 export const LIKELY_MATCHUP_DUO: DuoWeights = { perPp: 0.275, perDuoCap: 7, totalCap: 12 };
 
@@ -1139,6 +1149,82 @@ export function isMapSpecialist(
     return candidate !== null && candidate === target;
   });
   return hit ?? null;
+}
+
+export type MapRate = {
+  map: string;
+  winRate: number;
+  games: number;
+  deltaPp: number;
+  baselineWr: number;
+};
+
+/** This hero's win rate on the named map, including samples that score 0. */
+export function mapRateOn(
+  table: DraftMetaTable | null | undefined,
+  hero: string,
+  map: string | null,
+): MapRate | null {
+  if (!map) return null;
+  const target = normalizeMapName(map);
+  const meta = heroDraftMeta(table, hero);
+  const rows = meta.mapSamples?.length ? meta.mapSamples : meta.mapStrong;
+  const hit = rows.find((row) => normalizeMapName(row.map) === target);
+  if (!hit) return null;
+  return { ...hit, baselineWr: meta.winRate };
+}
+
+/**
+ * Map fit points. Same bar both ways, once the sample has 50 games.
+ * +3.0pp or better adds 6 + the edge (capped at 10). -3.0pp or worse subtracts
+ * that same amount. A smaller gap scores 0, and the text still shows the win rate.
+ */
+export function mapFitRead(
+  table: DraftMetaTable | null | undefined,
+  hero: string,
+  map: string | null,
+): { points: number; detail: string; formula: string } {
+  if (!map) {
+    return {
+      points: 0,
+      detail: "No map selected → 0",
+      formula: "0 because no map is selected",
+    };
+  }
+  const rate = mapRateOn(table, hero, map);
+  if (!rate) {
+    return {
+      points: 0,
+      detail: `No Storm League win rate on ${map} → 0`,
+      formula: `0 because ${hero} has no win rate on ${map}`,
+    };
+  }
+  const signed = `${rate.deltaPp >= 0 ? "+" : ""}${rate.deltaPp.toFixed(1)}`;
+  const wr = `${rate.winRate.toFixed(1)}% WR on ${rate.map} (${rate.games}g)`;
+  const edge = `(${rate.winRate.toFixed(1)} - ${rate.baselineWr.toFixed(1)}) = ${signed}pp`;
+  if (rate.games < 50) {
+    return {
+      points: 0,
+      detail: `${wr}. ${edge} vs baseline → 0 (under 50 games)`,
+      formula: `${edge}. 0 because the sample is under 50 games; ±(6 + min(10, |edge|)) once it has 50 games and the edge is at least ±3.0pp`,
+    };
+  }
+  if (Math.abs(rate.deltaPp) < 3) {
+    return {
+      points: 0,
+      detail: `${wr}. ${edge} vs baseline → 0 (points start at ±3.0pp, then ±(6 + min(10, |edge|)))`,
+      formula: `${edge}. 0 because the edge is inside ±3.0pp; outside that, ±(6 + min(10, |edge|))`,
+    };
+  }
+  const magnitude = Math.abs(rate.deltaPp);
+  const raw = (rate.deltaPp < 0 ? -1 : 1) * (6 + Math.min(10, magnitude));
+  const points = Math.round(raw);
+  const shaped = `${rate.deltaPp < 0 ? "-" : ""}(6 + min(10, ${magnitude.toFixed(1)})) = ${raw.toFixed(1)} → ${points}`;
+  return {
+    points: raw,
+    detail: `${wr}. ${edge} vs baseline → ${shaped}`,
+    formula: `${edge}; ${shaped}`,
+  };
 }
 
 export function mapSpecialistTooltip(

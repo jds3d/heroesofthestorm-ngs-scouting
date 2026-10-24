@@ -38,6 +38,8 @@ export function ScoutReportView({
   tournamentMode,
   onTournamentModeChange,
   onWatchReset,
+  onSaveReview,
+  onRereadLock,
 }: {
   report: ScoutReport;
   /** Played game to replay into the interactive draft. */
@@ -50,6 +52,15 @@ export function ScoutReportView({
   tournamentMode?: boolean;
   onTournamentModeChange?: (on: boolean) => void;
   onWatchReset?: () => void;
+  /** Stores the shared screen and the draft as read so far. */
+  onSaveReview?: () => Promise<string>;
+  /** Watch board: drop a lock and read that slot from the screen again. */
+  onRereadLock?: (lock: {
+    side: "our" | "their";
+    kind: "ban" | "pick";
+    index: number;
+    hero: string;
+  }) => void;
 }) {
   const [pickSide, setPickSide] = useState<"theyFirst" | "weFirst" | null>(
     review ? (review.weFirst ? "weFirst" : "theyFirst") : null,
@@ -180,6 +191,8 @@ export function ScoutReportView({
           tournamentMode={tournamentMode}
           onTournamentModeChange={onTournamentModeChange}
           onWatchReset={onWatchReset}
+          onSaveReview={onSaveReview}
+          onRereadLock={onRereadLock}
         />
       </div>
     );
@@ -623,6 +636,7 @@ export function ScoutReportView({
               ourMmr={report.homeHpMmrAvg ?? null}
               theirMmr={report.hpMmrAvg}
               allowSeatReshuffle={true}
+              onSaveReview={onSaveReview}
             />
           </div>
 

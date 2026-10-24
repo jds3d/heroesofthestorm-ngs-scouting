@@ -11,7 +11,14 @@ type Reply = {
   picksLeft?: OcrLine[];
   picksRight?: OcrLine[];
   center?: OcrLine[];
+  slots?: SlotOcr[];
   error?: string;
+};
+
+export type SlotOcr = {
+  side: "left" | "right";
+  index: number;
+  lines: OcrLine[];
 };
 
 let child: ChildProcessWithoutNullStreams | null = null;
@@ -25,6 +32,14 @@ export type ColumnRead = {
   picksRight: OcrLine[];
   center: OcrLine[];
 };
+
+const slotWaiting = new Map<
+  number,
+  {
+    resolve: (slots: SlotOcr[]) => void;
+    reject: (error: Error) => void;
+  }
+>();
 
 const waiting = new Map<
   number,
@@ -44,6 +59,8 @@ function pythonBin(): string {
 function failAll(error: Error) {
   for (const waiter of waiting.values()) waiter.reject(error);
   waiting.clear();
+  for (const waiter of slotWaiting.values()) waiter.reject(error);
+  slotWaiting.clear();
 }
 
 function writeRequest(proc: ChildProcessWithoutNullStreams, line: string): Promise<void> {
@@ -71,6 +88,13 @@ function ensureChild(): ChildProcessWithoutNullStreams {
     try {
       reply = JSON.parse(line) as Reply;
     } catch {
+      return;
+    }
+    const slotWaiter = slotWaiting.get(reply.id);
+    if (slotWaiter) {
+      slotWaiting.delete(reply.id);
+      if (reply.error) slotWaiter.reject(new Error(reply.error));
+      else slotWaiter.resolve(reply.slots ?? []);
       return;
     }
     const waiter = waiting.get(reply.id);
@@ -108,6 +132,37 @@ export function closeNameReader(): void {
   const current = child;
   child = null;
   current?.kill();
+}
+
+/** One changed nameplate. These readers are not the column readers, so a lock is not stuck behind a full column. */
+export function readSlotPlates(
+  slots: { side: "left" | "right"; index: number; image: string }[],
+): Promise<SlotOcr[]> {
+  const proc = ensureChild();
+  const id = ++sequence;
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      if (!slotWaiting.has(id)) return;
+      slotWaiting.delete(id);
+      reject(new Error("name reader timed out"));
+    }, 15000);
+    slotWaiting.set(id, {
+      resolve: (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      reject: (error) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    });
+    void writeRequest(proc, `${JSON.stringify({ id, slots })}\n`).catch((error: unknown) => {
+      if (!slotWaiting.has(id)) return;
+      slotWaiting.delete(id);
+      clearTimeout(timer);
+      reject(error instanceof Error ? error : new Error("name reader write failed"));
+    });
+  });
 }
 
 /** Deskewed column pictures in, text lines out. Name and pick crops run together. */

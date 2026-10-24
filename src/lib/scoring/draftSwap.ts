@@ -29,6 +29,89 @@ function playerId(tagOrName: string): string {
   return displayName(tagOrName).toLowerCase();
 }
 
+/** Same units as "seat comfort 40": the 0–1 comfort value times 100. */
+function comfortScore(comfort: number): number {
+  return Math.round(comfort * 100);
+}
+
+function heroComfort(
+  home: PlayerScout[],
+  player: string,
+  hero: string,
+): { comfort: number; games: number } {
+  const id = playerId(player);
+  const p = home.find(
+    (row) =>
+      playerId(row.battletag) === id ||
+      playerId(displayName(row.battletag)) === id,
+  );
+  const hit = p?.topHeroes.find((h) => heroKey(h.hero) === heroKey(hero));
+  return { comfort: hit?.comfort ?? 0, games: hit?.games ?? 0 };
+}
+
+function comfortPhrase(name: string, comfort: number, games: number): string {
+  const score = comfortScore(comfort);
+  if (comfort <= 0 && games <= 0) return `${score} for ${name} (no logged games)`;
+  if (games > 0 && games < 8) return `${score} for ${name} (${games} games)`;
+  return `${score} for ${name}`;
+}
+
+/**
+ * Past tense on purpose. The seats are already locked, so this names who was
+ * more comfortable. It is not an instruction to trade heroes.
+ */
+function crossedComfortReason(args: {
+  /** Played `firstHero`. The higher-comfort pair puts them on `secondHero`. */
+  first: string;
+  firstHero: string;
+  second: string;
+  secondHero: string;
+  firstOnOwn: { comfort: number; games: number };
+  firstOnOther: { comfort: number; games: number };
+  secondOnOwn: { comfort: number; games: number };
+  secondOnOther: { comfort: number; games: number };
+  delta: number;
+}): string {
+  const { first, second, firstHero, secondHero } = args;
+  const lead =
+    `${first} should have played ${secondHero} and ${second} should have played ${firstHero}.`;
+  const onSecond =
+    `${secondHero} comfort is ${comfortPhrase(first, args.firstOnOther.comfort, args.firstOnOther.games)} and ${comfortPhrase(second, args.secondOnOwn.comfort, args.secondOnOwn.games)}.`;
+  const onFirst =
+    `${firstHero} comfort is ${comfortPhrase(second, args.secondOnOther.comfort, args.secondOnOther.games)} and ${comfortPhrase(first, args.firstOnOwn.comfort, args.firstOnOwn.games)}.`;
+  const net = comfortScore(args.delta);
+  const firstHappier = args.firstOnOther.comfort > args.firstOnOwn.comfort;
+  const secondHappier = args.secondOnOther.comfort > args.secondOnOwn.comfort;
+  const firstIsBetterThere = args.firstOnOther.comfort > args.secondOnOwn.comfort;
+  const secondIsBetterThere = args.secondOnOther.comfort > args.firstOnOwn.comfort;
+  let insight: string;
+  if (firstHappier && secondHappier && firstIsBetterThere && secondIsBetterThere) {
+    insight = `Each of them is more comfortable on the hero the other locked, ${net} comfort higher together.`;
+  } else if (firstHappier && secondHappier) {
+    const stillTheirs: string[] = [];
+    if (!secondIsBetterThere) {
+      stillTheirs.push(
+        `${first} is still the more comfortable ${firstHero} (${comfortScore(args.firstOnOwn.comfort)} vs ${comfortScore(args.secondOnOther.comfort)}).`,
+      );
+    }
+    if (!firstIsBetterThere) {
+      stillTheirs.push(
+        `${second} is still the more comfortable ${secondHero} (${comfortScore(args.secondOnOwn.comfort)} vs ${comfortScore(args.firstOnOther.comfort)}).`,
+      );
+    }
+    insight = `Each is more comfortable on the other hero than on the one they locked. ${stillTheirs.join(" ")} Together that is ${net} comfort higher.`;
+  } else {
+    const giver = firstHappier ? second : first;
+    const gainer = firstHappier ? first : second;
+    const fromHero = firstHappier ? secondHero : firstHero;
+    const toHero = firstHappier ? firstHero : secondHero;
+    const from = firstHappier ? args.secondOnOwn : args.firstOnOwn;
+    const to = firstHappier ? args.secondOnOther : args.firstOnOther;
+    insight = `${giver} gives up comfort, from ${comfortScore(from.comfort)} on ${fromHero} to ${comfortScore(to.comfort)} on ${toHero}. ${gainer}'s gain is larger, so the pair is still ${net} comfort higher.`;
+  }
+  return `${lead} ${onSecond} ${onFirst} ${insight}`;
+}
+
 function comfortOf(
   home: PlayerScout[],
   player: string,
@@ -129,7 +212,7 @@ export function findPickSwap(args: {
     const reason =
       `${locker} locks ${neededHero} now, then swaps with ${specialist}: ` +
       `${specialist} ends on ${neededHero} (their seat), ${locker} ends on ${L.hero} ` +
-      `(playable). Net comfort +${delta.toFixed(2)} vs ${locker} just keeping ${neededHero}.`;
+      `(playable). Net comfort +${comfortScore(delta)} vs ${locker} just keeping ${neededHero}.`;
 
     if (!best || delta > best.comfortDelta) {
       best = {
@@ -177,26 +260,34 @@ export function findEndDraftSwaps(args: {
       const delta = after - before;
       if (delta < 0.05) continue;
 
-      // Prefer the clearer specialist direction in the copy.
-      const aGainsMore = cA_b - cA_a >= cB_a - cB_b;
-      const specialist = aGainsMore ? displayName(a.player) : displayName(b.player);
-      const locker = aGainsMore ? displayName(b.player) : displayName(a.player);
-      const lockHero = aGainsMore ? b.hero : a.hero;
-      const giveHero = aGainsMore ? a.hero : b.hero;
+      const aName = displayName(a.player);
+      const bName = displayName(b.player);
+      const aOnOwn = heroComfort(home, a.player, a.hero);
+      const aOnOther = heroComfort(home, a.player, b.hero);
+      const bOnOwn = heroComfort(home, b.player, b.hero);
+      const bOnOther = heroComfort(home, b.player, a.hero);
 
       const key = [heroKey(a.hero), heroKey(b.hero)].sort().join("|");
       if (seen.has(key)) continue;
       seen.add(key);
 
       out.push({
-        lockHero,
-        locker,
-        giveHero,
-        specialist,
+        lockHero: b.hero,
+        locker: bName,
+        giveHero: a.hero,
+        specialist: aName,
         comfortDelta: delta,
-        reason:
-          `Swap ${specialist}'s ${giveHero} ↔ ${locker}'s ${lockHero} — ` +
-          `both land on higher comfort (net +${delta.toFixed(2)}).`,
+        reason: crossedComfortReason({
+          first: aName,
+          firstHero: a.hero,
+          second: bName,
+          secondHero: b.hero,
+          firstOnOwn: aOnOwn,
+          firstOnOther: aOnOther,
+          secondOnOwn: bOnOwn,
+          secondOnOther: bOnOther,
+          delta,
+        }),
       });
     }
   }

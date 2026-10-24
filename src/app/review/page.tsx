@@ -14,10 +14,24 @@ type ReviewBoard = {
   theirPicks: PickRead[];
 };
 
+type ReviewLock = {
+  kind?: "ban" | "pick";
+  side: "us" | "them";
+  hero: string;
+  player: string | null;
+};
+
+type ReviewFrame = {
+  url: string;
+  at?: string | null;
+  added: ReviewLock[];
+};
+
 type ReviewCase = {
   id: string;
   test: string;
   image: string;
+  frames?: ReviewFrame[];
   skipped: boolean;
   board: ReviewBoard | null;
   source: string;
@@ -29,9 +43,35 @@ function scoutHeaders(): HeadersInit {
 }
 
 function stampLabel(id: string): string {
-  const match = id.match(/^review-(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z$/);
+  const match = id.match(/^review-(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})(?:\d{3})?Z$/);
   if (!match) return id;
   return `${match[1]}-${match[2]}-${match[3]} ${match[4]}:${match[5]} UTC`;
+}
+
+function frameClock(at: string | null | undefined): string | null {
+  if (!at) return null;
+  const date = new Date(at);
+  if (Number.isNaN(date.getTime())) return null;
+  return date.toLocaleString(undefined, {
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+}
+
+function lockLabel(lock: ReviewLock): string {
+  const who = lock.side === "us" ? "Us" : "Them";
+  const action = lock.kind === "ban" ? "ban" : "pick";
+  const player = lock.kind === "ban" || !lock.player ? "" : ` (${lock.player})`;
+  return `${who} ${action} ${heroLabel(lock.hero)}${player}`;
+}
+
+function frameLabel(frame: ReviewFrame, index: number): string {
+  const what = frame.added.length ? frame.added.map(lockLabel).join(", ") : "Lobby";
+  const when = frameClock(frame.at);
+  return when ? `${index + 1}. ${when} — ${what}` : `${index + 1}. ${what}`;
 }
 
 function heroLabel(hero: string): string {
@@ -76,7 +116,7 @@ export default function ReviewPage() {
   const [reviews, setReviews] = useState<ReviewCase[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [imageUrl, setImageUrl] = useState<string | null>(null);
+  const [imageUrls, setImageUrls] = useState<(string | null)[]>([]);
 
   useEffect(() => {
     let cancel = false;
@@ -99,32 +139,46 @@ export default function ReviewPage() {
   }, []);
 
   const selected = reviews?.find((review) => review.id === selectedId) ?? null;
+  const frames = selected?.frames?.length
+    ? selected.frames
+    : selected
+      ? [{ url: selected.image, added: [] }]
+      : [];
+  const frameKey = frames.map((frame) => frame.url).join("|");
 
   useEffect(() => {
-    if (!selected) {
-      setImageUrl(null);
+    if (!frameKey) {
+      setImageUrls([]);
       return;
     }
+    const urls = frameKey.split("|");
     let cancel = false;
-    let url: string | null = null;
-    fetch(selected.image, { headers: scoutHeaders() })
-      .then(async (res) => {
-        if (!res.ok) throw new Error("missing");
-        return res.blob();
-      })
-      .then((blob) => {
-        if (cancel) return;
-        url = URL.createObjectURL(blob);
-        setImageUrl(url);
-      })
-      .catch(() => {
-        if (!cancel) setImageUrl(null);
-      });
+    const created: string[] = [];
+    void Promise.all(
+      urls.map(async (url) => {
+        try {
+          const res = await fetch(url, { headers: scoutHeaders() });
+          if (!res.ok) return null;
+          const blob = await res.blob();
+          const objectUrl = URL.createObjectURL(blob);
+          created.push(objectUrl);
+          return objectUrl;
+        } catch {
+          return null;
+        }
+      }),
+    ).then((loaded) => {
+      if (cancel) {
+        for (const url of created) URL.revokeObjectURL(url);
+        return;
+      }
+      setImageUrls(loaded);
+    });
     return () => {
       cancel = true;
-      if (url) URL.revokeObjectURL(url);
+      for (const url of created) URL.revokeObjectURL(url);
     };
-  }, [selected]);
+  }, [frameKey]);
 
   return (
     <main className="mx-auto flex w-full max-w-none flex-col gap-6 px-4 py-8 sm:px-6 lg:px-8">
@@ -136,7 +190,7 @@ export default function ReviewPage() {
           Draft reviews
         </h1>
         <p className="max-w-2xl text-sm text-[var(--muted)]">
-          Each finished draft keeps the last lobby screenshot, taken before the loading screen, and a skipped test of what was read.
+          Save for review keeps the lobby screenshot for each ban and pick, with the time it was captured. Leaving the draft throws the rest away.
         </p>
       </header>
       {error ? <p className="text-sm text-red-700">{error}</p> : null}
@@ -169,15 +223,37 @@ export default function ReviewPage() {
           </ul>
           {selected ? (
             <div className="grid items-start gap-4 xl:grid-cols-2">
-              <figure className="overflow-hidden rounded-md border border-[var(--line)] bg-black">
-                {imageUrl ? (
-                  // The screenshot is a local draft frame, not a remote optimized asset.
-                  // eslint-disable-next-line @next/next/no-img-element
-                  <img src={imageUrl} alt="Lobby screenshot saved before the loading screen" className="h-auto w-full" />
-                ) : (
-                  <p className="p-4 text-sm text-white">Screenshot is not available.</p>
-                )}
-              </figure>
+              <ol className="space-y-4">
+                {frames.map((frame, index) => {
+                  const imageUrl = imageUrls[index] ?? null;
+                  const when = frameClock(frame.at);
+                  return (
+                    <li key={frame.url} className="space-y-2">
+                      <p className="text-sm font-semibold text-[var(--ink)]">
+                        {frameLabel(frame, index)}
+                      </p>
+                      <figure className="overflow-hidden rounded-md border border-[var(--line)] bg-black">
+                        {when ? (
+                          <figcaption className="border-b border-white/10 px-3 py-2 text-xs font-semibold text-white">
+                            {when}
+                          </figcaption>
+                        ) : null}
+                        {imageUrl ? (
+                          // The screenshot is a local draft frame, not a remote optimized asset.
+                          // eslint-disable-next-line @next/next/no-img-element
+                          <img
+                            src={imageUrl}
+                            alt={frameLabel(frame, index)}
+                            className="h-auto w-full"
+                          />
+                        ) : (
+                          <p className="p-4 text-sm text-white">Lobby screenshot is not available.</p>
+                        )}
+                      </figure>
+                    </li>
+                  );
+                })}
+              </ol>
               <div className="space-y-4 rounded-md border border-[var(--line)] bg-[var(--panel)] p-4">
                 <div>
                   <p className="text-xs font-bold uppercase tracking-wide text-[var(--muted)]">

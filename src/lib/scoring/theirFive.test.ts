@@ -8,6 +8,7 @@ import {
   rebuildTheirRemainingFive,
   seatSuggestionStack,
 } from "@/lib/scoring/theirFive";
+import { orderSuggestedColumns, takeOrderFacts } from "@/lib/scoring/takeOrder";
 import type { SourceHeroStat } from "@/lib/scoring/types";
 
 function sl(wins: number, losses: number): SourceHeroStat {
@@ -623,5 +624,76 @@ describe("our comp rows", () => {
     );
     const heroes = [0, 1, 2].flatMap((row) => [columns[1]?.[row]?.hero, columns[2]?.[row]?.hero]);
     expect(heroes).toContain("Johanna");
+  });
+
+  it("recommends a shown hover and still suggests the open player around it", () => {
+    const roster = [
+      scout("Sporty", [
+        ["Johanna", 40, 5],
+        ["Muradin", 10, 5],
+      ]),
+      scout("HuckIt", [
+        ["Valla", 40, 5],
+        ["Jaina", 20, 5],
+      ]),
+    ];
+    const columns = ourCompStacksUnderOpenSlots(
+      [null, null],
+      [seat("Sporty", "Johanna"), seat("HuckIt", "Valla")],
+      roster,
+      new Set(),
+      3,
+      ["Johanna", "Valla", "Jaina", "Anduin"],
+      null,
+      [{ hero: "Johanna", player: "Sporty" }],
+    );
+    const sporty = columns[0] ?? [];
+    const huck = columns[1] ?? [];
+    expect(sporty).toHaveLength(1);
+    expect(sporty[0]?.hero).toBe("Johanna");
+    expect(sporty[0]?.why).toContain("Hover — lock Johanna");
+    expect(huck[0]?.hero).toBe("Valla");
+    expect(huck.length).toBeGreaterThan(1);
+    expect(huck.map((row) => row.hero)).not.toContain("Johanna");
+
+    const ordered = orderSuggestedColumns(
+      columns,
+      takeOrderFacts({
+        actor: "our",
+        actors: roster,
+        opponents: [],
+        gone: new Set(["Johanna", "Valla"]),
+        map: null,
+        stepIndex: 8,
+        weFirst: true,
+        opponentPicksLeft: 3,
+      }),
+      false,
+    );
+    expect(ordered[0]?.[0]?.order).toBeGreaterThan(0);
+    expect(ordered[1]?.[0]?.order).toBeGreaterThan(0);
+    expect(ordered[0]?.[0]?.order).not.toBe(ordered[1]?.[0]?.order);
+  });
+
+  it("does not recommend a hover that is already banned", () => {
+    const roster = [
+      scout("Huckit", [
+        ["Qhira", 40, 5],
+        ["Genji", 20, 5],
+      ]),
+    ];
+    const columns = ourCompStacksUnderOpenSlots(
+      [null],
+      [seat("Huckit", "Qhira")],
+      roster,
+      new Set(["Qhira"]),
+      3,
+      ["Genji", "Valla", "Johanna"],
+      null,
+      [{ hero: "Qhira", player: "Huckit" }],
+    );
+    const huck = columns[0] ?? [];
+    expect(huck.map((row) => row.hero)).not.toContain("Qhira");
+    expect(huck[0]?.why ?? "").not.toContain("Hover — lock Qhira");
   });
 });

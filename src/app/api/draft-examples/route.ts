@@ -3,7 +3,12 @@ import path from "path";
 import { NextResponse } from "next/server";
 import { rowsFromBanHexExamples } from "@/lib/lobby/banHexCatalog";
 import { mismatchCaseSource, type FinalScreenConflict } from "@/lib/lobby/finalScreen";
-import { reviewCaseSource, type DraftReviewBoard } from "@/lib/lobby/reviewCase";
+import {
+  framesFromReviewSource,
+  reviewCaseSource,
+  type DraftReviewBoard,
+  type ReviewFrameNote,
+} from "@/lib/lobby/reviewCase";
 import { heroFromPlateText } from "@/lib/lobby/screenLobby";
 
 export const dynamic = "force-dynamic";
@@ -137,6 +142,58 @@ function reviewPicks(value: unknown): { hero: string; player: string | null }[] 
   return picks;
 }
 
+const REVIEW_ID = /^review-\d{8}T\d{6}(?:\d{3})?Z$/;
+
+function reviewAdded(value: unknown): ReviewFrameNote["added"] | null {
+  if (!Array.isArray(value) || value.length > 10) return null;
+  const added: ReviewFrameNote["added"] = [];
+  for (const row of value) {
+    if (!row || typeof row !== "object") return null;
+    const kind = (row as { kind?: unknown }).kind;
+    const side = (row as { side?: unknown }).side;
+    const hero = (row as { hero?: unknown }).hero;
+    const player = (row as { player?: unknown }).player;
+    const lockKind = kind == null ? "pick" : kind === "ban" || kind === "pick" ? kind : null;
+    if (!lockKind) return null;
+    if (side !== "us" && side !== "them") return null;
+    if (typeof hero !== "string" || hero.length > 40) return null;
+    if (player != null && (typeof player !== "string" || player.length > 40)) return null;
+    added.push({
+      kind: lockKind,
+      side,
+      hero,
+      player: typeof player === "string" ? player : null,
+    });
+  }
+  return added;
+}
+
+function reviewInstant(value: unknown): string | null {
+  if (typeof value !== "string" || value.length > 40) return null;
+  const parsed = Date.parse(value);
+  if (Number.isNaN(parsed)) return null;
+  return new Date(parsed).toISOString();
+}
+
+function reviewFramesFrom(
+  value: unknown,
+): { bytes: Buffer; added: ReviewFrameNote["added"]; at: string | null }[] | null {
+  if (!Array.isArray(value) || value.length === 0 || value.length > 30) return null;
+  const frames: { bytes: Buffer; added: ReviewFrameNote["added"]; at: string | null }[] = [];
+  for (const row of value) {
+    if (!row || typeof row !== "object") return null;
+    const image = asBase64((row as { image?: unknown }).image, 12_000_000);
+    const added = reviewAdded((row as { added?: unknown }).added);
+    if (!image || !added) return null;
+    const bytes = Buffer.from(image, "base64");
+    const png = bytes[0] === 0x89 && bytes[1] === 0x50;
+    const jpeg = bytes[0] === 0xff && bytes[1] === 0xd8;
+    if (!png && !jpeg) return null;
+    frames.push({ bytes, added, at: reviewInstant((row as { at?: unknown }).at) });
+  }
+  return frames;
+}
+
 function reviewBoardFrom(value: unknown): DraftReviewBoard | null {
   if (!value || typeof value !== "object") return null;
   const row = value as {
@@ -173,33 +230,52 @@ export async function POST(request: Request) {
     source?: unknown;
     conflict?: unknown;
     board?: unknown;
+    frames?: unknown;
+    id?: unknown;
   };
   if (body.kind === "review") {
-    const image = asBase64(body.image, 12_000_000);
     const board = reviewBoardFrom(body.board);
-    if (!image || !board) {
+    const incoming = reviewFramesFrom(body.frames);
+    if (!board || !incoming) {
       return NextResponse.json({ error: "Expected the lobby screenshot and the read" }, { status: 400 });
     }
-    const bytes = Buffer.from(image, "base64");
-    if (bytes[0] !== 0x89 || bytes[1] !== 0x50) {
-      return NextResponse.json({ error: "Expected a png frame" }, { status: 400 });
+    const requestedId = typeof body.id === "string" && REVIEW_ID.test(body.id) ? body.id : null;
+    const existingName = requestedId ? `${requestedId}.test.ts` : null;
+    const existingPath = existingName ? path.join(REVIEW_TEST_DIR, existingName) : null;
+    let prior: ReviewFrameNote[] = [];
+    if (existingPath) {
+      try {
+        prior = framesFromReviewSource(await readFile(existingPath, "utf8"));
+      } catch {
+        prior = [];
+      }
     }
-    const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z");
-    const imageName = `review-${stamp}.png`;
-    const imagePath = `examples/reviews/${imageName}`;
+    const stamp =
+      requestedId && prior.length
+        ? requestedId
+        : `review-${new Date().toISOString().replace(/[-:.]/g, "")}`;
     await mkdir(REVIEW_DIR, { recursive: true });
     await mkdir(REVIEW_TEST_DIR, { recursive: true });
-    await writeFile(path.join(REVIEW_DIR, imageName), bytes);
-    const testName = `review-${stamp}.test.ts`;
-    await writeFile(
-      path.join(REVIEW_TEST_DIR, testName),
-      reviewCaseSource(imagePath, board),
-    );
+    const notes = [...prior];
+    for (const frame of incoming) {
+      const jpeg = frame.bytes[0] === 0xff && frame.bytes[1] === 0xd8;
+      const imageName = `${stamp}-${notes.length + 1}.${jpeg ? "jpg" : "png"}`;
+      await writeFile(path.join(REVIEW_DIR, imageName), frame.bytes);
+      notes.push({
+        file: `examples/reviews/${imageName}`,
+        ...(frame.at ? { at: frame.at } : {}),
+        added: frame.added,
+      });
+    }
+    const testName = `${stamp}.test.ts`;
+    await writeFile(path.join(REVIEW_TEST_DIR, testName), reviewCaseSource(notes, board));
     return NextResponse.json({
       ok: true,
       saved: true,
-      image: imagePath,
+      id: stamp,
+      image: notes[0]?.file ?? null,
       test: `src/lib/lobby/reviews/${testName}`,
+      frames: notes.length,
     });
   }
   if (body.kind === "mismatch") {

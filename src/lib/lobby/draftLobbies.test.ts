@@ -17,6 +17,8 @@ import {
   nameplateCell,
   ocrFold,
   plateFill,
+  allySlotPlate,
+  nameLabelBox,
   portraitFilled,
   pickingFlagsBySlot,
   columnPickingFromOcrLines,
@@ -193,7 +195,9 @@ async function loadLobby(file: string) {
           hero: read.hero,
           player: read.player,
           slot,
-          plate: plateFill(boxRgb(image, nameBox), ally),
+          plate: ally
+            ? allySlotPlate(boxRgb(image, nameBox), boxRgb(image, nameLabelBox(nameBox, faceBox)))
+            : plateFill(boxRgb(image, nameBox), false),
           faceFilled: portraitFilled(boxRgb(image, faceBox)),
           ally,
           slotPicking: picking[slot] ?? false,
@@ -203,7 +207,13 @@ async function loadLobby(file: string) {
   const leftShown = leftReads.flatMap((read, slot) => {
     const nameBox = DRAFT_SLOT_NAMES.left[slot];
     if (!read.hero || !nameBox) return [];
-    if (plateFill(boxRgb(image, nameBox), true) !== "shown") return [];
+    const faceBox = DRAFT_PLATE_SLOTS.left[slot];
+    if (
+      !faceBox ||
+      allySlotPlate(boxRgb(image, nameBox), boxRgb(image, nameLabelBox(nameBox, faceBox))) !==
+        "shown"
+    )
+      return [];
     return [read.hero];
   });
   const map = mapFromTitle(titleText);

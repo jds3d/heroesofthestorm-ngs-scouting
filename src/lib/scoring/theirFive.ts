@@ -391,6 +391,16 @@ export function seatSuggestionStack(
 
 const COMP_CANDIDATES = 6;
 
+function pinnedHero(
+  pins: readonly { hero: string; player: string | null }[],
+  player: string | null,
+): string | null {
+  const key = nameKey(player);
+  if (!key) return null;
+  const hit = pins.find((pin) => pin.hero && nameKey(pin.player) === key);
+  return hit?.hero ?? null;
+}
+
 function roleInComp(hero: string, allies: readonly string[]): TheirSeatRole {
   const covered = compRolesCovered(allies);
   const job = (["healer", "offlane", "tank", "ranged damage"] as const).find(
@@ -510,14 +520,50 @@ export function ourCompStacksUnderOpenSlots(
   limit = 3,
   extras: readonly string[] = [],
   table?: DraftMetaTable | null,
+  /**
+   * Heroes those players are showing. Each pinned seat recommends only that
+   * hero. Everyone else is scored as if those hovers are already locked.
+   */
+  pinned: readonly { hero: string; player: string | null }[] = [],
 ): (TheirRemainingSeat[] | null)[] {
-  const locked = picks.flatMap((pick) => (pick?.hero ? [pick.hero] : []));
-  const unavailable = new Set([...gone, ...locked].map((hero) => heroKey(hero)));
+  const pickedHeroes = picks.flatMap((pick) => (pick?.hero ? [pick.hero] : []));
+  const unavailable = new Set([...gone, ...pickedHeroes].map((hero) => heroKey(hero)));
   const projected = likelyPicksUnderOpenSlots(picks, seats);
   const open = projected.filter((seat): seat is TheirRemainingSeat => Boolean(seat));
   if (!open.length) return projected.map(() => null);
 
-  const lists = open.map((seat) => compCandidatesFor(seat, roster, unavailable, extras, table));
+  const locked = [
+    ...pickedHeroes,
+    ...pinned.flatMap((pin) => {
+      if (!pin.hero) return [];
+      const key = nameKey(pin.player);
+      if (key && open.some((seat) => nameKey(seat.player) === key)) return [];
+      return [pin.hero];
+    }),
+  ];
+  const lists = open.map((seat) => {
+    const pin = pinnedHero(pinned, seat.player);
+    if (pin && !unavailable.has(heroKey(pin))) {
+      return [
+        {
+          option: {
+            hero: pin,
+            sl: seat.sl,
+            comfort: seat.comfort,
+            games: seat.games,
+          },
+          confidence: 1,
+        },
+      ];
+    }
+    const blocked = new Set(unavailable);
+    for (const other of open) {
+      const otherPin = pinnedHero(pinned, other.player);
+      if (otherPin) blocked.add(heroKey(otherPin));
+    }
+    for (const hero of locked) blocked.add(heroKey(hero));
+    return compCandidatesFor(seat, roster, blocked, extras, table);
+  });
   const used = new Set<string>();
   const choice: number[] = [];
   const lineupScores: { picks: number[]; score: number }[] = [];
@@ -607,7 +653,19 @@ export function ourCompStacksUnderOpenSlots(
       };
     });
   });
-  return columns;
+  return columns.map((column, index) => {
+    const seat = projected[index];
+    const pin = seat ? pinnedHero(pinned, seat.player) : null;
+    const lead = column?.[0];
+    if (!pin || !lead || unavailable.has(heroKey(pin))) return column;
+    return [
+      {
+        ...lead,
+        hero: pin,
+        why: `Hover — lock ${pin}.\n${lead.why}`,
+      },
+    ];
+  });
 }
 
 /** Three suggestions under each empty pick, left to right. */

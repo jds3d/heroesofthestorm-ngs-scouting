@@ -1,6 +1,7 @@
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
+import { EMPTY_LIVE_DRAFT } from "@/lib/lobby/screenLobby";
 import {
   InteractiveDraft,
   LikelyPickProjection,
@@ -20,8 +21,11 @@ describe("draft board options", () => {
     );
     const tournament = html.indexOf("Tournament draft mode");
     const comfort = html.indexOf("Ignore comfort");
+    const hovers = html.indexOf("Assume other hovers will be locked");
     expect(tournament).toBeGreaterThan(-1);
     expect(comfort).toBeGreaterThan(tournament);
+    expect(hovers).toBeGreaterThan(comfort);
+    expect(html.slice(hovers - 180, hovers)).toContain("checked");
   });
 });
 
@@ -218,6 +222,175 @@ describe("Likely pick projection", () => {
     expect(waiting).toContain("one request per player");
     expect(waiting).toContain("border-amber-400/70");
   });
+
+  const auriel = {
+    player: "KnoobKnight",
+    hero: "Auriel",
+    role: "Healer" as const,
+    locked: false,
+    sl: 0.5,
+    comfort: 0.5,
+    games: 20,
+    points: 18,
+  };
+
+  it("pulses a portrait and shows how much of its Storm League card is in", () => {
+    const html = renderToStaticMarkup(
+      createElement(LikelyPickProjection, {
+        accent: "ally",
+        hideRole: true,
+        queued: ["Auriel"],
+        seat: {
+          ...auriel,
+          breakdown: {
+            total: 18,
+            factors: [
+              {
+                id: "matchup",
+                label: "Vs their locked",
+                points: 4,
+                detail: "",
+                lines: [
+                  "into Leoric: 54.0% win rate (800g) → +4",
+                  "into Garrosh: fetching Storm League… → 0",
+                ],
+              },
+            ],
+          },
+        },
+      }),
+    );
+    expect(html).toContain("50% loading");
+    expect(html).toContain("animate-pulse");
+    expect(html).toContain("Auriel data 50% loaded");
+    expect(html).toContain("text-amber-200");
+    expect(html).toContain("+18");
+  });
+
+  it("leaves a portrait unmarked once every duo line has a sample", () => {
+    const html = renderToStaticMarkup(
+      createElement(LikelyPickProjection, {
+        accent: "ally",
+        seat: {
+          ...auriel,
+          breakdown: {
+            total: 18,
+            factors: [
+              {
+                id: "matchup",
+                label: "Vs their locked",
+                points: 4,
+                detail: "into Leoric: 54.0% win rate (800g) → +4",
+              },
+            ],
+          },
+        },
+      }),
+    );
+    expect(html).not.toContain("% loading");
+    expect(html).not.toContain("% sampled");
+    expect(html).not.toContain("animate-pulse");
+    expect(html).toContain("+18");
+  });
+
+  it("shows a quiet percent when the pull is done and a pairing has no sample", () => {
+    const html = renderToStaticMarkup(
+      createElement(LikelyPickProjection, {
+        accent: "ally",
+        seat: {
+          ...auriel,
+          breakdown: {
+            total: 18,
+            factors: [
+              {
+                id: "matchup",
+                label: "Vs their locked",
+                points: 4,
+                detail: "",
+                lines: [
+                  "into Leoric: 54.0% win rate (800g) → +4",
+                  "into Garrosh: no Storm League pairing on record → 0",
+                ],
+              },
+            ],
+          },
+        },
+      }),
+    );
+    expect(html).toContain("50% sampled");
+    expect(html).not.toContain("animate-pulse");
+    expect(html).not.toContain("% loading");
+  });
+
+  it("marks a failed Storm League pull on the portrait", () => {
+    const html = renderToStaticMarkup(
+      createElement(LikelyPickProjection, {
+        accent: "enemy",
+        failed: ["Auriel"],
+        seat: auriel,
+      }),
+    );
+    expect(html).toContain(">Failed<");
+    expect(html).toContain("Auriel Storm League data failed to load");
+    expect(html).toContain("ring-red-500");
+    expect(html).not.toContain("animate-pulse");
+  });
+
+  it("does not say loading when the card already has ally and enemy samples", () => {
+    const html = renderToStaticMarkup(
+      createElement(LikelyPickProjection, {
+        accent: "ally",
+        table: { patch: "test", source: "heroesprofile-sl", byHero: {} },
+        seat: {
+          ...auriel,
+          hero: "Rexxar",
+          points: 31,
+          breakdown: {
+            total: 31,
+            factors: [
+              {
+                id: "synergy",
+                label: "Ally synergy",
+                points: 13,
+                detail: "3 duos, net +13",
+                lines: [
+                  "with Rehgar: 54.8% together (3,756g) → +6",
+                  "with Tychus: 54.4% together (3,559g) → +5",
+                  "with Medivh: 51.8% together (643g) → +2",
+                ],
+              },
+              {
+                id: "matchup",
+                label: "Vs their locked",
+                points: 1,
+                detail: "2 duos, net +1",
+                lines: [
+                  "into Arthas: 52% win rate (2,794g) → +1",
+                  "into Tyrael: 49.1% win rate (2,330g) → 0",
+                ],
+              },
+            ],
+          },
+        },
+      }),
+    );
+    expect(html).not.toContain("% loading");
+    expect(html).not.toContain("animate-pulse");
+    expect(html).toContain("+31");
+  });
+
+  it("shows 0% while the hero's Storm League bundle is not in the table yet", () => {
+    const html = renderToStaticMarkup(
+      createElement(LikelyPickProjection, {
+        accent: "ally",
+        table: { patch: "test", source: "heroesprofile-sl", byHero: {} },
+        seat: auriel,
+      }),
+    );
+    expect(html).toContain("0% loading");
+    expect(html).toContain("animate-pulse");
+    expect(html).toContain("Auriel data 0% loaded");
+  });
 });
 
 describe("observed draft slots", () => {
@@ -306,5 +479,45 @@ describe("missing data badge", () => {
     expect(html).toContain("Failed to load");
     expect(html).toContain("Storm League matchups for Valla");
     expect(html).not.toContain("% loaded");
+  });
+});
+
+describe("reread a lock from the screen", () => {
+  const observed = {
+    ...EMPTY_LIVE_DRAFT,
+    ourBans: ["Johanna"],
+    ourPicks: ["Tyrael"],
+    ourPickPlayers: ["Saffiel"],
+    firstPick: "us" as const,
+    phase: "pick" as const,
+  };
+
+  it("makes a locked ban and hero a button while the screen is being watched", () => {
+    const html = renderToStaticMarkup(
+      createElement(InteractiveDraft, {
+        tree: { id: "t", title: "t", detail: "" },
+        weFirst: true,
+        watchOnly: true,
+        sideKnown: true,
+        observedPicks: observed,
+        onRereadLock: () => undefined,
+      }),
+    );
+    expect(html).toContain("Remove Johanna and read it from the screen");
+    expect(html).toContain("Remove Tyrael and read it from the screen");
+  });
+
+  it("leaves the board as pictures when it is not watching the screen", () => {
+    const html = renderToStaticMarkup(
+      createElement(InteractiveDraft, {
+        tree: { id: "t", title: "t", detail: "" },
+        weFirst: true,
+        watchOnly: false,
+        observedPicks: observed,
+        onRereadLock: () => undefined,
+      }),
+    );
+    expect(html).not.toContain("Remove Johanna and read it from the screen");
+    expect(html).not.toContain("Remove Tyrael and read it from the screen");
   });
 });

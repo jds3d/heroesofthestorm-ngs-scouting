@@ -2,12 +2,13 @@
 
 import { useEffect, useRef, useState, type MutableRefObject } from "react";
 import { TimeLeftBar } from "@/components/TimeLeftBar";
-import { heroKey } from "@/lib/scoring/heroMeta";
+import { locksAddedSince } from "@/lib/lobby/reviewCase";
 import {
   readThreeBanHexSlots,
   setBanHexMapContext,
 } from "@/lib/lobby/banFace";
 import { matchMapTitle } from "@/lib/lobby/mapTitle";
+import { heroKey } from "@/lib/scoring/heroMeta";
 import {
   FINAL_MAP_BOX,
   FINAL_NAME_BOXES,
@@ -48,10 +49,14 @@ import {
   pickSlotsFromPlateLocks,
   portraitFilled,
   plateFill,
+  allySlotPlate,
+  nameLabelBox,
   portraitIsLocked,
   portraitTeamRim,
   pruneHoverPicks,
   readsBySlot,
+  replaceSlotLines,
+  keepFresherSlotLines,
   draftHeroList,
   draftFromPartyQueue,
   partyNamesFromText,
@@ -72,6 +77,10 @@ import {
   takeNewLocks,
   turnFromOcr,
   draftLobbyLikelyOnFrame,
+  draftWithoutLock,
+  NO_BAN,
+  UNSEEN_BAN,
+  type ScreenReread,
   draftShortOfPicks,
   bothSidesPickedFive,
   liveDraftBoardFull,
@@ -341,6 +350,8 @@ export function LobbyScreenWatch({
   resetEpoch = 0,
   onIdlePausedChange,
   resumeRef,
+  saveReviewRef,
+  rereadRef,
   autoStart = false,
 }: {
   ourNames: string[];
@@ -359,11 +370,17 @@ export function LobbyScreenWatch({
   onIdlePausedChange?: (paused: boolean) => void;
   /** Parent calls `.current()` to resume after idle pause. */
   resumeRef?: MutableRefObject<(() => void) | null>;
+  /** Parent calls `.current()` to store the screen and the draft as read so far. */
+  saveReviewRef?: MutableRefObject<(() => Promise<string>) | null>;
+  /** Parent calls `.current(lock)` to drop one ban or pick and read that slot again. */
+  rereadRef?: MutableRefObject<((lock: ScreenReread) => void) | null>;
   /** When true, opens the share dialog on mount (off by default — wait for the button). */
   autoStart?: boolean;
 }) {
   const [phase, setPhase] = useState<Phase>(autoStart ? "watching" : "idle");
   const [requestingShare, setRequestingShare] = useState(false);
+  const [savingReview, setSavingReview] = useState(false);
+  const [reviewNote, setReviewNote] = useState<string | null>(null);
   const [status, setStatus] = useState(
     autoStart
       ? "Opening screen share…"
@@ -381,6 +398,13 @@ export function LobbyScreenWatch({
   const workerRef = useRef<Worker | null>(null);
   const hiddenRef = useRef(false);
   const busyRef = useRef(false);
+  const fastBusyRef = useRef(false);
+  const publishGenRef = useRef(0);
+  /** A read that started at or before a click must not write the board back over that fix. */
+  const ignoreDraftThroughRef = useRef(0);
+  const slotFpRef = useRef<{ left: string[]; right: string[] } | null>(null);
+  /** When a single-plate read finished, so a slower column read does not overwrite it. */
+  const slotFreshAtRef = useRef<Record<string, number>>({});
   const epochRef = useRef(0);
   const appliedReset = useRef(0);
   const oursRef = useRef(ourNames);
@@ -427,7 +451,16 @@ export function LobbyScreenWatch({
   const loadingTriesRef = useRef(0);
   /** Last draft-lobby frame, kept so the loading screen is not what gets saved. */
   const lastLobbyShotRef = useRef<{ frame: HTMLCanvasElement; draft: LiveDraft } | null>(null);
-  const reviewSavedRef = useRef(false);
+  /** Lobby frames that locked a new ban or pick. Kept only after Save for review. */
+  const heldPickFramesRef = useRef<
+    {
+      blob: Blob;
+      at: string;
+      added: { kind?: "ban" | "pick"; side: "us" | "them"; hero: string; player: string | null }[];
+    }[]
+  >([]);
+  const heldSentRef = useRef(0);
+  const keptReviewIdRef = useRef<string | null>(null);
   const onReplaySyncRef = useRef(onReplaySync);
   const leftNamesRef = useRef<string[]>([]);
   const rightNamesRef = useRef<string[]>([]);
@@ -509,6 +542,154 @@ export function LobbyScreenWatch({
     );
   }
 
+  function readStartedBeforeClick(readToken: number) {
+    return ignoreDraftThroughRef.current > 0 && readToken <= ignoreDraftThroughRef.current;
+  }
+
+  async function rereadLock(lock: ScreenReread) {
+    ignoreDraftThroughRef.current = publishGenRef.current;
+    draftCompleteRef.current = false;
+    announcedPicksRef.current = announcedPicksRef.current.filter(
+      (hero) => heroKey(hero) !== heroKey(lock.hero),
+    );
+    const cleared = draftWithoutLock(draftRef.current, lock);
+    draftRef.current = cleared;
+    onDraftRef.current(cleared);
+    const label =
+      lock.hero === UNSEEN_BAN || lock.hero === NO_BAN ? "that ban" : lock.hero;
+    const video = videoRef.current;
+    const frame = video ? snapshotVideo(video) : null;
+    const ctx = frame?.getContext("2d", { willReadFrequently: true }) ?? null;
+    if (!frame || !ctx) {
+      setStatus(`Removed ${label}. Share the main screen to read it again.`);
+      return;
+    }
+    setStatus(`Reading ${label} from the screen.`);
+    const epoch = epochRef.current;
+    const readToken = ++publishGenRef.current;
+    if (lock.kind === "ban") {
+      const cache = ocrCacheRef.current;
+      await publishWatched(
+        cache?.lobby ??
+          lobbyFromLines(frame, cache?.lines ?? { left: [], right: [], center: [] }),
+        cache?.title ?? "",
+        cache?.status ?? "",
+        cache?.center ?? "",
+        false,
+        frame,
+        ctx,
+        draftWatchFingerprintKey(ctx, frame),
+        epoch,
+        readToken,
+      );
+      return;
+    }
+    const column = lock.side === "our" ? "left" : "right";
+    const cache = ocrCacheRef.current;
+    const lines = cache?.lines ?? { left: [], right: [], center: [] };
+    const reads = readsBySlot(column === "left" ? lines.left : lines.right);
+    const found = reads.findIndex(
+      (read) => read.hero && heroKey(read.hero) === heroKey(lock.hero),
+    );
+    const slotIndexes = found >= 0 ? [found] : [0, 1, 2, 3, 4];
+    let left = lines.left;
+    let right = lines.right;
+    for (const index of slotIndexes) {
+      if (column === "left") left = replaceSlotLines(left, index, []);
+      else right = replaceSlotLines(right, index, []);
+      if (slotFpRef.current) {
+        const fps = {
+          left: [...slotFpRef.current.left],
+          right: [...slotFpRef.current.right],
+        };
+        fps[column][index] = "";
+        slotFpRef.current = fps;
+      }
+    }
+    const stripped = lobbyFromLines(frame, { left, right, center: lines.center });
+    if (cache) {
+      ocrCacheRef.current = {
+        ...cache,
+        lines: { left, right, center: lines.center },
+        lobby: stripped,
+      };
+    }
+    fastBusyRef.current = true;
+    try {
+      const boxes = column === "left" ? DRAFT_SLOT_NAMES.left : DRAFT_SLOT_NAMES.right;
+      const pictures: { side: "left" | "right"; index: number; image: string }[] = [];
+      for (const index of slotIndexes) {
+        const box = boxes[index];
+        if (!box) continue;
+        const plate = slotPlateCanvas(frame, box);
+        if (!plate) continue;
+        const image = await pictureOf(plate);
+        if (!image) continue;
+        pictures.push({ side: column, index, image });
+      }
+      if (pictures.length === 0 || epoch !== epochRef.current) return;
+      const res = await fetch("/api/ocr/names", {
+        method: "POST",
+        headers: { "content-type": "application/json", ...scoutHeaders() },
+        body: JSON.stringify({ slots: pictures }),
+      });
+      if (!res.ok || epoch !== epochRef.current) return;
+      const data = (await res.json()) as {
+        slots?: { side?: string; index?: number; lines?: { text: string; top: number }[] }[];
+      };
+      if (!data.slots) return;
+      const now = Date.now();
+      for (const slot of data.slots) {
+        const side = slot.side === "left" || slot.side === "right" ? slot.side : null;
+        const index = slot.index ?? -1;
+        if (!side || index < 0 || index > 4) continue;
+        if (side === "left") left = replaceSlotLines(left, index, slot.lines ?? []);
+        else right = replaceSlotLines(right, index, slot.lines ?? []);
+        slotFreshAtRef.current[`${side}:${index}`] = now;
+        if (slotFpRef.current) {
+          const fps = {
+            left: [...slotFpRef.current.left],
+            right: [...slotFpRef.current.right],
+          };
+          fps[side][index] = fingerprintSlots(ctx, frame)[side][index] ?? "";
+          slotFpRef.current = fps;
+        }
+      }
+      const lobby = lobbyFromLines(frame, { left, right, center: lines.center });
+      const current = ocrCacheRef.current;
+      ocrCacheRef.current = {
+        fingerprints: current?.fingerprints ?? {
+          title: "",
+          status: "",
+          namesLeft: "",
+          namesRight: "",
+          center: "",
+        },
+        title: current?.title ?? "",
+        status: current?.status ?? "",
+        center: current?.center ?? "",
+        lines: { left, right, center: lines.center },
+        lobby,
+      };
+      await publishWatched(
+        lobby,
+        current?.title ?? "",
+        current?.status ?? "",
+        current?.center ?? "",
+        false,
+        frame,
+        ctx,
+        draftWatchFingerprintKey(ctx, frame),
+        epoch,
+        readToken,
+      );
+    } catch {
+      setStatus(`Removed ${label}. Could not read that slot.`);
+    } finally {
+      fastBusyRef.current = false;
+    }
+  }
+
   function resumeIdleWatch() {
     if (draftCompleteRef.current) return;
     if (!streamRef.current || !videoRef.current || !workerRef.current) return;
@@ -520,6 +701,8 @@ export function LobbyScreenWatch({
   }
 
   if (resumeRef) resumeRef.current = resumeIdleWatch;
+  if (saveReviewRef) saveReviewRef.current = saveCurrentReview;
+  if (rereadRef) rereadRef.current = rereadLock;
 
   function armWatchTimer() {
     const video = videoRef.current;
@@ -533,6 +716,7 @@ export function LobbyScreenWatch({
     clearWatchTimer();
     timerMsRef.current = ms;
     timerRef.current = window.setInterval(() => {
+      void readChangedSlots(video);
       void readFrame(video, worker);
     }, ms);
   }
@@ -614,26 +798,72 @@ export function LobbyScreenWatch({
     };
   }
 
-  async function saveDraftReview(frame: HTMLCanvasElement, draft: LiveDraft) {
-    if (reviewSavedRef.current) return;
-    const board = reviewBoard(draft);
-    if (board.ourPicks.length + board.theirPicks.length === 0) return;
-    reviewSavedRef.current = true;
-    const blob = await canvasBlob(frame, "image/png");
-    if (!blob) {
-      reviewSavedRef.current = false;
-      return;
-    }
+  function discardPickFrames() {
+    heldPickFramesRef.current = [];
+    heldSentRef.current = 0;
+    keptReviewIdRef.current = null;
+  }
+
+  async function blobBase64(blob: Blob): Promise<string> {
     const bytes = new Uint8Array(await blob.arrayBuffer());
     let binary = "";
     for (let i = 0; i < bytes.length; i += 0x8000) {
       binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
     }
-    await fetch("/api/draft-examples", {
-      method: "POST",
-      headers: { "content-type": "application/json", ...scoutHeaders() },
-      body: JSON.stringify({ kind: "review", image: btoa(binary), board }),
-    }).catch(() => undefined);
+    return btoa(binary);
+  }
+
+  /** Remember the frame when it locks a ban or pick that was not already on the board. */
+  async function rememberPickFrame(frame: HTMLCanvasElement, prev: LiveDraft, next: LiveDraft) {
+    const added = locksAddedSince(prev, next);
+    if (!added.length) return;
+    const blob = await canvasBlob(frame, "image/jpeg", 0.82);
+    if (!blob) return;
+    heldPickFramesRef.current = [
+      ...heldPickFramesRef.current,
+      { blob, added, at: new Date().toISOString() },
+    ];
+    if (keptReviewIdRef.current) await flushHeldFrames(reviewBoard(next));
+  }
+
+  async function flushHeldFrames(board: ReturnType<typeof reviewBoard>): Promise<{ ok: boolean; count: number }> {
+    while (heldSentRef.current < heldPickFramesRef.current.length) {
+      const frame = heldPickFramesRef.current[heldSentRef.current];
+      if (!frame) break;
+      const response = await fetch("/api/draft-examples", {
+        method: "POST",
+        headers: { "content-type": "application/json", ...scoutHeaders() },
+        body: JSON.stringify({
+          kind: "review",
+          id: keptReviewIdRef.current,
+          board,
+          frames: [{ image: await blobBase64(frame.blob), added: frame.added, at: frame.at }],
+        }),
+      }).catch(() => null);
+      if (!response?.ok) return { ok: false, count: heldSentRef.current };
+      const data = (await response.json()) as { id?: string };
+      if (data.id) keptReviewIdRef.current = data.id;
+      heldSentRef.current += 1;
+    }
+    return { ok: true, count: heldSentRef.current };
+  }
+
+  async function saveCurrentReview(): Promise<string> {
+    if (heldPickFramesRef.current.length === 0) {
+      const video = videoRef.current;
+      const live = video ? snapshotVideo(video) : null;
+      const frame = live ?? lastLobbyShotRef.current?.frame ?? null;
+      if (!frame) return "No screen to save. Share the main screen first.";
+      const blob = await canvasBlob(frame, "image/jpeg", 0.82);
+      if (!blob) return "Could not capture the screen.";
+      heldPickFramesRef.current = [{ blob, added: [], at: new Date().toISOString() }];
+    }
+    const result = await flushHeldFrames(reviewBoard(draftRef.current));
+    if (!result.ok) return "Could not save that screen.";
+    if (result.count === 0) return "No lobby screenshots to keep.";
+    return result.count === 1
+      ? "Saved 1 lobby screenshot for review."
+      : `Saved ${result.count} lobby screenshots for review.`;
   }
 
   function scoutHeaders(): Record<string, string> {
@@ -695,6 +925,41 @@ export function LobbyScreenWatch({
   }
 
   type OcrLine = { text: string; top: number };
+
+/** One nameplate, scaled like the bench that still reads Tyrael. Not the 2200-wide column. */
+function slotPlateCanvas(
+  frame: HTMLCanvasElement,
+  box: DraftBox,
+): HTMLCanvasElement | null {
+  const sx = Math.max(0, Math.round(box.x * frame.width));
+  const sy = Math.max(0, Math.round(box.y * frame.height));
+  const sw = Math.max(1, Math.min(frame.width - sx, Math.round(box.w * frame.width)));
+  const sh = Math.max(1, Math.min(frame.height - sy, Math.round(box.h * frame.height)));
+  const scale = Math.min(2, 960 / sh);
+  const dw = Math.round(sw * scale);
+  const dh = Math.round(sh * scale);
+  if (dw < 8 || dh < 8) return null;
+  const plate = document.createElement("canvas");
+  plate.width = dw;
+  plate.height = dh;
+  const out = plate.getContext("2d");
+  if (!out) return null;
+  out.drawImage(frame, sx, sy, sw, sh, 0, 0, dw, dh);
+  return plate;
+}
+
+function fingerprintSlots(ctx: CanvasRenderingContext2D, frame: HTMLCanvasElement) {
+  return {
+    left: DRAFT_SLOT_NAMES.left.map((box) => regionFingerprint(ctx, frame, box)),
+    right: DRAFT_SLOT_NAMES.right.map((box) => regionFingerprint(ctx, frame, box)),
+  };
+}
+
+type LobbyLines = {
+  left: { text: string; top: number; x?: number }[];
+  right: { text: string; top: number; x?: number }[];
+  center: { text: string; top: number; x?: number }[];
+};
 
 /** Five nameplates, top to bottom, each in its own cell so line.top maps to a slot. */
 function stackNameplates(frame: HTMLCanvasElement, boxes: readonly DraftBox[]): HTMLCanvasElement | null {
@@ -832,6 +1097,10 @@ async function readLobby(
     };
   }
   const lines = mergeColumnReads(plan, fresh, cachedLines);
+  return lobbyFromLines(frame, lines);
+}
+
+function lobbyFromLines(frame: HTMLCanvasElement, lines: LobbyLines) {
   const leftReads = readsBySlot(lines.left);
   const rightReads = readsBySlot(lines.right);
   const leftPickingFlags = pickingFlagsBySlot(lines.left);
@@ -851,7 +1120,10 @@ async function readLobby(
       const box = portraitBoxes[index];
       const nameBox = nameBoxes[index];
       if (!read.hero || !box || !nameBox || !ctx || !pixelAt) return [];
-      const plate = plateFill(sampleBox(ctx, frame, nameBox), ally);
+      const namePixels = sampleBox(ctx, frame, nameBox);
+      const plate = ally
+        ? allySlotPlate(namePixels, sampleBox(ctx, frame, nameLabelBox(nameBox, box)))
+        : plateFill(namePixels, false);
       return [
         {
           hero: read.hero,
@@ -873,7 +1145,15 @@ async function readLobby(
     return reads.flatMap((read, index) => {
       const nameBox = nameBoxes[index];
       if (!read.hero || !nameBox) return [];
-      if (plateFill(sampleBox(ctx, frame, nameBox), true) !== "shown") return [];
+      const portrait = DRAFT_PLATE_SLOTS.left[index];
+      if (
+        !portrait ||
+        allySlotPlate(
+          sampleBox(ctx, frame, nameBox),
+          sampleBox(ctx, frame, nameLabelBox(nameBox, portrait)),
+        ) !== "shown"
+      )
+        return [];
       return [read.hero];
     });
   };
@@ -927,6 +1207,8 @@ async function readLobby(
     inDraftRef.current = false;
     watchFingerprintRef.current = "";
     ocrCacheRef.current = null;
+    slotFpRef.current = null;
+    slotFreshAtRef.current = {};
     stableSinceRef.current = 0;
     setIdlePaused(false);
     announcedPicksRef.current = [];
@@ -941,7 +1223,7 @@ async function readLobby(
     loadingArrivedDuringBusyRef.current = false;
     loadingTriesRef.current = 0;
     lastLobbyShotRef.current = null;
-    reviewSavedRef.current = false;
+    discardPickFrames();
     openTurnRef.current = null;
     picksStartedRef.current = false;
     draftRef.current = {
@@ -1032,6 +1314,7 @@ async function readLobby(
       setStatus(question);
       return true;
     }
+    await rememberPickFrame(frame, draft, completed.draft);
     draftRef.current = completed.draft;
     onDraftRef.current(completed.draft);
     inDraftRef.current = true;
@@ -1053,7 +1336,14 @@ async function readLobby(
     if (completed.draft.sealed) {
       draftCompleteRef.current = true;
       clearWatchTimer();
-      setStatus("Draft complete. Filled the remaining picks from the loading screen.");
+      const held = heldPickFramesRef.current.length;
+      setStatus(
+        keptReviewIdRef.current
+          ? "Draft complete. Filled the remaining picks from the loading screen. Lobby screenshots are saved."
+          : held > 0
+            ? `Draft complete. Filled the remaining picks from the loading screen. ${held} lobby screenshots are held — Save for review to keep them.`
+            : "Draft complete. Filled the remaining picks from the loading screen.",
+      );
     } else {
       setStatus("Loading screen is up. Still reading both teams.");
     }
@@ -1085,7 +1375,9 @@ async function readLobby(
     ctx: CanvasRenderingContext2D,
     fingerprint: string,
     epoch: number,
+    readToken = 0,
   ): Promise<boolean> {
+    const gen = readToken;
     const roster = rosterRef.current;
     const partyText = "";
     const mapHint = mapFromTitle(titleText) ?? draftRef.current.map ?? null;
@@ -1183,13 +1475,21 @@ async function readLobby(
     }
     lastLobbyShotRef.current = { frame, draft: nextDraft };
     if (epoch !== epochRef.current) return true;
+    if (readStartedBeforeClick(gen)) return false;
+    await rememberPickFrame(frame, draftRef.current, nextDraft);
     draftRef.current = nextDraft;
     onDraftRef.current(nextDraft);
     if (liveDraftBoardFull(nextDraft) && !draftCompleteRef.current) {
       draftCompleteRef.current = true;
       clearWatchTimer();
-      await saveDraftReview(frame, nextDraft);
-      setStatus("Draft complete. Saved the lobby screenshot for review.");
+      const held = heldPickFramesRef.current.length;
+      setStatus(
+        keptReviewIdRef.current
+          ? "Draft complete. Lobby screenshots are saved for review."
+          : held > 0
+            ? `Draft complete. ${held} lobby screenshots are held — Save for review to keep them.`
+            : "Draft complete.",
+      );
       return true;
     }
     if (ourColumn.length >= 3) {
@@ -1238,6 +1538,130 @@ async function readLobby(
     return false;
   }
 
+  function slotsFresherThan(side: "left" | "right", started: number): number[] {
+    return [0, 1, 2, 3, 4].filter(
+      (index) => (slotFreshAtRef.current[`${side}:${index}`] ?? 0) > started,
+    );
+  }
+
+  function mergeFreshLobby(
+    full: NonNullable<Awaited<ReturnType<typeof readLobby>>>,
+    started: number,
+    fallbackFrame: HTMLCanvasElement,
+  ) {
+    const leftFresh = slotsFresherThan("left", started);
+    const rightFresh = slotsFresherThan("right", started);
+    if (leftFresh.length === 0 && rightFresh.length === 0) return full;
+    const live = ocrCacheRef.current?.lines;
+    if (!live) return full;
+    const left = keepFresherSlotLines(full.lines.left, live.left, leftFresh);
+    const right = keepFresherSlotLines(full.lines.right, live.right, rightFresh);
+    const latest = videoRef.current
+      ? (snapshotVideo(videoRef.current) ?? fallbackFrame)
+      : fallbackFrame;
+    return lobbyFromLines(latest, { left, right, center: full.lines.center });
+  }
+
+  /** A changed nameplate, read on its own, so a lock is not waiting on the whole column. */
+  async function readChangedSlots(video: HTMLVideoElement) {
+    if (fastBusyRef.current || !inDraftRef.current || draftCompleteRef.current) return;
+    if (hiddenRef.current || idlePausedRef.current || video.readyState < 2) return;
+    const prev = slotFpRef.current;
+    if (!prev) return;
+    const frame = snapshotVideo(video);
+    if (!frame) return;
+    const ctx = frame.getContext("2d", { willReadFrequently: true });
+    if (!ctx) return;
+    const nextFp = fingerprintSlots(ctx, frame);
+    const changed: { side: "left" | "right"; index: number }[] = [];
+    nextFp.left.forEach((fp, index) => {
+      if (fp !== prev.left[index]) changed.push({ side: "left", index });
+    });
+    nextFp.right.forEach((fp, index) => {
+      if (fp !== prev.right[index]) changed.push({ side: "right", index });
+    });
+    if (changed.length === 0) return;
+    const leftCount = changed.filter((slot) => slot.side === "left").length;
+    if (leftCount > 2 || changed.length - leftCount > 2) return;
+    fastBusyRef.current = true;
+    const epoch = epochRef.current;
+    const readToken = ++publishGenRef.current;
+    try {
+      const pictures: { side: "left" | "right"; index: number; image: string }[] = [];
+      for (const slot of changed) {
+        const boxes = slot.side === "left" ? DRAFT_SLOT_NAMES.left : DRAFT_SLOT_NAMES.right;
+        const box = boxes[slot.index];
+        if (!box) continue;
+        const plate = slotPlateCanvas(frame, box);
+        if (!plate) continue;
+        const image = await pictureOf(plate);
+        if (!image) continue;
+        pictures.push({ side: slot.side, index: slot.index, image });
+      }
+      if (pictures.length === 0 || epoch !== epochRef.current) return;
+      const res = await fetch("/api/ocr/names", {
+        method: "POST",
+        headers: { "content-type": "application/json", ...scoutHeaders() },
+        body: JSON.stringify({ slots: pictures }),
+      });
+      if (!res.ok || epoch !== epochRef.current) return;
+      const data = (await res.json()) as {
+        slots?: { side?: string; index?: number; lines?: { text: string; top: number }[] }[];
+      };
+      if (!data.slots) return;
+      const cache = ocrCacheRef.current;
+      let left = cache?.lines.left ?? [];
+      let right = cache?.lines.right ?? [];
+      const now = Date.now();
+      for (const slot of data.slots ?? []) {
+        const side = slot.side === "left" || slot.side === "right" ? slot.side : null;
+        const index = slot.index ?? -1;
+        if (!side || index < 0 || index > 4) continue;
+        const lines = slot.lines ?? [];
+        if (side === "left") left = replaceSlotLines(left, index, lines);
+        else right = replaceSlotLines(right, index, lines);
+        slotFreshAtRef.current[`${side}:${index}`] = now;
+      }
+      if (readStartedBeforeClick(readToken)) return;
+      const lobby = lobbyFromLines(frame, {
+        left,
+        right,
+        center: cache?.lines.center ?? [],
+      });
+      ocrCacheRef.current = {
+        fingerprints: cache?.fingerprints ?? {
+          title: "",
+          status: "",
+          namesLeft: nextFp.left.join("|"),
+          namesRight: nextFp.right.join("|"),
+          center: "",
+        },
+        title: cache?.title ?? "",
+        status: cache?.status ?? "",
+        center: cache?.center ?? "",
+        lines: { left, right, center: cache?.lines.center ?? [] },
+        lobby,
+      };
+      slotFpRef.current = nextFp;
+      await publishWatched(
+        lobby,
+        cache?.title ?? "",
+        cache?.status ?? "",
+        cache?.center ?? "",
+        false,
+        frame,
+        ctx,
+        draftWatchFingerprintKey(ctx, frame),
+        epoch,
+        readToken,
+      );
+    } catch {
+      // The slot fingerprints stay put, so the next tick reads the plate again.
+    } finally {
+      fastBusyRef.current = false;
+    }
+  }
+
   async function readFrame(video: HTMLVideoElement, worker: Worker) {
     if (video.readyState < 2) return;
     if (hiddenRef.current) return;
@@ -1250,16 +1674,15 @@ async function readLobby(
     }
     if (busyRef.current) {
       if (heldLoadingRef.current) loadingArrivedDuringBusyRef.current = true;
+      void readChangedSlots(video);
       return;
     }
     const epoch = epochRef.current;
+    const readToken = ++publishGenRef.current;
     busyRef.current = true;
     try {
       const held = heldLoadingRef.current;
       if (held) {
-        if (!reviewSavedRef.current && lastLobbyShotRef.current) {
-          await saveDraftReview(lastLobbyShotRef.current.frame, lastLobbyShotRef.current.draft);
-        }
         const heldCtx = held.getContext("2d", { willReadFrequently: true });
         if (heldCtx) {
           loadingTriesRef.current += 1;
@@ -1318,7 +1741,26 @@ async function readLobby(
         right: plan.right || !haveLines,
         center: plan.center || !haveLines,
       };
-      const namesNeeded = refresh.left || refresh.right;
+      if (!slotFpRef.current) slotFpRef.current = fingerprintSlots(ctx, frame);
+      const liveSlots = fingerprintSlots(ctx, frame);
+      const slotDelta = {
+        left: liveSlots.left.filter((fp, index) => fp !== slotFpRef.current?.left[index]).length,
+        right: liveSlots.right.filter((fp, index) => fp !== slotFpRef.current?.right[index]).length,
+      };
+      const fastOwnsNames =
+        inDraftRef.current &&
+        haveLines &&
+        slotDelta.left <= 2 &&
+        slotDelta.right <= 2 &&
+        slotDelta.left + slotDelta.right > 0;
+      if (fastOwnsNames && !plan.title && !plan.status && !plan.center) {
+        watchFingerprintRef.current = fingerprint;
+        stableSinceRef.current = Date.now();
+        void readChangedSlots(video);
+        return;
+      }
+      const namesNeeded = (refresh.left || refresh.right) && !fastOwnsNames;
+      const nameReadStarted = Date.now();
       const seq = ++frameSeqRef.current;
       // Nameplates commit a lock. The center splash is a second read so a
       // hero is not stuck behind the big picture.
@@ -1345,10 +1787,11 @@ async function readLobby(
       if (inDraftRef.current && namesNeeded) {
         const quick = await namesPromise;
         if (epoch !== epochRef.current || seq !== frameSeqRef.current) return;
+        const merged = quick ? mergeFreshLobby(quick, nameReadStarted, frame) : null;
         if (
-          quick &&
+          merged &&
           (await publishWatched(
-            quick,
+            merged,
             cached?.title ?? "",
             cached?.status ?? "",
             cached?.center ?? "",
@@ -1357,6 +1800,7 @@ async function readLobby(
             ctx,
             fingerprint,
             epoch,
+            readToken,
           ))
         ) {
           return;
@@ -1367,10 +1811,13 @@ async function readLobby(
       const centerNow = inDraftRef.current ? null : await centerPromise;
       if (epoch !== epochRef.current || seq !== frameSeqRef.current) return;
       const lobbyFresh = namesNeeded ? await namesPromise : null;
-      const lobby = lobbyFresh ?? cached?.lobby ?? null;
+      const lobby = lobbyFresh
+        ? mergeFreshLobby(lobbyFresh, nameReadStarted, frame)
+        : (cached?.lobby ?? null);
       const centerLines = centerNow?.center ?? lobby?.center ?? [];
       const rapidCenter = centerLines.map((line) => line.text).join("\n");
       const centerSource = rapidCenter.trim() ? rapidCenter : (cached?.center ?? "");
+      if (readStartedBeforeClick(readToken)) return;
       ocrCacheRef.current = {
         fingerprints: {
           title: currentFp.title,
@@ -1391,11 +1838,11 @@ async function readLobby(
         status: statusText,
         center: centerSource,
         lines: {
-          left: lobbyFresh?.lines.left ?? cached?.lines?.left ?? [],
-          right: lobbyFresh?.lines.right ?? cached?.lines?.right ?? [],
+          left: lobby?.lines.left ?? cached?.lines?.left ?? [],
+          right: lobby?.lines.right ?? cached?.lines?.right ?? [],
           center:
             centerNow?.lines.center ??
-            lobbyFresh?.lines.center ??
+            lobby?.lines.center ??
             cached?.lines?.center ??
             [],
         },
@@ -1423,9 +1870,6 @@ async function readLobby(
             return;
           }
           if (draftShortOfPicks(draftRef.current)) {
-            if (!reviewSavedRef.current && lastLobbyShotRef.current) {
-              await saveDraftReview(lastLobbyShotRef.current.frame, lastLobbyShotRef.current.draft);
-            }
             setStatus(
               "A pick is still missing. Holding this draft until the loading screen shows who locked it.",
             );
@@ -1481,6 +1925,7 @@ async function readLobby(
           ctx,
           fingerprint,
           epoch,
+          readToken,
         )
       ) {
         return;
@@ -1511,6 +1956,7 @@ async function readLobby(
             ctx,
             fingerprint,
             epoch,
+            readToken,
           );
         });
       }
@@ -1550,7 +1996,7 @@ async function readLobby(
     loadingArrivedDuringBusyRef.current = false;
     loadingTriesRef.current = 0;
     lastLobbyShotRef.current = null;
-    reviewSavedRef.current = false;
+    discardPickFrames();
     announcedPicksRef.current = [];
     draftRef.current = {
       ...EMPTY_LIVE_DRAFT,
@@ -1564,6 +2010,8 @@ async function readLobby(
     inDraftRef.current = false;
     watchFingerprintRef.current = "";
     ocrCacheRef.current = null;
+    slotFpRef.current = null;
+    slotFreshAtRef.current = {};
     stableSinceRef.current = 0;
     onDraftRef.current(draftRef.current);
     setNames([]);
@@ -1645,7 +2093,23 @@ async function readLobby(
           ) : (
             <p className="text-sm text-[var(--muted)]">{status}</p>
           )}
+          {reviewNote ? <p className="text-sm text-[var(--ink)]">{reviewNote}</p> : null}
         </div>
+        <button
+          type="button"
+          disabled={savingReview}
+          onClick={() => {
+            setSavingReview(true);
+            setReviewNote(null);
+            void saveCurrentReview().then((note) => {
+              setReviewNote(note);
+              setSavingReview(false);
+            });
+          }}
+          className="h-10 shrink-0 rounded-md border border-[var(--accent)] px-4 text-sm font-semibold uppercase tracking-wide text-[var(--accent)] transition hover:bg-[var(--accent)]/10 disabled:opacity-50"
+        >
+          {savingReview ? "Saving…" : "Save for review"}
+        </button>
         <button
           type="button"
           onClick={() => {

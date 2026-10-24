@@ -23,6 +23,8 @@ import {
   pickCountsFit,
   pickSlotsFromPlateLocks,
   plateLockPhase,
+  dropShownPlates,
+  shownHoverLocks,
   portraitIsLocked,
   pruneHoverPicks,
   resolveFirstPick,
@@ -435,6 +437,14 @@ export function nextWatchedDraft(args: {
       : draft.theirOpenPlayers ?? [];
   let ourPickPlayers = ourLocked?.players ?? draft.ourPickPlayers;
   let theirPickPlayers = theirLocked?.players ?? draft.theirPickPlayers;
+  const ourHover = dropShownPlates(
+    ourPicks,
+    ourPickPlayers,
+    ourReads,
+    usOnLeft ? (lobby?.leftSlots ?? []) : (lobby?.rightSlots ?? []),
+  );
+  ourPicks = ourHover.heroes;
+  ourPickPlayers = ourHover.players;
   const turnPhase =
     phase === "ban" || phase === "pick"
       ? phase
@@ -504,6 +514,20 @@ export function nextWatchedDraft(args: {
   theirPicks = fittedPicks.theirPicks;
   ourPickPlayers = fittedPicks.ourPickPlayers;
   theirPickPlayers = fittedPicks.theirPickPlayers;
+  const takenHeroes = new Set([...ourPicks, ...theirPicks].map((hero) => heroKey(hero)));
+  const takenPlayers = new Set(ourPickPlayers.map((name) => playerFold(name)).filter(Boolean));
+  const ourHovers =
+    platePhase === "pick" || picksStarted
+      ? shownHoverLocks(
+          ourReads,
+          usOnLeft ? (lobby?.leftSlots ?? []) : (lobby?.rightSlots ?? []),
+          [...args.roster, ...ourColumn],
+        ).filter((hover) => {
+          if (!hover.hero || takenHeroes.has(heroKey(hover.hero))) return false;
+          const who = playerFold(hover.player);
+          return !who || !takenPlayers.has(who);
+        })
+      : [];
   const resolvedFirst =
     resolveFirstPick({
       firstPick,
@@ -536,6 +560,7 @@ export function nextWatchedDraft(args: {
         theirPickPlayers,
         ourOpenPlayers,
         theirOpenPlayers,
+        ourHovers,
         ourBans,
         theirBans,
         firstPick: resolvedFirst,

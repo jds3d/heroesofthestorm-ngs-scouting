@@ -226,6 +226,9 @@ export const NO_BAN = "__no_ban__";
 /** A locked portrait and the name printed under it. */
 export type SlotLock = { hero: string; player: string | null };
 
+/** An ally hero sitting on a hover plate. Not a lock until the player confirms it. */
+export type ShownHover = { hero: string; player: string | null };
+
 export type LiveDraft = {
   ourPicks: string[];
   theirPicks: string[];
@@ -240,6 +243,11 @@ export type LiveDraft = {
    */
   ourOpenPlayers?: string[];
   theirOpenPlayers?: string[];
+  /**
+   * Ally heroes on a hover plate during picks. The board can treat these as
+   * the heroes those players will lock.
+   */
+  ourHovers?: ShownHover[];
   /** Who banned first. In this lobby that side also picks first. */
   firstPick: "us" | "them" | null;
   /** Last phase read from the center banner. */
@@ -255,6 +263,32 @@ export type LiveDraft = {
 };
 
 export type LiveTurn = { side: "our" | "their"; kind: "ban" | "pick" };
+
+export type ScreenReread = {
+  side: "our" | "their";
+  kind: "ban" | "pick";
+  index: number;
+  hero: string;
+};
+
+/** Drop one locked ban or pick. A ban keeps its hex index; a pick leaves the list. */
+export function draftWithoutLock(draft: LiveDraft, target: ScreenReread): LiveDraft {
+  if (target.kind === "ban") {
+    const key = target.side === "our" ? "ourBans" : "theirBans";
+    const bans = draft[key].slice();
+    if (target.index < 0 || target.index >= bans.length) return { ...draft, sealed: false };
+    bans[target.index] = "";
+    return { ...draft, [key]: bans, sealed: false };
+  }
+  const heroes = target.side === "our" ? "ourPicks" : "theirPicks";
+  const players = target.side === "our" ? "ourPickPlayers" : "theirPickPlayers";
+  return {
+    ...draft,
+    [heroes]: draft[heroes].filter((_, index) => index !== target.index),
+    [players]: draft[players].filter((_, index) => index !== target.index),
+    sealed: false,
+  };
+}
 
 export const EMPTY_LIVE_DRAFT: LiveDraft = {
   ourPicks: [],
@@ -355,6 +389,39 @@ export function readsBySlot(
     buckets[index].push(line.text);
   }
   return buckets.map((bucket) => readSlotPlate(bucket));
+}
+
+/** Swap one nameplate's lines into a stacked column. Tops stay inside that slot. */
+export function replaceSlotLines<T extends { text: string; top: number }>(
+  lines: readonly T[],
+  index: number,
+  fresh: readonly { text: string; top: number }[],
+  stride = SLOT_LINE_STRIDE,
+): T[] {
+  const start = index * stride;
+  const end = start + stride;
+  const kept = lines.filter((line) => line.top < start || line.top >= end);
+  const added = fresh.map(
+    (line, offset) => ({ ...line, top: start + 20 + offset * 30 }) as T,
+  );
+  return [...kept, ...added].sort((a, b) => a.top - b.top);
+}
+
+/**
+ * A slot read that finished after the column read started wins.
+ * The column's other slots stay.
+ */
+export function keepFresherSlotLines<T extends { top: number }>(
+  full: readonly T[],
+  newer: readonly T[],
+  slots: readonly number[],
+  stride = SLOT_LINE_STRIDE,
+): T[] {
+  if (slots.length === 0) return [...full];
+  const fresh = new Set(slots);
+  const kept = full.filter((line) => !fresh.has(Math.floor(line.top / stride)));
+  const taken = newer.filter((line) => fresh.has(Math.floor(line.top / stride)));
+  return [...kept, ...taken].sort((a, b) => a.top - b.top);
 }
 
 /**
@@ -1135,9 +1202,8 @@ export function portraitTeamRim(
 }
 
 /**
- * A hero name plate with a light background is locked. A dark plate is a hover.
- * The enemy column has no hovers: fog of war hides what they are considering,
- * so a hero name printed on their plate is a lock in either phase.
+ * Our light nameplate is a lock. Our blue or dark nameplate is a hover.
+ * The enemy column does not show hovers. A hero name on their plate is a lock.
  */
 export function portraitIsLocked(args: {
   phase: "ban" | "pick" | null;
@@ -1156,10 +1222,99 @@ export function portraitIsLocked(args: {
    */
   keepCommitted?: boolean;
 }): boolean {
-  if (args.ally === false) return Boolean(args.heroOnPlate);
   if (args.slotPicking) return false;
+  if (args.ally === false) return Boolean(args.heroOnPlate);
   if (!args.heroOnPlate || !args.faceFilled) return false;
   return args.plate === "locked";
+}
+
+/**
+ * The part of a name box that is the text plate, left of the portrait.
+ * A bright face must not be what decides hover versus lock.
+ */
+export function nameLabelBox(name: DraftBox, portrait: DraftBox): DraftBox {
+  const cut = portrait.x + portrait.w * 0.2;
+  const x1 = Math.min(name.x + name.w, cut);
+  return { x: name.x, y: name.y, w: Math.max(0, x1 - name.x), h: name.h, rotate: 0 };
+}
+
+/**
+ * Ally plate color. The full name box can be pulled bright by the portrait.
+ * A blue text plate is still a hover.
+ */
+export function allySlotPlate(namePixels: readonly Rgb[], labelPixels: readonly Rgb[]): PlateFill {
+  const plate = allyPlateFill(namePixels);
+  if (plate !== "locked") return plate;
+  if (labelIsBlueHover(labelPixels)) return "shown";
+  return plate;
+}
+
+function labelIsBlueHover(pixels: readonly Rgb[]): boolean {
+  const lumas: number[] = [];
+  const cast: number[] = [];
+  for (const pixel of pixels) {
+    const luma = lumaOf(pixel);
+    if (luma < 55) continue;
+    lumas.push(luma);
+    cast.push(pixel.b - pixel.r);
+  }
+  if (lumas.length < 30) return false;
+  lumas.sort((a, b) => a - b);
+  cast.sort((a, b) => a - b);
+  const medianLuma = lumas[Math.floor(lumas.length / 2)] ?? 0;
+  const medianCast = cast[Math.floor(cast.length / 2)] ?? 0;
+  return medianLuma < 120 && medianCast >= 40;
+}
+
+/**
+ * Our hero is on a hover plate this frame. That is not a lock.
+ * A lock that is simply missing from this frame stays.
+ */
+export function dropShownPlates(
+  heroes: readonly string[],
+  players: readonly (string | null)[],
+  reads: readonly { hero: string | null }[],
+  slots: readonly { plate?: PlateFill; slot: number }[],
+): { heroes: string[]; players: (string | null)[] } {
+  const hovering = new Set<string>();
+  reads.forEach((read, index) => {
+    if (!read.hero) return;
+    const plate = slots.find((slot) => slot.slot === index)?.plate;
+    if (plate === "shown") hovering.add(heroKey(read.hero));
+  });
+  if (hovering.size === 0) {
+    return {
+      heroes: [...heroes],
+      players: heroes.map((_, index) => players[index] ?? null),
+    };
+  }
+  const nextHeroes: string[] = [];
+  const nextPlayers: (string | null)[] = [];
+  heroes.forEach((hero, index) => {
+    if (hovering.has(heroKey(hero))) return;
+    nextHeroes.push(hero);
+    nextPlayers.push(players[index] ?? null);
+  });
+  return { heroes: nextHeroes, players: nextPlayers };
+}
+
+/** Ally heroes whose plate is a hover, with the name under that plate. */
+export function shownHoverLocks(
+  reads: readonly { hero: string | null; player: string | null }[],
+  slots: readonly { plate?: PlateFill; slot: number }[],
+  names: readonly string[] = [],
+): ShownHover[] {
+  const hovers: ShownHover[] = [];
+  reads.forEach((read, index) => {
+    if (!read.hero) return;
+    const plate = slots.find((slot) => slot.slot === index)?.plate;
+    if (plate !== "shown") return;
+    hovers.push({
+      hero: read.hero,
+      player: read.player ? snapToRoster(read.player, names) : null,
+    });
+  });
+  return hovers;
 }
 
 /**
@@ -2689,7 +2844,11 @@ export function actionsFromObserved(
     }
     if (step.kind !== "ban") break;
     const openingBansRead = draft.ourBans.length + draft.theirBans.length > 0;
-    if (stepIndex > 3 && openingBansRead) break;
+    // A named opening ban means the second-round hexes are still coming.
+    // Wait for them — unless a pick after this ban is already locked, in
+    // which case the ban step is over and the last wave still has to be listed.
+    const picksPastThisBan = observedPicks > picksBefore(stepIndex);
+    if (stepIndex > 3 && openingBansRead && !picksPastThisBan) break;
     if (!banAlreadyPassed(stepIndex, observedPicks, draft.phase)) break;
     actions.push({ side, kind: "ban", hero: UNSEEN_BAN });
   }

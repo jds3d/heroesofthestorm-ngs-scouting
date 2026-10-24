@@ -19,6 +19,7 @@ import {
   assignRequiredRoles,
   checkRequiredRoles,
   type RequiredRole,
+  type ShapeNeed,
 } from "@/lib/scoring/roles";
 import type { DraftCompPick, PlayerScout } from "@/lib/scoring/types";
 
@@ -124,6 +125,7 @@ export function pairRoleCheck(
   after: DraftCompPick[],
   first: string,
   second: string,
+  map?: string | null,
 ): {
   points: number;
   detail: string;
@@ -133,7 +135,7 @@ export function pairRoleCheck(
   secondDetail: string;
 } {
   const heroes = after.map((pick) => pick.hero);
-  const check = checkRequiredRoles(heroes);
+  const check = checkRequiredRoles(heroes, map);
   const [firstPoints, secondPoints] = splitBetweenPair(check.points);
   const heroDetail = (hero: string, share: number) => {
     const index = heroes.findIndex((h) => heroKey(h) === heroKey(hero));
@@ -212,10 +214,11 @@ export function pairScoreFactors(args: {
   after: DraftCompPick[];
   first: string;
   second: string;
+  map?: string | null;
 }): PairScoreFactor[] {
   const duo = pairDuoSynergy(args.table, args.first, args.second);
   const [firstSynergy, secondSynergy] = splitBetweenPair(duo.points);
-  const roles = pairRoleCheck(args.after, args.first, args.second);
+  const roles = pairRoleCheck(args.after, args.first, args.second, args.map);
   return [
     {
       id: "duo",
@@ -246,6 +249,7 @@ export function scoreOrderedPair(args: {
   /** This team's locked heroes plus both new locks (no unlocked plan seats). */
   projectBoth: (first: string, second: string) => DraftCompPick[];
   table: DraftMetaTable | null | undefined;
+  map?: string | null;
 }): RankedPickPair {
   const { first, second } = args;
   const firstSolo = args.soloScore(first.hero);
@@ -255,6 +259,7 @@ export function scoreOrderedPair(args: {
     after: args.projectBoth(first.hero, second.hero),
     first: first.hero,
     second: second.hero,
+    map: args.map,
   });
   const total = Math.round(
     firstSolo + secondSolo + pairFactors.reduce((sum, factor) => sum + factor.points, 0),
@@ -284,25 +289,23 @@ export function scoreOrderedPair(args: {
 export function rolesThisPairMustCover(
   lockedHeroes: readonly string[],
   picksAfter: number,
-): RequiredRole[] {
+): ShapeNeed[] {
   if (picksAfter > 0) return [];
-  const missing = checkRequiredRoles(lockedHeroes).missing;
+  const missing = checkRequiredRoles(lockedHeroes).missing.filter((role) => role !== "frontline");
   if (missing.includes("healer")) return ["healer"];
   return missing.slice(0, 2);
 }
 
-/** True when the two locks fill every role this pair is required to cover. */
+/** True when the two locks fill every hole this pair is required to cover. */
 export function pairCoversRoles(
   lockedHeroes: readonly string[],
   first: string,
   second: string,
-  roles: readonly RequiredRole[],
+  roles: readonly ShapeNeed[],
 ): boolean {
   if (!roles.length) return true;
-  const have = new Set(
-    assignRequiredRoles([...lockedHeroes, first, second]).values(),
-  );
-  return roles.every((role) => have.has(role));
+  const holes = new Set(checkRequiredRoles([...lockedHeroes, first, second]).missing);
+  return roles.every((role) => !holes.has(role));
 }
 
 /**
@@ -318,6 +321,7 @@ export function rankDoublePickPairs(args: {
   /** This team's locked heroes plus both new locks (no unlocked plan seats). */
   projectBoth: (first: string, second: string) => DraftCompPick[];
   table: DraftMetaTable | null | undefined;
+  map?: string | null;
   maxPerSeat?: number;
   maxPairs?: number;
   /**

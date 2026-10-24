@@ -112,7 +112,7 @@ describe("resolvePairPickSelection", () => {
     expect(synergy.firstPoints + synergy.secondPoints).toBe(synergy.points);
     expect(roles.label).toBe("Roles");
     expect(roles.points).toBe(0);
-    expect(roles.detail).toBe("Still need tank, healer · 2 picks left");
+    expect(roles.detail).toBe("Still need healer, frontline · 2 picks left");
     expect(roles.firstDetail).toBe("Covers offlane");
     expect(roles.secondDetail).toBe("Covers ranged damage");
   });
@@ -131,10 +131,10 @@ describe("resolvePairPickSelection", () => {
     });
 
     const roles = factors.find((factor) => factor.id === "roles")!;
-    // healer + offlane missing, one pick left → one role can't fit.
-    expect(roles.points).toBe(-45);
-    expect(roles.detail).toContain("Can't fill");
-    expect(roles.firstPoints + roles.secondPoints).toBe(-45);
+    // Jaina still covers waveclear, and the last pick can still be the healer.
+    expect(roles.points).toBe(0);
+    expect(roles.detail).toContain("Still need healer");
+    expect(roles.firstPoints + roles.secondPoints).toBe(0);
   });
 
   it("keeps the first hero in a pair window until a second hero is chosen", () => {
@@ -374,6 +374,88 @@ describe("ban deviation grading", () => {
 
     expect(card.factors.some((factor) => factor.id === "banPri")).toBe(false);
     expect(card.factors.some((factor) => factor.id === "mutualBan")).toBe(false);
+  });
+
+  it("shows the map win rate and the point formula when the score is 0", () => {
+    const table = buildDraftMetaTable({
+      patch: "test",
+      global: [
+        {
+          hero: "Tyrael",
+          winRate: 50,
+          influence: 50,
+          popularity: 40,
+          banRate: 0,
+          pickRate: 0,
+          games: 200,
+        },
+      ],
+      matchups: { Tyrael: [] },
+      mapStats: [
+        { hero: "Tyrael", map: "Tomb of the Spider Queen", winRate: 48, games: 90 },
+      ],
+    });
+    const card = buildPickScorecard({
+      hero: "Tyrael",
+      table,
+      gone: new Set<string>(),
+      map: "Tomb of the Spider Queen",
+      ourPickCount: 0,
+      inPlan: false,
+      fromAlt: false,
+      planRole: null,
+      lockedAllies: [],
+      theirLocked: [],
+      theirLikely: [],
+      banPriority: [],
+      comfort: 0,
+      swapDelta: 0,
+      takeAndRebuild: false,
+      kind: "pick",
+    });
+    const map = card.factors.find((factor) => factor.id === "map");
+    expect(map?.points).toBe(0);
+    expect(map?.detail).toContain("48.0% WR");
+    expect(map?.detail).toContain("→ 0");
+    expect(map?.formula).toContain("(48.0 - 50.0) = -2.0pp");
+
+    const weak = buildDraftMetaTable({
+      patch: "test",
+      global: [
+        {
+          hero: "Tyrael",
+          winRate: 50,
+          influence: 50,
+          popularity: 40,
+          banRate: 0,
+          pickRate: 0,
+          games: 200,
+        },
+      ],
+      matchups: { Tyrael: [] },
+      mapStats: [{ hero: "Tyrael", map: "Sky Temple", winRate: 43, games: 110 }],
+    });
+    const weakCard = buildPickScorecard({
+      hero: "Tyrael",
+      table: weak,
+      gone: new Set<string>(),
+      map: "Sky Temple",
+      ourPickCount: 0,
+      inPlan: false,
+      fromAlt: false,
+      planRole: null,
+      lockedAllies: [],
+      theirLocked: [],
+      theirLikely: [],
+      banPriority: [],
+      comfort: 0,
+      swapDelta: 0,
+      takeAndRebuild: false,
+      kind: "pick",
+    });
+    const weakMap = weakCard.factors.find((factor) => factor.id === "map");
+    expect(weakMap?.points).toBe(-13);
+    expect(weakMap?.detail).toContain("43.0% WR");
   });
 
   it("does not score a ban candidate against heroes the opponent would play alongside it", () => {

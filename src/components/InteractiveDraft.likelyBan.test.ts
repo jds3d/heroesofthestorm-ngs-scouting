@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  banHeroesToSuggest,
   computeTheirLikelyBan,
   draftBoardHasStarted,
   livePlayableBanPriority,
@@ -81,6 +82,23 @@ describe("livePlayableBanPriority", () => {
     };
     const bans = livePlayableBanPriority([], [], () => null, table);
     expect(bans[0]?.hero).toBe("Qhira");
+  });
+});
+
+describe("banHeroesToSuggest", () => {
+  it("keeps the meta list when nobody on the roster plays those heroes", () => {
+    const roster = [scout("A#1", [{ hero: "Murky", comfort: 0.4, games: 40 }])];
+    expect(banHeroesToSuggest(["Qhira", "Johanna"], roster, [])).toEqual([
+      "Qhira",
+      "Johanna",
+    ]);
+  });
+
+  it("keeps only the heroes they play once any of them clear the bar", () => {
+    const roster = [scout("A#1", [{ hero: "Johanna", comfort: 0.4, games: 80 }])];
+    expect(banHeroesToSuggest(["Qhira", "Johanna"], roster, [])).toEqual([
+      "Johanna",
+    ]);
   });
 });
 
